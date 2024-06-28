@@ -11,15 +11,24 @@
   "request": {},
   "response": {
     "required": [
-      "channel_id"
+      "channel_open_failed"
     ],
     "properties": {
-      "channel_id": {
-        "type": "hash",
-        "description": [
-          "The channel id of the channel."
+      "channel_open_failed": {
+        "type": "object",
+        "added": "pre-v0.10.1",
+        "required": [
+          "channel_id"
         ],
-        "added": "pre-v0.10.1"
+        "properties": {
+          "channel_id": {
+            "type": "hash",
+            "description": [
+              "The channel id of the channel."
+            ],
+            "added": "pre-v0.10.1"
+          }
+        }
       }
     }
   }

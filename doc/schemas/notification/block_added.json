@@ -11,23 +11,32 @@
   "request": {},
   "response": {
     "required": [
-      "hash",
-      "height"
+      "block_added"
     ],
     "properties": {
-      "hash": {
-        "type": "hash",
-        "description": [
-          "The hash of the block."
+      "block_added": {
+        "type": "object",
+        "added": "v22.11",
+        "required": [
+          "hash",
+          "height"
         ],
-        "added": "v22.11"
-      },
-      "height": {
-        "type": "u32",
-        "description": [
-          "The total block height."
-        ],
-        "added": "v22.11"
+        "properties": {
+          "hash": {
+            "type": "hash",
+            "description": [
+              "The hash of the block."
+            ],
+            "added": "v22.11"
+          },
+          "height": {
+            "type": "u32",
+            "description": [
+              "The total block height."
+            ],
+            "added": "v22.11"
+          }
+        }
       }
     }
   }
