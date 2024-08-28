@@ -103,9 +103,6 @@ struct chain_topology {
 	struct bitcoin_blkid prev_tip;
 	struct block_map *block_map;
 
-	/* Set during startup */
-	bool feerate_uninitialized;
-
 	/* This is the lowest feerate that bitcoind is saying will broadcast. */
 	u32 feerate_floor;
 
@@ -119,9 +116,6 @@ struct chain_topology {
 	/* Where to log things. */
 	struct logger *log;
 
-	/* What range of blocks do we have in our database? */
-	u32 min_blockheight, max_blockheight;
-
 	/* How often to poll. */
 	u32 poll_seconds;
 
@@ -134,7 +128,10 @@ struct chain_topology {
 	struct bitcoind *bitcoind;
 
 	/* Timers we're running. */
-	struct oneshot *extend_timer, *updatefee_timer, *rebroadcast_timer;
+	struct oneshot *checkchain_timer, *extend_timer, *updatefee_timer, *rebroadcast_timer;
+
+	/* Parent context for requests (to bcli plugin) we have outstanding. */
+	tal_t *request_ctx;
 
 	/* Bitcoin transactions we're broadcasting */
 	struct outgoing_tx_map *outgoing_txs;
@@ -146,9 +143,6 @@ struct chain_topology {
 	/* The number of headers known to the bitcoin backend at startup. Not
 	 * updated after the initial check. */
 	u32 headercount;
-
-	/* Are we stopped? */
-	bool stopping;
 };
 
 /* Information relevant to locating a TX in a blockchain. */
@@ -246,8 +240,7 @@ void broadcast_tx_(const tal_t *ctx,
 		   void *cbarg TAKES);
 
 struct chain_topology *new_topology(struct lightningd *ld, struct logger *log);
-void setup_topology(struct chain_topology *topology,
-		    u32 min_blockheight, u32 max_blockheight);
+void setup_topology(struct chain_topology *topology);
 
 void begin_topology(struct chain_topology *topo);
 

@@ -9,11 +9,18 @@
 #include <common/bech32_util.h>
 #include <common/bolt11.h>
 #include <common/bolt11_json.h>
+#include <common/bolt12_id.h>
 #include <common/bolt12_merkle.h>
-#include <common/invoice_path_id.h>
+#include <common/gossmap.h>
 #include <common/iso4217.h>
+#include <common/json_blinded_path.h>
 #include <common/json_param.h>
 #include <common/json_stream.h>
+#include <common/memleak.h>
+#include <common/onion_message.h>
+#include <errno.h>
+#include <plugins/establish_onion_path.h>
+#include <plugins/fetchinvoice.h>
 #include <plugins/offers.h>
 #include <plugins/offers_inv_hook.h>
 #include <plugins/offers_invreq_hook.h>
@@ -27,7 +34,38 @@ struct pubkey id;
 u32 blockheight;
 u16 cltv_final;
 bool offers_enabled;
+bool disable_connect;
+bool dev_invoice_bpath_scid;
+struct short_channel_id *dev_invoice_internal_scid;
 struct secret invoicesecret_base;
+struct secret offerblinding_base;
+struct secret nodealias_base;
+static struct gossmap *global_gossmap;
+
+static void init_gossmap(struct plugin *plugin)
+{
+	size_t num_cupdates_rejected;
+	global_gossmap
+		= notleak_with_children(gossmap_load(plugin,
+						     GOSSIP_STORE_FILENAME,
+						     &num_cupdates_rejected));
+	if (!global_gossmap)
+		plugin_err(plugin, "Could not load gossmap %s: %s",
+			   GOSSIP_STORE_FILENAME, strerror(errno));
+	if (num_cupdates_rejected)
+		plugin_log(plugin, LOG_DBG,
+			   "gossmap ignored %zu channel updates",
+			   num_cupdates_rejected);
+}
+
+struct gossmap *get_gossmap(struct plugin *plugin)
+{
+	if (!global_gossmap)
+		init_gossmap(plugin);
+	else
+		gossmap_refresh(global_gossmap, NULL);
+	return global_gossmap;
+}
 
 static struct command_result *finished(struct command *cmd,
 				       const char *buf,
@@ -37,18 +75,89 @@ static struct command_result *finished(struct command *cmd,
 	return command_hook_success(cmd);
 }
 
-static struct command_result *sendonionmessage_error(struct command *cmd,
-						     const char *buf,
-						     const jsmntok_t *err,
-						     void *unused)
+static struct command_result *injectonionmessage_error(struct command *cmd,
+						       const char *buf,
+						       const jsmntok_t *err,
+						       void *unused)
 {
 	/* This can happen if the peer goes offline or wasn't directly
 	 * connected: "Unknown first peer" */
 	plugin_log(cmd->plugin, LOG_DBG,
-		   "sendonionmessage gave JSON error: %.*s",
+		   "injectonionmessage gave JSON error: %.*s",
 		   json_tok_full_len(err),
 		   json_tok_full(buf, err));
 	return command_hook_success(cmd);
+}
+
+struct command_result *
+inject_onionmessage_(struct command *cmd,
+		     const struct onion_message *omsg,
+		     struct command_result *(*cb)(struct command *command,
+						  const char *buf,
+						  const jsmntok_t *result,
+						  void *arg),
+		     struct command_result *(*errcb)(struct command *command,
+						     const char *buf,
+						     const jsmntok_t *result,
+						     void *arg),
+		     void *arg)
+{
+	struct out_req *req;
+
+	req = jsonrpc_request_start(cmd->plugin, cmd, "injectonionmessage",
+				    cb, errcb, arg);
+	json_add_pubkey(req->js, "blinding", &omsg->first_blinding);
+	json_array_start(req->js, "hops");
+	for (size_t i = 0; i < tal_count(omsg->hops); i++) {
+		json_object_start(req->js, NULL);
+		json_add_pubkey(req->js, "id", &omsg->hops[i]->pubkey);
+		json_add_hex_talarr(req->js, "tlv", omsg->hops[i]->raw_payload);
+		json_object_end(req->js);
+	}
+	json_array_end(req->js);
+	return send_outreq(cmd->plugin, req);
+}
+
+/* Holds the details while we wait for establish_onion_path to connect */
+struct onion_reply {
+	struct blinded_path *reply_path;
+	struct tlv_onionmsg_tlv *payload;
+};
+
+static struct command_result *send_onion_reply_after_established(struct command *cmd,
+								 const struct pubkey *path,
+								 struct onion_reply *onion_reply)
+{
+	struct onion_message *omsg;
+
+	omsg = outgoing_onion_message(tmpctx, path, NULL, onion_reply->reply_path, onion_reply->payload);
+	return inject_onionmessage(cmd, omsg, finished, injectonionmessage_error, onion_reply);
+}
+
+static struct command_result *send_onion_reply_not_established(struct command *cmd,
+							       const char *why,
+							       struct onion_reply *onion_reply)
+{
+	plugin_log(cmd->plugin, LOG_DBG,
+		   "Failed to connect for reply via %s: %s",
+		   fmt_sciddir_or_pubkey(tmpctx, &onion_reply->reply_path->first_node_id),
+		   why);
+	return command_hook_success(cmd);
+}
+
+static struct blinded_path *blinded_path_dup(const tal_t *ctx,
+					     const struct blinded_path *old)
+{
+	struct blinded_path *bp = tal(ctx, struct blinded_path);
+	*bp = *old;
+	bp->path = tal_arr(bp, struct onionmsg_hop *, tal_count(old->path));
+	for (size_t i = 0; i < tal_count(bp->path); i++) {
+		bp->path[i] = tal(bp->path, struct onionmsg_hop);
+		bp->path[i]->blinded_node_id = old->path[i]->blinded_node_id;
+		bp->path[i]->encrypted_recipient_data = tal_dup_talarr(bp->path[i], u8,
+								       old->path[i]->encrypted_recipient_data);
+	}
+	return bp;
 }
 
 struct command_result *
@@ -56,52 +165,57 @@ send_onion_reply(struct command *cmd,
 		 struct blinded_path *reply_path,
 		 struct tlv_onionmsg_tlv *payload)
 {
-	struct out_req *req;
-	size_t nhops;
+	struct onion_reply *onion_reply;
 
-	req = jsonrpc_request_start(cmd->plugin, cmd, "sendonionmessage",
-				    finished, sendonionmessage_error, NULL);
+	onion_reply = tal(cmd, struct onion_reply);
+	onion_reply->reply_path = blinded_path_dup(onion_reply, reply_path);
+	onion_reply->payload = tal_steal(onion_reply, payload);
 
-	json_add_pubkey(req->js, "first_id", &reply_path->first_node_id);
-	json_add_pubkey(req->js, "blinding", &reply_path->blinding);
-	json_array_start(req->js, "hops");
-
-	nhops = tal_count(reply_path->path);
-	for (size_t i = 0; i < nhops; i++) {
-		struct tlv_onionmsg_tlv *omp;
-		u8 *tlv;
-
-		json_object_start(req->js, NULL);
-		json_add_pubkey(req->js, "id", &reply_path->path[i]->blinded_node_id);
-
-		/* Put payload in last hop. */
-		if (i == nhops - 1)
-			omp = payload;
-		else
-			omp = tlv_onionmsg_tlv_new(tmpctx);
-
-		omp->encrypted_recipient_data = reply_path->path[i]->encrypted_recipient_data;
-
-		tlv = tal_arr(tmpctx, u8, 0);
-		towire_tlv_onionmsg_tlv(&tlv, omp);
-		json_add_hex_talarr(req->js, "tlv", tlv);
-		json_object_end(req->js);
+	if (!gossmap_scidd_pubkey(get_gossmap(cmd->plugin),
+				  &onion_reply->reply_path->first_node_id)) {
+		plugin_log(cmd->plugin, LOG_DBG,
+			   "Cannot resolve initial reply scidd %s",
+			   fmt_short_channel_id_dir(tmpctx,
+						    &onion_reply->reply_path->first_node_id.scidd));
+		return command_hook_success(cmd);
 	}
-	json_array_end(req->js);
-	return send_outreq(cmd->plugin, req);
+
+	return establish_onion_path(cmd, get_gossmap(cmd->plugin),
+				    &id, &onion_reply->reply_path->first_node_id.pubkey,
+				    disable_connect,
+				    send_onion_reply_after_established,
+				    send_onion_reply_not_established,
+				    onion_reply);
 }
 
-static struct command_result *onion_message_modern_call(struct command *cmd,
-							const char *buf,
-							const jsmntok_t *params)
+static struct command_result *onion_message_recv(struct command *cmd,
+						 const char *buf,
+						 const jsmntok_t *params)
 {
-	const jsmntok_t *om, *replytok, *invreqtok, *invtok;
+	const jsmntok_t *om, *secrettok, *replytok, *invreqtok, *invtok;
 	struct blinded_path *reply_path = NULL;
+ 	struct secret *secret;
 
 	if (!offers_enabled)
 		return command_hook_success(cmd);
 
 	om = json_get_member(buf, params, "onion_message");
+	secrettok = json_get_member(buf, om, "pathsecret");
+	if (secrettok) {
+		secret = tal(tmpctx, struct secret);
+		json_to_secret(buf, secrettok, secret);
+	} else
+		secret = NULL;
+
+	/* Might be reply for fetchinvoice (which always has a secret,
+	 * so we can tell it's a response). */
+	if (secret) {
+		struct command_result *res;
+		res = handle_invoice_onion_message(cmd, buf, om, secret);
+		if (res)
+			return res;
+	}
+
 	replytok = json_get_member(buf, om, "reply_blindedpath");
 	if (replytok) {
 		reply_path = json_to_blinded_path(cmd, buf, replytok);
@@ -117,7 +231,7 @@ static struct command_result *onion_message_modern_call(struct command *cmd,
 		if (reply_path)
 			return handle_invoice_request(cmd,
 						      invreqbin,
-						      reply_path);
+						      reply_path, secret);
 		else
 			plugin_log(cmd->plugin, LOG_DBG,
 				   "invoice_request without reply_path");
@@ -127,16 +241,108 @@ static struct command_result *onion_message_modern_call(struct command *cmd,
 	if (invtok) {
 		const u8 *invbin = json_tok_bin_from_hex(tmpctx, buf, invtok);
 		if (invbin)
-			return handle_invoice(cmd, invbin, reply_path);
+			return handle_invoice(cmd, invbin, reply_path, secret);
 	}
 
 	return command_hook_success(cmd);
 }
 
+struct find_best_peer_data {
+	struct command_result *(*cb)(struct command *,
+				     const struct chaninfo *,
+				     void *);
+	int needed_feature;
+	void *arg;
+};
+
+static struct command_result *listincoming_done(struct command *cmd,
+						const char *buf,
+						const jsmntok_t *result,
+						struct find_best_peer_data *data)
+{
+	const jsmntok_t *arr, *t;
+	size_t i;
+	struct chaninfo *best = NULL;
+
+  	arr = json_get_member(buf, result, "incoming");
+	json_for_each_arr(i, t, arr) {
+		struct chaninfo ci;
+		const jsmntok_t *pftok;
+		u8 *features;
+		const char *err;
+		struct amount_msat feebase;
+
+		err = json_scan(tmpctx, buf, t,
+				"{id:%,"
+				"incoming_capacity_msat:%,"
+				"htlc_min_msat:%,"
+				"htlc_max_msat:%,"
+				"fee_base_msat:%,"
+				"fee_proportional_millionths:%,"
+				"cltv_expiry_delta:%}",
+				JSON_SCAN(json_to_pubkey, &ci.id),
+				JSON_SCAN(json_to_msat, &ci.capacity),
+				JSON_SCAN(json_to_msat, &ci.htlc_min),
+				JSON_SCAN(json_to_msat, &ci.htlc_max),
+				JSON_SCAN(json_to_msat, &feebase),
+				JSON_SCAN(json_to_u32, &ci.feeppm),
+				JSON_SCAN(json_to_u32, &ci.cltv));
+		if (err) {
+			plugin_log(cmd->plugin, LOG_BROKEN,
+				   "Could not parse listincoming: %s",
+				   err);
+			continue;
+		}
+		ci.feebase = feebase.millisatoshis; /* Raw: feebase */
+
+		/* Not presented if there's no channel_announcement for peer:
+		 * we could use listpeers, but if it's private we probably
+		 * don't want to blinded route through it! */
+		pftok = json_get_member(buf, t, "peer_features");
+		if (!pftok)
+			continue;
+		features = json_tok_bin_from_hex(tmpctx, buf, pftok);
+		if (!feature_offered(features, data->needed_feature))
+			continue;
+
+		if (!best || amount_msat_greater(ci.capacity, best->capacity))
+			best = tal_dup(tmpctx, struct chaninfo, &ci);
+	}
+
+	/* Free data if they don't */
+	tal_steal(tmpctx, data);
+	return data->cb(cmd, best, data->arg);
+}
+
+struct command_result *find_best_peer_(struct command *cmd,
+				       int needed_feature,
+				       struct command_result *(*cb)(struct command *,
+								    const struct chaninfo *,
+								    void *),
+				       void *arg)
+{
+	struct out_req *req;
+	struct find_best_peer_data *data = tal(cmd, struct find_best_peer_data);
+	data->cb = cb;
+	data->arg = arg;
+	data->needed_feature = needed_feature;
+	req = jsonrpc_request_start(cmd->plugin, cmd, "listincoming",
+				    listincoming_done, forward_error, data);
+	return send_outreq(cmd->plugin, req);
+}
+
 static const struct plugin_hook hooks[] = {
 	{
 		"onion_message_recv",
-		onion_message_modern_call
+		onion_message_recv
+	},
+	{
+		"onion_message_recv_secret",
+		onion_message_recv
+	},
+	{
+		"invoice_payment",
+		invoice_payment,
 	},
 };
 
@@ -315,7 +521,15 @@ static bool json_add_blinded_paths(struct json_stream *js,
 	json_array_start(js, fieldname);
 	for (size_t i = 0; i < tal_count(paths); i++) {
 		json_object_start(js, NULL);
-		json_add_pubkey(js, "first_node_id", &paths[i]->first_node_id);
+		if (paths[i]->first_node_id.is_pubkey) {
+			json_add_pubkey(js, "first_node_id",
+					&paths[i]->first_node_id.pubkey);
+		} else {
+			json_add_short_channel_id(js, "first_scid",
+						  paths[i]->first_node_id.scidd.scid);
+			json_add_u32(js, "first_scid_dir",
+				     paths[i]->first_node_id.scidd.dir);
+		}
 		json_add_pubkey(js, "blinding", &paths[i]->blinding);
 
 		/* Don't crash if we're short a payinfo! */
@@ -349,6 +563,19 @@ static bool json_add_blinded_paths(struct json_stream *js,
 				 "invoice has %zu blinded_payinfo but %zu paths",
 				 tal_count(blindedpay), tal_count(paths));
 		return false;
+	}
+
+	/* BOLT-offers #12:
+	 *  - if `num_hops` is 0 in any `blinded_path` in `offer_paths`:
+	 *    - MUST NOT respond to the offer.
+	 */
+	for (size_t i = 0; i < tal_count(paths); i++) {
+		if (tal_count(paths[i]->path) == 0) {
+			json_add_str_fmt(js, "warning_empty_blinded_path",
+					 "blinded path %zu has 0 hops",
+					 i);
+			return false;
+		}
 	}
 
 	return true;
@@ -396,7 +623,7 @@ static bool json_add_offer_fields(struct json_stream *js,
 				  struct blinded_path **offer_paths,
 				  const char *offer_issuer,
 				  const u64 *offer_quantity_max,
-				  const struct pubkey *offer_node_id,
+				  const struct pubkey *offer_issuer_id,
 				  const struct recurrence *offer_recurrence,
 				  const struct recurrence_paywindow *offer_recurrence_paywindow,
 				  const u32 *offer_recurrence_limit,
@@ -423,19 +650,17 @@ static bool json_add_offer_fields(struct json_stream *js,
 	} else if (offer_amount)
 		json_add_amount_msat(js, "offer_amount_msat",
 				     amount_msat(*offer_amount));
-
 	/* BOLT-offers #12:
-	 * A reader of an offer:
-	 *...
-	 * - if `offer_description` is not set:
-	 *   - MUST NOT respond to the offer.
+	 *
+	 * - if `offer_amount` is set and `offer_description` is not set:
+	 *    - MUST NOT respond to the offer.
 	 */
 	if (offer_description)
 		valid &= json_add_utf8(js, "offer_description",
 				       offer_description);
-	else {
+	else if (!offer_description && offer_amount) {
 		json_add_string(js, "warning_missing_offer_description",
-				"offers without a description are invalid");
+				"description is required if offer_amount is set (for the user to know what it was they paid for)");
 		valid = false;
 	}
 
@@ -482,9 +707,8 @@ static bool json_add_offer_fields(struct json_stream *js,
 		json_object_end(js);
 	}
 
-	/* Required for offers, *not* for others! */
-	if (offer_node_id)
-		json_add_pubkey(js, "offer_node_id", offer_node_id);
+	if (offer_issuer_id)
+		json_add_pubkey(js, "offer_issuer_id", offer_issuer_id);
 
 	return valid;
 }
@@ -507,6 +731,7 @@ static void json_add_extra_fields(struct json_stream *js,
 		json_add_u64(js, "length", fields[i].length);
 		json_add_hex(js, "value",
 			     fields[i].value, fields[i].length);
+		json_object_end(js);
 	}
 	if (have_extra)
 		json_array_end(js);
@@ -531,18 +756,18 @@ static void json_add_offer(struct json_stream *js, const struct tlv_offer *offer
 				       offer->offer_paths,
 				       offer->offer_issuer,
 				       offer->offer_quantity_max,
-				       offer->offer_node_id,
+				       offer->offer_issuer_id,
 				       offer->offer_recurrence,
 				       offer->offer_recurrence_paywindow,
 				       offer->offer_recurrence_limit,
 				       offer->offer_recurrence_base);
 	/* BOLT-offers #12:
-	 * - if `offer_node_id` is not set:
+	 * - if neither `offer_issuer_id` nor `offer_paths` are set:
 	 *   - MUST NOT respond to the offer.
 	 */
-	if (!offer->offer_node_id) {
-		json_add_string(js, "warning_missing_offer_node_id",
-				"offers without a node_id are invalid");
+	if (!offer->offer_issuer_id && !offer->offer_paths) {
+		json_add_string(js, "warning_missing_offer_issuer_id",
+				"offers without an issuer_id or paths are invalid");
 		valid = false;
 	}
 	json_add_extra_fields(js, "unknown_offer_tlvs", offer->fields);
@@ -557,6 +782,7 @@ static bool json_add_invreq_fields(struct json_stream *js,
 				   const u64 *invreq_quantity,
 				   const struct pubkey *invreq_payer_id,
 				   const utf8 *invreq_payer_note,
+				   struct blinded_path **invreq_paths,
 				   const u32 *invreq_recurrence_counter,
 				   const u32 *invreq_recurrence_start)
 {
@@ -590,6 +816,9 @@ static bool json_add_invreq_fields(struct json_stream *js,
 		json_add_u64(js, "invreq_quantity", *invreq_quantity);
 	if (invreq_payer_note)
 		valid &= json_add_utf8(js, "invreq_payer_note", invreq_payer_note);
+	if (invreq_paths)
+		valid &= json_add_blinded_paths(js, "invreq_paths",
+						invreq_paths, NULL);
 	if (invreq_recurrence_counter) {
 		json_add_u32(js, "invreq_recurrence_counter",
 			     *invreq_recurrence_counter);
@@ -678,8 +907,8 @@ static void json_add_invoice_request(struct json_stream *js,
 {
 	bool valid = true;
 
-	/* If there's an offer_node_id, then there's an offer. */
-	if (invreq->offer_node_id) {
+	/* If there's an offer_issuer_id or offer_paths, then there's an offer. */
+	if (invreq->offer_issuer_id || invreq->offer_paths) {
 		struct sha256 offer_id;
 
 		invreq_offer_id(invreq, &offer_id);
@@ -697,7 +926,7 @@ static void json_add_invoice_request(struct json_stream *js,
 				       invreq->offer_paths,
 				       invreq->offer_issuer,
 				       invreq->offer_quantity_max,
-				       invreq->offer_node_id,
+				       invreq->offer_issuer_id,
 				       invreq->offer_recurrence,
 				       invreq->offer_recurrence_paywindow,
 				       invreq->offer_recurrence_limit,
@@ -710,6 +939,7 @@ static void json_add_invoice_request(struct json_stream *js,
 					invreq->invreq_quantity,
 					invreq->invreq_payer_id,
 					invreq->invreq_payer_note,
+					invreq->invreq_paths,
 					invreq->invreq_recurrence_counter,
 					invreq->invreq_recurrence_start);
 
@@ -755,8 +985,8 @@ static void json_add_b12_invoice(struct json_stream *js,
 {
 	bool valid = true;
 
-	/* If there's an offer_node_id, then there's an offer. */
-	if (invoice->offer_node_id) {
+	/* If there's an offer_issuer_id or offer_paths, then there's an offer. */
+	if (invoice->offer_issuer_id || invoice->offer_paths) {
 		struct sha256 offer_id;
 
 		invoice_offer_id(invoice, &offer_id);
@@ -774,7 +1004,7 @@ static void json_add_b12_invoice(struct json_stream *js,
 				       invoice->offer_paths,
 				       invoice->offer_issuer,
 				       invoice->offer_quantity_max,
-				       invoice->offer_node_id,
+				       invoice->offer_issuer_id,
 				       invoice->offer_recurrence,
 				       invoice->offer_recurrence_paywindow,
 				       invoice->offer_recurrence_limit,
@@ -787,12 +1017,14 @@ static void json_add_b12_invoice(struct json_stream *js,
 					invoice->invreq_quantity,
 					invoice->invreq_payer_id,
 					invoice->invreq_payer_note,
+					invoice->invreq_paths,
 					invoice->invreq_recurrence_counter,
 					invoice->invreq_recurrence_start);
 
 	/* BOLT-offers #12:
 	 * - MUST reject the invoice if `invoice_paths` is not present
 	 *   or is empty.
+	 * - MUST reject the invoice if `num_hops` is 0 in any `blinded_path` in `invoice_paths`.
 	 * - MUST reject the invoice if `invoice_blindedpay` is not present.
 	 * - MUST reject the invoice if `invoice_blindedpay` does not contain
 	 *   exactly one `blinded_payinfo` per `invoice_paths`.`blinded_path`.
@@ -1154,8 +1386,11 @@ static const char *init(struct plugin *p,
 {
 	rpc_scan(p, "getinfo",
 		 take(json_out_obj(NULL, NULL, NULL)),
-		 "{id:%}", JSON_SCAN(json_to_pubkey, &id),
-		 "{blockheight:%}", JSON_SCAN(json_to_u32, &blockheight));
+		 "{id:%}", JSON_SCAN(json_to_pubkey, &id));
+
+	rpc_scan(p, "getchaininfo",
+		 take(json_out_obj(NULL, "last_height", NULL)),
+		 "{headercount:%}", JSON_SCAN(json_to_u32, &blockheight));
 
 	rpc_scan(p, "listconfigs",
 		 take(json_out_obj(NULL, NULL, NULL)),
@@ -1166,9 +1401,19 @@ static const char *init(struct plugin *p,
 		 JSON_SCAN(json_to_bool, &offers_enabled));
 
 	rpc_scan(p, "makesecret",
-		 take(json_out_obj(NULL, "string", INVOICE_PATH_BASE_STRING)),
+		 take(json_out_obj(NULL, "string", BOLT12_ID_BASE_STRING)),
 		 "{secret:%}",
 		 JSON_SCAN(json_to_secret, &invoicesecret_base));
+
+	rpc_scan(p, "makesecret",
+		 take(json_out_obj(NULL, "string", "offer-blinded-path")),
+		 "{secret:%}",
+		 JSON_SCAN(json_to_secret, &offerblinding_base));
+
+	rpc_scan(p, "makesecret",
+		 take(json_out_obj(NULL, "string", NODE_ALIAS_BASE_STRING)),
+		 "{secret:%}",
+		 JSON_SCAN(json_to_secret, &nodealias_base));
 
 	return NULL;
 }
@@ -1176,26 +1421,51 @@ static const char *init(struct plugin *p,
 static const struct plugin_command commands[] = {
     {
 	    "offer",
-	    "payment",
-	    "Create an offer to accept money",
-            "Create an offer for invoices of {amount} with {description}, optional {issuer}, internal {label}, {quantity_min}, {quantity_max}, {absolute_expiry}, {recurrence}, {recurrence_base}, {recurrence_paywindow}, {recurrence_limit} and {single_use}",
-            json_offer
+		json_offer
     },
     {
 	    "invoicerequest",
-	    "payment",
-	    "Create an invoice_request to send money",
-            "Create an invoice_request to pay invoices of {amount} with {description}, optional {issuer}, internal {label}, and {absolute_expiry}",
-            json_invoicerequest
+		json_invoicerequest
     },
     {
 	    "decode",
-	    "utility",
-	    "Decode {string} message, returning {type} and information.",
-	    NULL,
 	    json_decode,
     },
+    {
+	    "fetchinvoice",
+	    json_fetchinvoice,
+    },
+    {
+	    "sendinvoice",
+	    json_sendinvoice,
+    },
+    {
+	    "dev-rawrequest",
+	    json_dev_rawrequest,
+	    .dev_only = true,
+    },
 };
+
+static char *scid_option(struct plugin *plugin, const char *arg, bool check_only,
+			 struct short_channel_id **scidp)
+{
+	struct short_channel_id scid;
+
+	if (!short_channel_id_from_str(arg, strlen(arg), &scid))
+		return tal_fmt(tmpctx, "'%s' is not an scid", arg);
+
+	*scidp = notleak(tal_dup(plugin, struct short_channel_id, &scid));
+	return NULL;
+}
+
+static bool scid_jsonfmt(struct plugin *plugin, struct json_stream *js, const char *fieldname,
+			 struct short_channel_id **scid)
+{
+	if (!*scid)
+		return false;
+	json_add_short_channel_id(js, fieldname, **scid);
+	return true;
+}
 
 int main(int argc, char *argv[])
 {
@@ -1203,9 +1473,19 @@ int main(int argc, char *argv[])
 
 	/* We deal in UTC; mktime() uses local time */
 	setenv("TZ", "", 1);
-	plugin_main(argv, init, PLUGIN_RESTARTABLE, true, NULL,
+	plugin_main(argv, init, NULL, PLUGIN_RESTARTABLE, true, NULL,
 		    commands, ARRAY_SIZE(commands),
 		    notifications, ARRAY_SIZE(notifications),
 		    hooks, ARRAY_SIZE(hooks),
-		    NULL, 0, NULL);
+		    NULL, 0,
+		    plugin_option("fetchinvoice-noconnect", "flag",
+				  "Don't try to connect directly to fetch/pay an invoice.",
+				  flag_option, flag_jsonfmt, &disable_connect),
+		    plugin_option_dev("dev-invoice-bpath-scid", "flag",
+				      "Use short_channel_id instead of pubkey when creating a blinded payment path",
+				      flag_option, flag_jsonfmt, &dev_invoice_bpath_scid),
+		    plugin_option_dev("dev-invoice-internal-scid", "string",
+				      "Use short_channel_id instead of pubkey when creating a blinded payment path",
+				      scid_option, scid_jsonfmt, &dev_invoice_internal_scid),
+		    NULL);
 }

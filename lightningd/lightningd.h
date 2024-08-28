@@ -18,8 +18,8 @@ struct config {
 	/* How long do we want them to lock up their funds? (blocks) */
 	u32 locktime_blocks;
 
-	/* How long do we let them lock up our funds? (blocks) */
-	u32 locktime_max;
+	/* How long do we let them lock up our funds? (blocks: 2016 by spec) */
+	u32 max_htlc_cltv;
 
 	/* How many confirms until we consider an anchor "settled". */
 	u32 anchor_confirms;
@@ -108,7 +108,7 @@ enum lightningd_state {
 
 struct lightningd {
 	/* The directory to find all the subdaemons. */
-	const char *daemon_dir;
+	const char *subdaemon_dir;
 
 	/* Are deprecated APIs enabled? */
 	bool deprecated_ok;
@@ -147,14 +147,15 @@ struct lightningd {
 	struct logger *log;
 	const char **logfiles;
 
-	/* This is us. */
-	struct node_id id;
+	/* This is us, in both node_id and pubkey form */
+	struct node_id our_nodeid;
+	struct pubkey our_pubkey;
 
-	/* The public base for our payer_id keys */
-	struct pubkey bolt12_base;
-
-	/* Secret base for our invoices */
+	/* Secret base for our invoices. */
 	struct secret invoicesecret_base;
+
+	/* Secret base for node aliases  */
+	struct secret nodealias_base;
 
 	/* Feature set we offer. */
 	struct feature_set *our_features;
@@ -287,6 +288,9 @@ struct lightningd {
 	/* Contains the codex32 string used with --recover flag */
 	char *recover;
 
+	/* 2, unless overridden by --dev-fd-limit-multiplier */
+	u32 fd_limit_multiplier;
+
 	/* If we want to debug a subdaemon/plugin. */
 	char *dev_debug_subprocess;
 
@@ -308,6 +312,8 @@ struct lightningd {
 	/* Speedup gossip propagation, for testing. */
 	bool dev_fast_gossip;
 	bool dev_fast_gossip_prune;
+	bool dev_throttle_gossip;
+	bool dev_suppress_gossip;
 
 	/* Speedup reconnect delay, for testing. */
 	bool dev_fast_reconnect;
@@ -348,6 +354,13 @@ struct lightningd {
 
 	/* Allow changing of shutdown output point even if dangerous */
 	bool dev_allow_shutdown_destination_change;
+
+	/* hsmd characteristic tweaks */
+	bool dev_hsmd_no_preapprove_check;
+	bool dev_hsmd_fail_preapprove;
+
+	/* Tell connectd not to talk after handshake */
+	bool dev_handshake_no_reply;
 
 	/* tor support */
 	struct wireaddr *proxyaddr;

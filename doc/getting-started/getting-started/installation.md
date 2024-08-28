@@ -24,13 +24,6 @@ Then you can fetch a pre-compiled binary from the [releases](https://github.com/
 sudo tar -xvf <release>.tar.xz -C /usr/local --strip-components=2
 ```
 
-You will need some Python packages if you want to use clnrest.  Unfortunately there are some Python packages which are not packaged in Ubuntu, and so you will need to force installation of these (I recommend --user which will install them in your own .local directory, so at least you won't run the risk of breaking Python globally!).
-
-```
-sudo apt-get install python3-json5 python3-flask python3-gunicorn
-pip3 install --user flask-cors flask_restx pyln-client flask-socketio gevent gevent-websocket
-```
-
 If you're on a different distribution or OS, you can compile the source by following the instructions from [Installing from Source](<>).
 
 # Docker
@@ -41,10 +34,10 @@ To install the Docker image for the latest stable release:
 docker pull elementsproject/lightningd:latest
 ```
 
-To install for a specific version, for example, 23.11.2:
+To install for a specific version, for example, 24.05:
 
 ```shell
-docker pull elementsproject/lightningd:v23.11.2
+docker pull elementsproject/lightningd:v24.05
 ```
 
 See all of the docker images for Core Lightning on [Docker Hub](https://hub.docker.com/r/elementsproject/lightningd/tags).
@@ -82,7 +75,7 @@ Get dependencies:
 ```shell
 sudo apt-get update
 sudo apt-get install -y \
-  jq autoconf automake build-essential git libtool libsqlite3-dev \
+  jq autoconf automake build-essential git libtool libsqlite3-dev libffi-dev \
   python3 python3-pip net-tools zlib1g-dev libsodium-dev gettext
 pip3 install --upgrade pip
 pip3 install --user poetry
@@ -108,7 +101,7 @@ cd lightning
 Checkout a release tag:
 
 ```shell
-git checkout v23.11.2
+git checkout v24.05
 ```
 
 For development or running tests, get additional dependencies:
@@ -116,6 +109,7 @@ For development or running tests, get additional dependencies:
 ```shell
 sudo apt-get install -y valgrind libpq-dev shellcheck cppcheck \
   libsecp256k1-dev lowdown
+pip3 install pytest
 ```
 
 If you can't install `lowdown`, a version will be built in-tree.
@@ -133,7 +127,6 @@ To build cln to just install a tagged or master version you can use the followin
 ```shell
 pip3 install --upgrade pip
 pip3 install mako
-pip3 install -r plugins/clnrest/requirements.txt
 pip3 install grpcio-tools
 ./configure
 make
@@ -211,7 +204,7 @@ cd lightning
 Checkout a release tag:
 
 ```shell
-git checkout v23.11.2
+git checkout v24.05
 ```
 
 Build and install lightning:
@@ -385,7 +378,7 @@ cd lightning
 Checkout a release tag:
 
 ```shell
-git checkout v23.11.2
+git checkout v24.05
 ```
 
 Build lightning:
@@ -590,4 +583,27 @@ Install runtime dependencies:
 
 ```shell
 apk add libgcc libsodium sqlite-libs zlib
+```
+
+## Python plugins
+
+Python plugins will be installed with the `poetry install` step mentioned above fron development setup. 
+
+Other users will need some Python packages if python plugins are used. Unfortunately there are some Python packages which are not packaged in Ubuntu, and so force installation will be needed (Flag `--user` is recommended which will install them in user's own .local directory, so at least the risk of breaking Python globally can be avoided!).
+
+### clnrest
+
+Installation steps for clnrest are:
+
+```
+sudo apt-get install python3-json5 python3-flask python3-gunicorn
+pip3 install --user flask-cors flask-restx pyln-client flask-socketio gevent gevent-websocket
+```
+
+### wss-proxy
+
+Below libraries are required for wss-proxy:
+
+```
+pip3 install --user pyln-client websockets
 ```

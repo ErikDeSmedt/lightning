@@ -46,7 +46,10 @@ where
     options: HashMap<String, UntypedConfigOption>,
     option_values: HashMap<String, Option<options::Value>>,
     rpcmethods: HashMap<String, RpcMethod<S>>,
+    setconfig_callback: Option<AsyncCallback<S>>,
     subscriptions: HashMap<String, Subscription<S>>,
+    // Contains a Subscription if the user subscribed to "*"
+    wildcard_subscription: Option<Subscription<S>>,
     notifications: Vec<NotificationTopic>,
     custommessages: Vec<u16>,
     featurebits: FeatureBits,
@@ -70,8 +73,10 @@ where
     option_values: HashMap<String, Option<options::Value>>,
     configuration: Configuration,
     rpcmethods: HashMap<String, AsyncCallback<S>>,
+    setconfig_callback: Option<AsyncCallback<S>>,
     hooks: HashMap<String, AsyncCallback<S>>,
     subscriptions: HashMap<String, AsyncNotificationCallback<S>>,
+    wildcard_subscription: Option<AsyncNotificationCallback<S>>,
     #[allow(dead_code)] // unsure why rust thinks this field isn't used
     notifications: Vec<NotificationTopic>,
 }
@@ -87,10 +92,12 @@ where
 {
     plugin: Plugin<S>,
     rpcmethods: HashMap<String, AsyncCallback<S>>,
+    setconfig_callback: Option<AsyncCallback<S>>,
 
     #[allow(dead_code)] // Unused until we fill in the Hook structs.
     hooks: HashMap<String, AsyncCallback<S>>,
     subscriptions: HashMap<String, AsyncNotificationCallback<S>>,
+    wildcard_subscription: Option<AsyncNotificationCallback<S>>,
 }
 
 #[derive(Clone)]
@@ -102,7 +109,7 @@ where
     state: S,
     /// "options" field of "init" message sent by cln
     options: HashMap<String, UntypedConfigOption>,
-    option_values: HashMap<String, Option<options::Value>>,
+    option_values: Arc<std::sync::Mutex<HashMap<String, Option<options::Value>>>>,
     /// "configuration" field of "init" message sent by cln
     configuration: Configuration,
     /// A signal that allows us to wait on the plugin's shutdown.
@@ -123,11 +130,13 @@ where
             output: Some(output),
             hooks: HashMap::new(),
             subscriptions: HashMap::new(),
+            wildcard_subscription: None,
             options: HashMap::new(),
             // Should not be configured by user.
             // This values are set when parsing the init-call
             option_values: HashMap::new(),
             rpcmethods: HashMap::new(),
+            setconfig_callback: None,
             notifications: vec![],
             featurebits: FeatureBits::default(),
             dynamic: false,
@@ -173,12 +182,15 @@ where
         C: Fn(Plugin<S>, Request) -> F + 'static,
         F: Future<Output = Result<(), Error>> + Send + 'static,
     {
-        self.subscriptions.insert(
-            topic.to_string(),
-            Subscription {
-                callback: Box::new(move |p, r| Box::pin(callback(p, r))),
-            },
-        );
+        let subscription = Subscription {
+            callback: Box::new(move |p, r| Box::pin(callback(p, r))),
+        };
+
+        if topic == "*" {
+            self.wildcard_subscription = Some(subscription);
+        } else {
+            self.subscriptions.insert(topic.to_string(), subscription);
+        };
         self
     }
 
@@ -221,6 +233,17 @@ where
     pub fn rpcmethod_from_builder(mut self, rpc_method: RpcMethodBuilder<S>) -> Builder<S, I, O> {
         self.rpcmethods
             .insert(rpc_method.name.to_string(), rpc_method.build());
+        self
+    }
+
+    /// Register a callback for setconfig to accept changes for dynamic options
+    pub fn setconfig_callback<C, F>(mut self, setconfig_callback: C) -> Builder<S, I, O>
+    where
+        C: Send + Sync + 'static,
+        C: Fn(Plugin<S>, Request) -> F + 'static,
+        F: Future<Output = Response> + Send + 'static,
+    {
+        self.setconfig_callback = Some(Box::new(move |p, r| Box::pin(setconfig_callback(p, r))));
         self
     }
 
@@ -328,6 +351,7 @@ where
 
         let subscriptions =
             HashMap::from_iter(self.subscriptions.drain().map(|(k, v)| (k, v.callback)));
+        let all_subscription = self.wildcard_subscription.map(|s| s.callback);
 
         // Leave the `init` reply pending, so we can disable based on
         // the options if required.
@@ -337,8 +361,10 @@ where
             input,
             output,
             rpcmethods,
+            setconfig_callback: self.setconfig_callback,
             notifications: self.notifications,
             subscriptions,
+            wildcard_subscription: all_subscription,
             options: self.options,
             option_values: self.option_values,
             configuration,
@@ -378,9 +404,16 @@ where
             })
             .collect();
 
+        let subscriptions = self
+            .subscriptions
+            .keys()
+            .map(|s| s.clone())
+            .chain(self.wildcard_subscription.iter().map(|_| String::from("*")))
+            .collect();
+
         messages::GetManifestResponse {
             options: self.options.values().cloned().collect(),
-            subscriptions: self.subscriptions.keys().map(|s| s.clone()).collect(),
+            subscriptions,
             hooks: self.hooks.keys().map(|s| s.clone()).collect(),
             rpcmethods,
             notifications: self.notifications.clone(),
@@ -404,6 +437,15 @@ where
             let option_value: Option<options::Value> = match (json_value, default_value) {
                 (None, None) => None,
                 (None, Some(default)) => Some(default.clone()),
+                (Some(JValue::Array(a)), _) => match a.first() {
+                    Some(JValue::String(_)) => Some(OValue::StringArray(
+                        a.iter().map(|x| x.as_str().unwrap().to_string()).collect(),
+                    )),
+                    Some(JValue::Number(_)) => Some(OValue::IntegerArray(
+                        a.iter().map(|x| x.as_i64().unwrap()).collect(),
+                    )),
+                    _ => panic!("Array type not supported for option: {}", name),
+                },
                 (Some(JValue::String(s)), _) => Some(OValue::String(s.to_string())),
                 (Some(JValue::Number(i)), _) => Some(OValue::Integer(i.as_i64().unwrap())),
                 (Some(JValue::Bool(b)), _) => Some(OValue::Boolean(*b)),
@@ -509,9 +551,11 @@ where
 {
     pub fn option_str(&self, name: &str) -> Result<Option<options::Value>> {
         self.option_values
+            .lock()
+            .unwrap()
             .get(name)
             .ok_or(anyhow!("No option named {}", name))
-            .map(|c| c.clone())
+            .cloned()
     }
 
     pub fn option<'a, OV: OptionType<'a>>(
@@ -520,6 +564,25 @@ where
     ) -> Result<OV::OutputValue> {
         let value = self.option_str(config_option.name())?;
         Ok(OV::from_value(&value))
+    }
+
+    pub fn set_option_str(&self, name: &str, value: options::Value) -> Result<()> {
+        *self
+            .option_values
+            .lock()
+            .unwrap()
+            .get_mut(name)
+            .ok_or(anyhow!("No option named {}", name))? = Some(value);
+        Ok(())
+    }
+
+    pub fn set_option<'a, OV: OptionType<'a>>(
+        &self,
+        config_option: &options::ConfigOption<'a, OV>,
+        value: options::Value,
+    ) -> Result<()> {
+        self.set_option_str(config_option.name(), value)?;
+        Ok(())
     }
 }
 
@@ -542,7 +605,7 @@ where
         let plugin = Plugin {
             state,
             options: self.options,
-            option_values: self.option_values,
+            option_values: Arc::new(std::sync::Mutex::new(self.option_values)),
             configuration: self.configuration,
             wait_handle,
             sender,
@@ -551,8 +614,10 @@ where
         let driver = PluginDriver {
             plugin: plugin.clone(),
             rpcmethods: self.rpcmethods,
+            setconfig_callback: self.setconfig_callback,
             hooks: self.hooks,
             subscriptions: self.subscriptions,
+            wildcard_subscription: self.wildcard_subscription,
         };
 
         output
@@ -688,9 +753,16 @@ where
                             .context("Missing 'method' in request")?
                             .as_str()
                             .context("'method' is not a string")?;
-                        let callback = self.rpcmethods.get(method).with_context(|| {
-                            anyhow!("No handler for method '{}' registered", method)
-                        })?;
+                        let callback = match method {
+                            name if name.eq("setconfig") => {
+                                self.setconfig_callback.as_ref().ok_or_else(|| {
+                                    anyhow!("No handler for method '{}' registered", method)
+                                })?
+                            }
+                            _ => self.rpcmethods.get(method).with_context(|| {
+                                anyhow!("No handler for method '{}' registered", method)
+                            })?,
+                        };
                         let params = request
                             .get("params")
                             .context("Missing 'params' field in request")?
@@ -715,7 +787,7 @@ where
                                     .send(json!({
                                     "jsonrpc": "2.0",
                                     "id": id,
-                                    "error": e.to_string(),
+                                    "error": parse_error(e.to_string()),
                                     }))
                                     .await
                                     .context("returning custom error"),
@@ -724,24 +796,44 @@ where
                         Ok(())
                     }
                     messages::JsonRpc::CustomNotification(request) => {
+                        // This code handles notifications
                         trace!("Dispatching custom notification {:?}", request);
                         let method = request
                             .get("method")
                             .context("Missing 'method' in request")?
                             .as_str()
                             .context("'method' is not a string")?;
-                        let callback = self.subscriptions.get(method).with_context(|| {
-                            anyhow!("No handler for notification '{}' registered", method)
-                        })?;
+
                         let params = request
                             .get("params")
-                            .context("Missing 'params' field in request")?
-                            .clone();
+                            .context("Missing 'params' field in request")?;
 
-                        let plugin = plugin.clone();
-                        let call = callback(plugin.clone(), params);
+                        // Send to notification to the wildcard
+                        // subscription "*" it it exists
+                        match &self.wildcard_subscription {
+                            Some(cb) => {
+                                let call = cb(plugin.clone(), params.clone());
+                                tokio::spawn(async move { call.await.unwrap() });
+                            }
+                            None => {}
+                        };
 
-                        tokio::spawn(async move { call.await.unwrap() });
+                        // Find the appropriate callback and process it
+                        // We'll log a warning if no handler is defined
+                        match self.subscriptions.get(method) {
+                            Some(cb) => {
+                                let call = cb(plugin.clone(), params.clone());
+                                tokio::spawn(async move { call.await.unwrap() });
+                            }
+                            None => {
+                                if self.wildcard_subscription.is_none() {
+                                    log::warn!(
+                                        "No handler for notification '{}' registered",
+                                        method
+                                    );
+                                }
+                            }
+                        };
                         Ok(())
                     }
                 }
@@ -810,6 +902,23 @@ pub enum FeatureBitsKind {
     Channel,
     Invoice,
     Init,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize, Debug)]
+struct RpcError {
+    pub code: Option<i32>,
+    pub message: String,
+    pub data: Option<serde_json::Value>,
+}
+fn parse_error(error: String) -> RpcError {
+    match serde_json::from_str::<RpcError>(&error) {
+        Ok(o) => o,
+        Err(_) => RpcError {
+            code: Some(-32700),
+            message: error,
+            data: None,
+        },
+    }
 }
 
 #[cfg(test)]

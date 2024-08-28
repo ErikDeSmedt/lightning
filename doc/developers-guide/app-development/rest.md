@@ -36,7 +36,7 @@ An online demo for the REST interface is available at [REST API REFERENCE](ref:g
 ## Installation
 
 The plugin is built-in with Core Lightning but its python dependencies are not, and must be installed separately.
-Install required packages with `pip install -r plugins/clnrest/requirements.txt`.
+Detailed installation instructions can be found [here](https://docs.corelightning.org/docs/installation#clnrest).
 
 Note: if you have the older c-lightning-REST plugin, you can configure Core Lightning with `disable-plugin=clnrest.py`
 option to avoid confusion with this one. You can also run both plugins simultaneously till all your applications
@@ -71,6 +71,8 @@ clnrest-cors-origins=http://192.168.1.50:3030
 clnrest-cors-origins=https?://127.0.0.1:([0-9]{1,4}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])
 
 ```
+
+- --clnrest-swagger-root: Root url for Swagger UI. Default is `/`. Example: `clnrest-swagger-root=/doc`
 
 ## Server
 

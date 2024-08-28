@@ -292,7 +292,7 @@ The [`lightning-listconfigs`](ref:lightning-listconfigs) command will output a v
 
   How long we need to spot an outdated close attempt: on opening a channel we tell our peer that this is how long they'll have to wait if they perform a unilateral close.
 
-- **max-locktime-blocks**=_BLOCKS_
+- **max-locktime-blocks**=_BLOCKS_ (*deprecated* in 24.05, *removed* in 24.11)
 
   The longest our funds can be delayed (ie. the longest **watchtime-blocks** our peer can ask for, and also the longest HTLC timeout we will accept). If our peer asks for longer, we'll refuse to create a channel, and if an HTLC asks for longer, we'll refuse it.
 
@@ -422,7 +422,7 @@ If a 'DNS' hostname was given that resolves to a local interface, the daemon wil
 
 - **announce-addr-dns**=_BOOL_
 
-  Set to _true_ (default is \_false), this so that names given as arguments to **addr** and \_announce-addr\*\* are published in node announcement messages as names, rather than IP addresses.  Please note that most mainnet nodes do not yet use, read or propagate this information correctly.
+  Set to _true_ (default is _false_), this so that names given as arguments to **addr** and **announce-addr** are published in node announcement messages as names, rather than IP addresses.  Please note that most mainnet nodes do not yet use, read or propagate this information correctly.
 
 - **announce-addr-discovered**=_true/false/auto_
 

@@ -303,7 +303,7 @@ static void peer_closing_complete(struct channel *channel, const u8 *msg)
 		return;
 
 	/* Channel gets dropped to chain cooperatively. */
-	drop_to_chain(channel->peer->ld, channel, true);
+	drop_to_chain(channel->peer->ld, channel, true, true /* rebroadcast */);
 	channel_set_state(channel,
 			  CLOSINGD_SIGEXCHANGE,
 			  CLOSINGD_COMPLETE,
@@ -364,7 +364,7 @@ void peer_start_closingd(struct channel *channel, struct peer_fd *peer_fd)
 	int hsmfd;
 	struct lightningd *ld = channel->peer->ld;
 	u32 final_commit_feerate;
-	bool option_anchor_outputs = channel_has(channel, OPT_ANCHOR_OUTPUTS);
+	bool option_anchor_outputs = channel_has(channel, OPT_ANCHOR_OUTPUTS_DEPRECATED);
 	bool option_anchors_zero_fee_htlc_tx = channel_has(channel, OPT_ANCHORS_ZERO_FEE_HTLC_TX);
 
 	if (!channel->shutdown_scriptpubkey[REMOTE]) {
@@ -376,6 +376,13 @@ void peer_start_closingd(struct channel *channel, struct peer_fd *peer_fd)
 	hsmfd = hsm_get_client_fd(ld, &channel->peer->id, channel->dbid,
 				  HSM_PERM_SIGN_CLOSING_TX
 				  | HSM_PERM_COMMITMENT_POINT);
+	if (hsmfd < 0) {
+		log_broken(channel->log, "Could not get hsm fd for closing: %s",
+			   strerror(errno));
+		force_peer_disconnect(ld, channel->peer,
+				      "Failed to get hsm fd for closingd");
+		return;
+	}
 
 	channel_set_owner(channel,
 			  new_channel_subd(channel, ld,
@@ -427,9 +434,6 @@ void peer_start_closingd(struct channel *channel, struct peer_fd *peer_fd)
 	if (channel->closing_feerate_range) {
 		min_feerate = channel->closing_feerate_range[0];
 		max_feerate = channel->closing_feerate_range[1];
-	} else if (channel->ignore_fee_limits || ld->config.ignore_fee_limits) {
-		min_feerate = 253;
-		max_feerate = 0xFFFFFFFF;
 	}
 
 	/* BOLT #3:
@@ -892,11 +896,6 @@ discard_unopened: {
 
 static const struct json_command close_command = {
 	"close",
-	"channels",
 	json_close,
-	"Close the channel with {id} "
-	"(either peer ID, channel ID, or short channel ID). "
-	"Force a unilateral close after {unilateraltimeout} seconds (default 48h). "
-	"If {destination} address is provided, will be used as output address."
 };
 AUTODATA(json_command, &close_command);

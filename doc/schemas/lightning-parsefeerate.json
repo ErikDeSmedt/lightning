@@ -32,50 +32,6 @@
       }
     }
   },
-  "example_json_request": [
-    {
-      "id": "example:parsefeerate#1",
-      "method": "parsefeerate",
-      "params": [
-        "unilateral_close"
-      ]
-    },
-    {
-      "id": "example:parsefeerate#2",
-      "method": "parsefeerate",
-      "params": [
-        "9999perkw"
-      ]
-    },
-    {
-      "id": "example:parsefeerate#3",
-      "method": "parsefeerate",
-      "params": [
-        10000
-      ]
-    },
-    {
-      "id": "example:parsefeerate#4",
-      "method": "parsefeerate",
-      "params": [
-        "urgent"
-      ]
-    }
-  ],
-  "example_json_response": [
-    {
-      "perkw": 11000
-    },
-    {
-      "perkw": 9999
-    },
-    {
-      "perkw": 2500
-    },
-    {
-      "perkw": 11000
-    }
-  ],
   "errors": [
     "The **parsefeerate** command will error if the *feerate_str* format is not recognized.",
     "",
@@ -86,5 +42,55 @@
   ],
   "resources": [
     "Main web site: <https://github.com/ElementsProject/lightning>"
+  ],
+  "examples": [
+    {
+      "request": {
+        "id": "example:parsefeerate#1",
+        "method": "parsefeerate",
+        "params": [
+          "unilateral_close"
+        ]
+      },
+      "response": {
+        "perkw": 11000
+      }
+    },
+    {
+      "request": {
+        "id": "example:parsefeerate#2",
+        "method": "parsefeerate",
+        "params": [
+          "9999perkw"
+        ]
+      },
+      "response": {
+        "perkw": 9999
+      }
+    },
+    {
+      "request": {
+        "id": "example:parsefeerate#3",
+        "method": "parsefeerate",
+        "params": [
+          10000
+        ]
+      },
+      "response": {
+        "perkw": 2500
+      }
+    },
+    {
+      "request": {
+        "id": "example:parsefeerate#4",
+        "method": "parsefeerate",
+        "params": [
+          "urgent"
+        ]
+      },
+      "response": {
+        "perkw": 11000
+      }
+    }
   ]
 }

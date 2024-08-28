@@ -68,6 +68,13 @@ struct local_hint {
  * get remove on failure. Success keeps the capacities, since the capacities
  * changed due to the successful HTLCs. */
 struct channel_hint {
+	/* The timestamp this observation was made. Used to let the
+	 * constraint expressed by this hint decay over time, until it
+	 * is fully relaxed, at which point we can forget about it
+	 * (the structural information is the best we can do in that
+	 * case).
+	 */
+	u32 timestamp;
 	/* The short_channel_id we're going to use when referring to
 	 * this channel. This can either be the real scid, or the
 	 * local alias. The `pay` algorithm doesn't really care which
@@ -180,8 +187,11 @@ struct payment {
 	/* The current phase we are in. */
 	enum payment_step step;
 
-	/* Real destination we want to route to */
-	struct node_id *destination;
+	/* Destination we want to route to */
+	struct node_id *route_destination;
+
+	/* Destination we want to pay to (can be different for blinded paths!) */
+	struct node_id *pay_destination;
 
 	/* Payment hash extracted from the invoice if any. */
 	struct sha256 *payment_hash;
@@ -197,7 +207,6 @@ struct payment {
 	struct blinded_payinfo *blindedpay;
 	struct amount_msat blindedouramount;
 	struct amount_msat blindedfinalamount;
-	u32 blindedfinalcltv;
 
 	u64 groupid;
 	u32 partid;
@@ -325,6 +334,15 @@ struct payment {
 	/* A human readable error message that is used as a top-level
 	 * explanation if a payment is aborted. */
 	char *aborterror;
+	/* A numeric error code to return to JSON-RPC callers. Allows
+	 * programmatically differentiate various errors, without
+	 * having to parse the `p->aborterror` string. */
+	u32 errorcode;
+
+	/* How many blocks are we lagging behind the rest of the
+	network? This needs to be taken into consideration when
+	sending payments before being fully caught up.*/
+	u32 chainlag;
 
 	/* Callback to be called when the entire payment process
 	 * completes successfully. */
@@ -435,17 +453,12 @@ struct route_exclusions_data {
 	struct route_exclusion **exclusions;
 };
 
-struct preapproveinvoice_data {
-	bool approved;
-};
-
 /* List of globally available payment modifiers. */
 REGISTER_PAYMENT_MODIFIER_HEADER(retry, struct retry_mod_data);
 REGISTER_PAYMENT_MODIFIER_HEADER(routehints, struct routehints_data);
 REGISTER_PAYMENT_MODIFIER_HEADER(exemptfee, struct exemptfee_data);
 REGISTER_PAYMENT_MODIFIER_HEADER(shadowroute, struct shadow_route_data);
 REGISTER_PAYMENT_MODIFIER_HEADER(directpay, struct direct_pay_data);
-extern struct payment_modifier waitblockheight_pay_mod;
 REGISTER_PAYMENT_MODIFIER_HEADER(presplit, struct presplit_mod_data);
 REGISTER_PAYMENT_MODIFIER_HEADER(adaptive_splitter, struct adaptive_split_mod_data);
 
@@ -460,7 +473,6 @@ REGISTER_PAYMENT_MODIFIER_HEADER(local_channel_hints, void);
  * each of those channels can bear.  */
 REGISTER_PAYMENT_MODIFIER_HEADER(payee_incoming_limit, void);
 REGISTER_PAYMENT_MODIFIER_HEADER(route_exclusions, struct route_exclusions_data);
-REGISTER_PAYMENT_MODIFIER_HEADER(check_preapproveinvoice, struct preapproveinvoice_data);
 
 
 struct payment *payment_new(tal_t *ctx, struct command *cmd,
@@ -488,10 +500,13 @@ void payment_fail(struct payment *p, const char *fmt, ...) PRINTF_FMT(2,3);
  * they can, and sets the root failreason so we have a sensible error
  * message. The failreason is overwritten if it is already set, since
  * we probably know better what happened in the modifier.. */
-void payment_abort(struct payment *p, const char *fmt, ...) PRINTF_FMT(2,3);
+void payment_abort(struct payment *p, enum jsonrpc_errcode code, const char *fmt, ...) PRINTF_FMT(3,4);
 
 struct payment *payment_root(struct payment *p);
 struct payment_tree_result payment_collect_result(struct payment *p);
+
+/* If you need an unmodified gossmap */
+struct gossmap *get_raw_gossmap(struct payment *payment);
 
 /* Add fields for successful payment: result can be NULL for selfpay */
 void json_add_payment_success(struct json_stream *js,
@@ -501,5 +516,8 @@ void json_add_payment_success(struct json_stream *js,
 
 /* Overriding io_poll for extra checks. */
 int libplugin_pay_poll(struct pollfd *fds, nfds_t nfds, int timeout);
+
+void
+paymod_log(struct payment *p, enum log_level l, const char *fmt, ...);
 
 #endif /* LIGHTNING_PLUGINS_LIBPLUGIN_PAY_H */

@@ -1421,15 +1421,6 @@ perform_fundpsbt(struct multifundchannel_command *mfc, u32 feerate)
 				tal_fmt(tmpctx, "%zu", startweight));
 	}
 
-	/* If we've got v2 opens, we need to use a min weight of 110. */
-	/* BOLT-f53ca2301232db780843e894f55d95d512f297f9 #3:
-	 * The minimum witness weight for an input is 110.
-	 */
-	if (dest_count(mfc, OPEN_CHANNEL) > 0) {
-		json_add_string(req->js, "min_witness_weight",
-				tal_fmt(tmpctx, "%u", 110));
-	}
-
 	/* Handle adding a change output if required. */
 	json_add_bool(req->js, "excess_as_change", true);
 
@@ -2027,15 +2018,6 @@ json_multifundchannel(struct command *cmd,
 const struct plugin_command multifundchannel_commands[] = {
 	{
 		"multifundchannel",
-		"channels",
-		"Fund channels to {destinations}, which is an array of "
-		"objects containing peer {id}, {amount}, and optional "
-		"{announce} and {push_msat}.  "
-		"A single transaction will be used to fund all the "
-		"channels.  "
-		"Use {feerate} for the transaction, select outputs that are "
-		"buried {minconf} blocks deep, or specify a set of {utxos}.",
-		"Fund multiple channels at once.",
 		json_multifundchannel
 	}
 };

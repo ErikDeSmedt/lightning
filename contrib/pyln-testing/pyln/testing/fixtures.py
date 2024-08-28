@@ -392,6 +392,12 @@ def _extra_validator(is_request: bool):
             return True
         return is_msat_request(checker, instance)
 
+    def is_sat_or_all(checker, instance):
+        """sat field, or 'all'"""
+        if instance == "all":
+            return True
+        return is_sat(checker, instance)
+
     def is_currency(checker, instance):
         """currency including currency code"""
         pattern = re.compile(r'^\d+(\.\d+)?[A-Z][A-Z][A-Z]$')
@@ -414,6 +420,7 @@ def _extra_validator(is_request: bool):
         "u8": is_u8,
         "pubkey": is_pubkey,
         "sat": is_sat,
+        "sat_or_all": is_sat_or_all,
         "msat": is_msat,
         "msat_or_all": is_msat_or_all,
         "msat_or_any": is_msat_or_any,
@@ -485,7 +492,7 @@ def node_factory(request, directory, test_name, bitcoind, executor, db_provider,
 
     map_node_error(nf.nodes, printValgrindErrors, "reported valgrind errors")
     map_node_error(nf.nodes, printCrashLog, "had crash.log files")
-    map_node_error(nf.nodes, lambda n: not n.allow_broken_log and n.daemon.is_in_log(r'\*\*BROKEN\*\*'), "had BROKEN messages")
+    map_node_error(nf.nodes, checkBroken, "had BROKEN messages")
     map_node_error(nf.nodes, lambda n: not n.allow_warning and n.daemon.is_in_log(r' WARNING:'), "had warning messages")
     map_node_error(nf.nodes, checkReconnect, "had unexpected reconnections")
 
@@ -598,10 +605,13 @@ def checkBadGossip(node):
 
 
 def checkBroken(node):
-    if node.allow_broken_log:
-        return 0
-    # We can get bad gossip order from inside error msgs.
-    if node.daemon.is_in_log(r'\*\*BROKEN\*\*'):
+    node.daemon.logs_catchup()
+    broken_lines = [l for l in node.daemon.logs if '**BROKEN**' in l]
+    if node.broken_log:
+        ex = re.compile(node.broken_log)
+        broken_lines = [l for l in broken_lines if not ex.search(l)]
+    if broken_lines:
+        print(broken_lines)
         return 1
     return 0
 

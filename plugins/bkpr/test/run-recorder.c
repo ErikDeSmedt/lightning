@@ -30,6 +30,13 @@
 /* Generated stub for account_entry_tag_str */
 const char *account_entry_tag_str(enum account_entry_tag tag UNNEEDED)
 { fprintf(stderr, "account_entry_tag_str called!\n"); abort(); }
+/* Generated stub for command_fail_badparam */
+struct command_result *command_fail_badparam(struct command *cmd UNNEEDED,
+					     const char *paramname UNNEEDED,
+					     const char *buffer UNNEEDED,
+					     const jsmntok_t *tok UNNEEDED,
+					     const char *msg UNNEEDED)
+{ fprintf(stderr, "command_fail_badparam called!\n"); abort(); }
 /* Generated stub for daemon_developer_mode */
 bool daemon_developer_mode(char *argv[])
 { fprintf(stderr, "daemon_developer_mode called!\n"); abort(); }
@@ -100,6 +107,10 @@ int htlc_state_flags(enum htlc_state state UNNEEDED)
 /* Generated stub for htlc_state_name */
 const char *htlc_state_name(enum htlc_state s UNNEEDED)
 { fprintf(stderr, "htlc_state_name called!\n"); abort(); }
+/* Generated stub for is_asterix_notification */
+bool is_asterix_notification(const char *notification_name UNNEEDED,
+			     const char *subscriptions UNNEEDED)
+{ fprintf(stderr, "is_asterix_notification called!\n"); abort(); }
 /* Generated stub for json_get_id */
 const char *json_get_id(const tal_t *ctx UNNEEDED,
 			const char *buffer UNNEEDED, const jsmntok_t *obj UNNEEDED)
@@ -173,12 +184,19 @@ bool json_to_u16(const char *buffer UNNEEDED, const jsmntok_t *tok UNNEEDED,
 /* Generated stub for json_tok_bin_from_hex */
 u8 *json_tok_bin_from_hex(const tal_t *ctx UNNEEDED, const char *buffer UNNEEDED, const jsmntok_t *tok UNNEEDED)
 { fprintf(stderr, "json_tok_bin_from_hex called!\n"); abort(); }
+/* Generated stub for json_tok_copy */
+jsmntok_t *json_tok_copy(const tal_t *ctx UNNEEDED, const jsmntok_t *tok UNNEEDED)
+{ fprintf(stderr, "json_tok_copy called!\n"); abort(); }
 /* Generated stub for json_tok_full */
 const char *json_tok_full(const char *buffer UNNEEDED, const jsmntok_t *t UNNEEDED)
 { fprintf(stderr, "json_tok_full called!\n"); abort(); }
 /* Generated stub for json_tok_full_len */
 int json_tok_full_len(const jsmntok_t *t UNNEEDED)
 { fprintf(stderr, "json_tok_full_len called!\n"); abort(); }
+/* Generated stub for json_tok_remove */
+void json_tok_remove(jsmntok_t **tokens UNNEEDED,
+		     jsmntok_t *obj_or_array UNNEEDED, const jsmntok_t *tok UNNEEDED, size_t num UNNEEDED)
+{ fprintf(stderr, "json_tok_remove called!\n"); abort(); }
 /* Generated stub for json_tok_streq */
 bool json_tok_streq(const char *buffer UNNEEDED, const jsmntok_t *tok UNNEEDED, const char *str UNNEEDED)
 { fprintf(stderr, "json_tok_streq called!\n"); abort(); }
@@ -199,6 +217,11 @@ struct channel_event *new_channel_event(const tal_t *ctx UNNEEDED,
 					u32 part_id UNNEEDED,
 					u64 timestamp UNNEEDED)
 { fprintf(stderr, "new_channel_event called!\n"); abort(); }
+/* Generated stub for param_check */
+bool param_check(struct command *cmd UNNEEDED,
+		 const char *buffer UNNEEDED,
+		 const jsmntok_t tokens[] UNNEEDED, ...)
+{ fprintf(stderr, "param_check called!\n"); abort(); }
 /* Generated stub for toks_alloc */
 jsmntok_t *toks_alloc(const tal_t *ctx UNNEEDED)
 { fprintf(stderr, "toks_alloc called!\n"); abort(); }
@@ -332,6 +355,8 @@ static bool chain_events_eq(struct chain_event *e1, struct chain_event *e2)
 	if (e1->desc)
 		CHECK(streq(e1->desc, e2->desc));
 
+	CHECK(e1->splice_close == e2->splice_close);
+
 	return true;
 }
 
@@ -383,6 +408,7 @@ static struct chain_event *make_chain_event(const tal_t *ctx,
 	ev->blockheight = blockheight;
 	ev->ignored = false;
 	ev->stealable = false;
+	ev->splice_close = false;
 	ev->desc = tal_fmt(ev, "hello hello");
 	memset(&ev->outpoint.txid, outpoint_char, sizeof(struct bitcoin_txid));
 	ev->outpoint.n = outnum;
@@ -1061,6 +1087,7 @@ static bool test_chain_event_crud(const tal_t *ctx, struct plugin *p)
 	ev1->blockheight = 1919191;
 	ev1->ignored = false;
 	ev1->stealable  = false;
+	ev1->splice_close = false;
 	memset(&ev1->outpoint.txid, 'D', sizeof(struct bitcoin_txid));
 	ev1->outpoint.n = 1;
 	ev1->spending_txid = tal(ctx, struct bitcoin_txid);
@@ -1082,6 +1109,7 @@ static bool test_chain_event_crud(const tal_t *ctx, struct plugin *p)
 	ev2->blockheight = 1919191;
 	ev2->ignored = false;
 	ev2->stealable = false;
+	ev2->splice_close = false;
 	memset(&ev2->outpoint.txid, 'D', sizeof(struct bitcoin_txid));
 	ev2->outpoint.n = 1;
 	ev2->spending_txid = NULL;
@@ -1101,6 +1129,7 @@ static bool test_chain_event_crud(const tal_t *ctx, struct plugin *p)
 	ev3->blockheight = 3939393;
 	ev3->ignored = false;
 	ev3->stealable = false;
+	ev3->splice_close = false;
 	memset(&ev3->outpoint.txid, 'E', sizeof(struct bitcoin_txid));
 	ev3->outpoint.n = 1;
 	ev3->spending_txid = tal(ctx, struct bitcoin_txid);
@@ -1328,6 +1357,7 @@ static bool test_account_crud(const tal_t *ctx, struct plugin *p)
 	ev1->blockheight = 1919191;
 	ev1->ignored = false;
 	ev1->stealable = false;
+	ev1->splice_close = false;
 	memset(&ev1->outpoint.txid, 'D', sizeof(struct bitcoin_txid));
 	ev1->outpoint.n = 1;
 	ev1->spending_txid = tal(ctx, struct bitcoin_txid);

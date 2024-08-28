@@ -209,23 +209,27 @@ static void disable_gossip_stream(struct seeker *seeker, struct peer *peer)
 	queue_peer_msg(peer->daemon, &peer->id, take(msg));
 }
 
-static void enable_gossip_stream(struct seeker *seeker, struct peer *peer)
+static void enable_gossip_stream(struct seeker *seeker, struct peer *peer,
+				 bool ask_for_all)
 {
 	u32 start;
 	u8 *msg;
 
+	/* If we have no gossip, always ask for everything */
+	if (!peer->daemon->gossip_store_populated)
+		ask_for_all = true;
+
 	/* Modern timestamp_filter is a trinary: 0 = all, FFFFFFFF = none,
 	 * other = from now on */
-	if (seeker->daemon->gossip_store_populated) {
+	if (ask_for_all) {
+		start = 0;
+	} else {
 		/* Just in case they care */
 		start = time_now().ts.tv_sec - GOSSIP_SEEKER_INTERVAL(seeker) * 10;
-	} else {
-		start = 0;
 	}
 
 	status_peer_debug(&peer->id, "seeker: starting gossip (%s)",
-			  seeker->daemon->gossip_store_populated
-			  ? "streaming" : "EVERTHING");
+			  ask_for_all ? "EVERYTHING" : "streaming");
 
 	/* This is allowed even if they don't understand it (odd) */
 	msg = towire_gossip_timestamp_filter(NULL,
@@ -235,9 +239,19 @@ static void enable_gossip_stream(struct seeker *seeker, struct peer *peer)
 	queue_peer_msg(peer->daemon, &peer->id, take(msg));
 }
 
-static void normal_gossip_start(struct seeker *seeker, struct peer *peer)
+static void normal_gossip_start(struct seeker *seeker, struct peer *peer, bool ask_for_all)
 {
 	bool enable_stream = false;
+
+	/* BOLT-remove-old-features #7:
+	 * Understanding of messages used to be indicated with the `gossip_queries`
+	 * feature bit; now these messages are universally supported, that feature has
+	 * now been slightly repurposed.  Not offering this feature means a node is not
+	 * worth querying for gossip: either they do not store the entire gossip map, or
+	 * they are only connected to a single peer (this one).
+	 */
+	if (!peer->gossip_queries_feature)
+		return;
 
 	/* Make this one of our streaming gossipers if we aren't full */
 	for (size_t i = 0; i < ARRAY_SIZE(seeker->gossiper); i++) {
@@ -249,7 +263,7 @@ static void normal_gossip_start(struct seeker *seeker, struct peer *peer)
 	}
 
 	if (enable_stream)
-		enable_gossip_stream(seeker, peer);
+		enable_gossip_stream(seeker, peer, ask_for_all);
 	else
 		disable_gossip_stream(seeker, peer);
 }
@@ -276,11 +290,12 @@ static struct short_channel_id *unknown_scids_remove(const tal_t *ctx,
 }
 
 /* We have selected this peer to stream us startup gossip */
-static void peer_gossip_startup(struct seeker *seeker, struct peer *peer)
+static void peer_gossip_startup(struct seeker *seeker, struct peer *peer,
+				bool ask_for_all)
 {
 	status_peer_debug(&peer->id, "seeker: chosen as startup peer");
 	selected_peer(seeker, peer);
-	normal_gossip_start(seeker, peer);
+	normal_gossip_start(seeker, peer, ask_for_all);
 }
 
 static bool peer_has_gossip_queries(const struct peer *peer)
@@ -794,7 +809,7 @@ static void check_firstpeer(struct seeker *seeker)
 			return;
 		}
 
-		peer_gossip_startup(seeker, peer);
+		peer_gossip_startup(seeker, peer, false);
 		return;
 	}
 
@@ -813,7 +828,7 @@ static void check_firstpeer(struct seeker *seeker)
 		if (p == peer)
 			continue;
 
-		normal_gossip_start(seeker, p);
+		normal_gossip_start(seeker, p, false);
 	}
 
 	/* Ask a random peer for all channels, in case we're missing */
@@ -850,6 +865,13 @@ static bool peer_is_not_gossipper(const struct peer *peer)
 {
 	const struct seeker *seeker = peer->daemon->seeker;
 
+	/* BOLT-remove-old-features #7:
+	 * `gossip_queries`... Not offering this feature means a node is not
+	 * worth querying for gossip
+	 */
+	if (!peer->gossip_queries_feature)
+		return false;
+
 	for (size_t i = 0; i < ARRAY_SIZE(seeker->gossiper); i++) {
 		if (seeker->gossiper[i] == peer)
 			return false;
@@ -864,7 +886,7 @@ static void maybe_rotate_gossipers(struct seeker *seeker)
 	struct peer *peer;
 	size_t i;
 
-	/* If all peers are gossiping, we're done */
+	/* If all (usable) peers are gossiping, we're done */
 	peer = random_seeker(seeker, peer_is_not_gossipper);
 	if (!peer)
 		return;
@@ -889,7 +911,7 @@ disable_gossiper:
 	disable_gossip_stream(seeker, seeker->gossiper[i]);
 set_gossiper:
 	seeker->gossiper[i] = peer;
-	enable_gossip_stream(seeker, peer);
+	enable_gossip_stream(seeker, peer, false);
 }
 
 static bool seek_any_unknown_nodes(struct seeker *seeker)
@@ -951,7 +973,7 @@ void seeker_setup_peer_gossip(struct seeker *seeker, struct peer *peer)
 	switch (seeker->state) {
 	case STARTING_UP:
 		if (seeker->random_peer == NULL)
-			peer_gossip_startup(seeker, peer);
+			peer_gossip_startup(seeker, peer, true);
 		/* Waiting for seeker_check to release us */
 		return;
 
@@ -961,7 +983,7 @@ void seeker_setup_peer_gossip(struct seeker *seeker, struct peer *peer)
 	case NORMAL:
 	case ASKING_FOR_UNKNOWN_SCIDS:
 	case ASKING_FOR_STALE_SCIDS:
-		normal_gossip_start(seeker, peer);
+		normal_gossip_start(seeker, peer, false);
 		return;
 	}
 	abort();

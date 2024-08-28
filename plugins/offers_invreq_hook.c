@@ -1,14 +1,20 @@
 #include "config.h"
 #include <bitcoin/chainparams.h>
 #include <bitcoin/preimage.h>
+#include <ccan/cast/cast.h>
+#include <ccan/mem/mem.h>
 #include <ccan/tal/str/str.h>
 #include <common/bech32_util.h>
 #include <common/blindedpath.h>
+#include <common/bolt12_id.h>
 #include <common/bolt12_merkle.h>
-#include <common/invoice_path_id.h>
+#include <common/gossmap.h>
 #include <common/iso4217.h>
 #include <common/json_stream.h>
+#include <common/memleak.h>
+#include <common/onion_message.h>
 #include <common/overflows.h>
+#include <errno.h>
 #include <plugins/offers.h>
 #include <plugins/offers_invreq_hook.h>
 #include <secp256k1_schnorrsig.h>
@@ -16,7 +22,10 @@
 
 /* We need to keep the reply path around so we can reply with invoice */
 struct invreq {
+	/* The invoice request we're replying to */
 	struct tlv_invoice_request *invreq;
+
+	/* They reply path they told us to use */
 	struct blinded_path *reply_path;
 
 	/* The offer id */
@@ -27,6 +36,9 @@ struct invreq {
 
 	/* The preimage for the invoice. */
 	struct preimage preimage;
+
+	/* Optional secret. */
+	const struct secret *secret;
 };
 
 static struct command_result *WARN_UNUSED_RESULT
@@ -181,7 +193,7 @@ static struct command_result *createinvoice_done(struct command *cmd,
 	}
 
 	payload = tlv_onionmsg_tlv_new(tmpctx);
-	payload->invoice = rawinv;
+	payload->invoice = tal_steal(payload, rawinv);
 	return send_onion_reply(cmd, ir->reply_path, payload);
 }
 
@@ -222,116 +234,16 @@ static struct command_result *create_invoicereq(struct command *cmd,
 	return send_outreq(cmd->plugin, req);
 }
 
-/* Create and encode an enctlv */
-static u8 *create_enctlv(const tal_t *ctx,
-			 /* in and out */
-			 struct privkey *blinding,
-			 const struct pubkey *node_id,
-			 struct short_channel_id *next_scid,
-			 struct tlv_encrypted_data_tlv_payment_relay *payment_relay,
-			 struct tlv_encrypted_data_tlv_payment_constraints *payment_constraints,
-			 u8 *path_secret,
-			 struct pubkey *node_alias)
-{
-	struct tlv_encrypted_data_tlv *tlv = tlv_encrypted_data_tlv_new(tmpctx);
-
-	tlv->short_channel_id = next_scid;
-	tlv->path_id = path_secret;
-	tlv->payment_relay = payment_relay;
-	tlv->payment_constraints = payment_constraints;
-	/* FIXME: Add padding! */
-
-	return encrypt_tlv_encrypted_data(ctx, blinding, node_id, tlv,
-					  blinding, node_alias);
-}
-
-/* If we only have private channels, we need to add a blinded path to the
- * invoice.  We need to choose a peer who supports blinded payments, too. */
-struct chaninfo {
-	struct pubkey id;
-	struct short_channel_id scid;
-	struct amount_msat capacity, htlc_min, htlc_max;
-	u32 feebase, feeppm, cltv;
-	bool public;
-};
-
 /* FIXME: This is naive:
  * - Only creates if we have no public channels.
  * - Always creates a path from direct neighbor.
  * - Doesn't append dummy hops.
  * - Doesn't pad to length.
  */
-/* (We only create if we have to, because our code doesn't handle
- * making a payment if the blinded path starts with ourselves!) */
-static struct command_result *listincoming_done(struct command *cmd,
-						const char *buf,
-						const jsmntok_t *result,
-						struct invreq *ir)
+static struct command_result *found_best_peer(struct command *cmd,
+					      const struct chaninfo *best,
+					      struct invreq *ir)
 {
-	const jsmntok_t *arr, *t;
-	size_t i;
-	struct chaninfo *best = NULL;
-	bool any_public = false;
-
-	arr = json_get_member(buf, result, "incoming");
-	json_for_each_arr(i, t, arr) {
-		struct chaninfo ci;
-		const jsmntok_t *pftok;
-		u8 *features;
-		const char *err;
-		struct amount_msat feebase;
-
-		err = json_scan(tmpctx, buf, t,
-				"{id:%,"
-				"incoming_capacity_msat:%,"
-				"htlc_min_msat:%,"
-				"htlc_max_msat:%,"
-				"fee_base_msat:%,"
-				"fee_proportional_millionths:%,"
-				"cltv_expiry_delta:%,"
-				"short_channel_id:%,"
-				"public:%}",
-				JSON_SCAN(json_to_pubkey, &ci.id),
-				JSON_SCAN(json_to_msat, &ci.capacity),
-				JSON_SCAN(json_to_msat, &ci.htlc_min),
-				JSON_SCAN(json_to_msat, &ci.htlc_max),
-				JSON_SCAN(json_to_msat, &feebase),
-				JSON_SCAN(json_to_u32, &ci.feeppm),
-				JSON_SCAN(json_to_u32, &ci.cltv),
-				JSON_SCAN(json_to_short_channel_id, &ci.scid),
-				JSON_SCAN(json_to_bool, &ci.public));
-		if (err) {
-			plugin_log(cmd->plugin, LOG_BROKEN,
-				   "Could not parse listincoming: %s",
-				   err);
-			continue;
-		}
-		ci.feebase = feebase.millisatoshis; /* Raw: feebase */
-		any_public |= ci.public;
-
-		/* Not presented if there's no channel_announcement for peer:
-		 * we could use listpeers, but if it's private we probably
-		 * don't want to blinded route through it! */
-		pftok = json_get_member(buf, t, "peer_features");
-		if (!pftok)
-			continue;
-		features = json_tok_bin_from_hex(tmpctx, buf, pftok);
-		if (!feature_offered(features, OPT_ROUTE_BLINDING))
-			continue;
-
-		if (amount_msat_less(ci.htlc_max,
-				     amount_msat(*ir->inv->invoice_amount)))
-			continue;
-
-		/* Only pick a private one if no public candidates. */
-		if (!best || (!best->public && ci.public))
-			best = tal_dup(tmpctx, struct chaninfo, &ci);
-	}
-
-	/* If there are any public channels, don't add. */
-	if (any_public)
-		goto done;
-
 	/* BOLT-offers #12:
 	 * - MUST include `invoice_paths` containing one or more paths to the node.
 	 * - MUST specify `invoice_paths` in order of most-preferred to
@@ -346,15 +258,31 @@ static struct command_result *listincoming_done(struct command *cmd,
 			   fmt_amount_msat(tmpctx,
 					   amount_msat(*ir->inv->invoice_amount)));
 	} else {
-		struct privkey blinding;
-		struct tlv_encrypted_data_tlv_payment_relay relay;
-		struct tlv_encrypted_data_tlv_payment_constraints constraints;
-		struct onionmsg_hop **hops;
+		struct tlv_encrypted_data_tlv **etlvs;
+		struct pubkey *ids;
+		struct short_channel_id **scids;
 		u32 base;
 
-		relay.cltv_expiry_delta = best->cltv;
-		relay.fee_base_msat = best->feebase;
-		relay.fee_proportional_millionths = best->feeppm;
+		/* Make a small 1-hop path to us */
+		ids = tal_arr(tmpctx, struct pubkey, 2);
+		ids[0] = best->id;
+		ids[1] = id;
+
+		/* This does nothing unless dev_invoice_internal_scid is set */
+		scids = tal_arrz(tmpctx, struct short_channel_id *, 2);
+		scids[1] = dev_invoice_internal_scid;
+
+		/* Make basic tlvs, add payment restrictions */
+		etlvs = new_encdata_tlvs(tmpctx, ids,
+					 cast_const2(const struct short_channel_id **,
+						     scids));
+
+		/* Tell the first node what restrictions we have on relaying */
+		etlvs[0]->payment_relay = tal(etlvs[0],
+					      struct tlv_encrypted_data_tlv_payment_relay);
+		etlvs[0]->payment_relay->cltv_expiry_delta = best->cltv;
+		etlvs[0]->payment_relay->fee_base_msat = best->feebase;
+		etlvs[0]->payment_relay->fee_proportional_millionths = best->feeppm;
 
 		/* BOLT-offers #12:
 		 * - if the expiry for accepting payment is not 7200 seconds
@@ -366,64 +294,70 @@ static struct command_result *listincoming_done(struct command *cmd,
 			base = blockheight + 6 + *ir->inv->invoice_relative_expiry / 600;
 		else
 			base = blockheight + 6 + 7200 / 600;
-		constraints.max_cltv_expiry = base + best->cltv + cltv_final;
-		constraints.htlc_minimum_msat = best->htlc_min.millisatoshis; /* Raw: tlv */
 
-		randombytes_buf(&blinding, sizeof(blinding));
+		etlvs[0]->payment_constraints = tal(etlvs[0],
+						    struct tlv_encrypted_data_tlv_payment_constraints);
+		etlvs[0]->payment_constraints->max_cltv_expiry = base + best->cltv + cltv_final;
+		etlvs[0]->payment_constraints->htlc_minimum_msat = best->htlc_min.millisatoshis; /* Raw: tlv */
+
+		/* So we recognize this payment */
+		etlvs[1]->path_id = bolt12_path_id(etlvs[1],
+						   &invoicesecret_base,
+						   ir->inv->invoice_payment_hash);
 
 		ir->inv->invoice_paths = tal_arr(ir->inv, struct blinded_path *, 1);
-		ir->inv->invoice_paths[0] = tal(ir->inv->invoice_paths, struct blinded_path);
-		ir->inv->invoice_paths[0]->first_node_id = best->id;
-		if (!pubkey_from_privkey(&blinding,
-					 &ir->inv->invoice_paths[0]->blinding))
-			abort();
-		hops = tal_arr(ir->inv->invoice_paths[0], struct onionmsg_hop *, 2);
-		ir->inv->invoice_paths[0]->path = hops;
+		ir->inv->invoice_paths[0]
+			= blinded_path_from_encdata_tlvs(ir->inv->invoice_paths,
+							 cast_const2(const struct tlv_encrypted_data_tlv **, etlvs),
+							 ids);
 
-		/* First hop is the peer */
-		hops[0] = tal(hops, struct onionmsg_hop);
-		hops[0]->encrypted_recipient_data
-			= create_enctlv(hops[0],
-					&blinding,
-					&best->id,
-					&best->scid,
-					&relay, &constraints,
-					NULL,
-					&hops[0]->blinded_node_id);
-		/* Second hops is us (so we can identify correct use of path) */
-		hops[1] = tal(hops, struct onionmsg_hop);
-		hops[1]->encrypted_recipient_data
-			= create_enctlv(hops[1],
-					&blinding,
-					&id,
-					NULL, NULL, NULL,
-					invoice_path_id(tmpctx, &invoicesecret_base,
-							ir->inv->invoice_payment_hash),
-					&hops[1]->blinded_node_id);
+		/* If they tell us to use scidd for first point, grab
+		 * a channel from node (must exist, it's public) */
+		if (dev_invoice_bpath_scid) {
+			struct gossmap *gossmap = get_gossmap(cmd->plugin);
+			struct node_id best_nodeid;
+			const struct gossmap_node *n;
+			const struct gossmap_chan *c;
+			struct short_channel_id_dir scidd;
+
+			node_id_from_pubkey(&best_nodeid, &best->id);
+			n = gossmap_find_node(gossmap, &best_nodeid);
+			c = gossmap_nth_chan(gossmap, n, 0, &scidd.dir);
+
+			scidd.scid = gossmap_chan_scid(gossmap, c);
+			sciddir_or_pubkey_from_scidd(&ir->inv->invoice_paths[0]->first_node_id,
+						     &scidd);
+			plugin_log(cmd->plugin, LOG_DBG, "dev_invoice_bpath_scid: start is %s",
+				   fmt_sciddir_or_pubkey(tmpctx,
+							 &ir->inv->invoice_paths[0]->first_node_id));
+		}
 
 		/* FIXME: This should be a "normal" feerate and range. */
 		ir->inv->invoice_blindedpay = tal_arr(ir->inv, struct blinded_payinfo *, 1);
 		ir->inv->invoice_blindedpay[0] = tal(ir->inv->invoice_blindedpay, struct blinded_payinfo);
 		ir->inv->invoice_blindedpay[0]->fee_base_msat = best->feebase;
 		ir->inv->invoice_blindedpay[0]->fee_proportional_millionths = best->feeppm;
-		ir->inv->invoice_blindedpay[0]->cltv_expiry_delta = best->cltv;
+		ir->inv->invoice_blindedpay[0]->cltv_expiry_delta = best->cltv + cltv_final;
 		ir->inv->invoice_blindedpay[0]->htlc_minimum_msat = best->htlc_min;
 		ir->inv->invoice_blindedpay[0]->htlc_maximum_msat = best->htlc_max;
 		ir->inv->invoice_blindedpay[0]->features = NULL;
 	}
 
-done:
 	return create_invoicereq(cmd, ir);
 }
 
 static struct command_result *add_blindedpaths(struct command *cmd,
 					       struct invreq *ir)
 {
-	struct out_req *req;
+	struct node_id local_nodeid;
 
-	req = jsonrpc_request_start(cmd->plugin, cmd, "listincoming",
-				    listincoming_done, listincoming_done, ir);
-	return send_outreq(cmd->plugin, req);
+	/* Don't bother if we're public */
+	node_id_from_pubkey(&local_nodeid, &id);
+	if (gossmap_find_node(get_gossmap(cmd->plugin), &local_nodeid))
+		create_invoicereq(cmd, ir);
+
+	return find_best_peer(cmd, OPT_ROUTE_BLINDING,
+			      found_best_peer, ir);
 }
 
 static struct command_result *check_period(struct command *cmd,
@@ -844,7 +778,49 @@ static struct command_result *listoffers_done(struct command *cmd,
 	if (arr->size == 0)
 		return fail_invreq(cmd, ir, "Unknown offer");
 
+	/* Now, since we looked up by hash, we know that the entire offer
+	 * is faithfully mirrored in this invreq. */
+
+	/* BOLT-offers #4:
+	 *
+	 * The final recipient:
+	 *...
+	 * - MUST ignore the message if the `path_id` does not match
+	 * the blinded route it created
+	 */
 	offertok = arr + 1;
+	if (ir->secret) {
+		struct sha256 offer_id;
+		struct secret blinding_path_secret;
+		struct blinded_path **offer_paths;
+
+		if (!ir->invreq->offer_paths) {
+			/* You should not have used a blinded path for invreq */
+			if (command_dev_apis(cmd))
+				return fail_invreq(cmd, ir, "Unexpected blinded path");
+			return fail_invreq(cmd, ir, "Unknown offer");
+		}
+		/* We generated this without the paths, so temporarily remove them */
+		offer_paths = ir->invreq->offer_paths;
+		ir->invreq->offer_paths = NULL;
+		invreq_offer_id(ir->invreq, &offer_id);
+		ir->invreq->offer_paths = offer_paths;
+		bolt12_path_secret(&offerblinding_base, &offer_id,
+				   &blinding_path_secret);
+		if (!secret_eq_consttime(ir->secret, &blinding_path_secret)) {
+			/* You used the wrong blinded path for invreq */
+			if (command_dev_apis(cmd))
+				return fail_invreq(cmd, ir, "Wrong blinded path");
+			return fail_invreq(cmd, ir, "Unknown offer");
+		}
+	} else {
+		if (ir->invreq->offer_paths) {
+			/* You should have used a blinded path for invreq */
+			if (command_dev_apis(cmd))
+				return fail_invreq(cmd, ir, "Expected blinded path");
+			return fail_invreq(cmd, ir, "Unknown offer");
+		}
+	}
 
 	activetok = json_get_member(buf, offertok, "active");
 	if (!activetok) {
@@ -857,8 +833,6 @@ static struct command_result *listoffers_done(struct command *cmd,
 	if (!active)
 		return fail_invreq(cmd, ir, "Offer no longer available");
 
-	/* Now, since we looked up by hash, we know that the entire offer
-	 * is faithfully mirrored in this invreq. */
 	b12tok = json_get_member(buf, offertok, "bolt12");
 	if (!b12tok) {
 		return fail_internalerr(cmd, ir,
@@ -955,11 +929,11 @@ static struct command_result *listoffers_done(struct command *cmd,
 	assert(ir->inv->invreq_payer_id);
 
 	/* BOLT-offers #12:
-	 *   - if `offer_node_id` is present:
-	 *     - MUST set `invoice_node_id` to `offer_node_id`.
+	 *   - if `offer_issuer_id` is present:
+	 *     - MUST set `invoice_node_id` to the `offer_issuer_id`
 	 */
-	/* We always provide an offer_node_id! */
-	ir->inv->invoice_node_id = ir->inv->offer_node_id;
+	/* FIXME: We always provide an offer_issuer_id! */
+	ir->inv->invoice_node_id = ir->inv->offer_issuer_id;
 
 	/* BOLT-offers #12:
 	 * - MUST set `invoice_created_at` to the number of seconds since
@@ -996,21 +970,36 @@ static struct command_result *listoffers_done(struct command *cmd,
 
 struct command_result *handle_invoice_request(struct command *cmd,
 					      const u8 *invreqbin,
-					      struct blinded_path *reply_path)
+					      struct blinded_path *reply_path,
+					      const struct secret *secret)
 {
+	struct out_req *req;
+	int bad_feature;
 	size_t len = tal_count(invreqbin);
 	const u8 *cursor = invreqbin;
 	struct invreq *ir = tal(cmd, struct invreq);
-	struct out_req *req;
-	int bad_feature;
 
 	ir->reply_path = tal_steal(ir, reply_path);
-
+	ir->secret = tal_dup_or_null(ir, struct secret, secret);
 	ir->invreq = fromwire_tlv_invoice_request(cmd, &cursor, &len);
+
 	if (!ir->invreq) {
-		return fail_invreq(cmd, ir,
-				   "Invalid invreq %s",
-				   tal_hex(tmpctx, invreqbin));
+		return fail_invreq(cmd, ir, "Invalid invreq");
+	}
+
+	/* BOLT-offers #12:
+	 * The reader:
+	 * ...
+	 *  - MUST fail the request if any non-signature TLV fields are outside the inclusive ranges: 0 to 159 and 1000000000 to 2999999999
+	 */
+	/* BOLT-offers #12:
+	 * Each form is signed using one or more *signature TLV elements*:
+	 * TLV types 240 through 1000 (inclusive)
+	 */
+	if (any_field_outside_range(ir->invreq->fields, true,
+				    0, 159,
+				    1000000000, 2999999999)) {
+		return fail_invreq(cmd, ir, "Invalid high fields");
 	}
 
 	/* BOLT-offers #12:
@@ -1023,20 +1012,6 @@ struct command_result *handle_invoice_request(struct command *cmd,
 		return fail_invreq(cmd, ir, "Missing invreq_payer_id");
 	if (!ir->invreq->invreq_metadata)
 		return fail_invreq(cmd, ir, "Missing invreq_metadata");
-
-	/* BOLT-offers #12:
-	 * The reader:
-	 * ...
-	 *  - MUST fail the request if any non-signature TLV fields greater or
-	 *    equal to 160.
-	 */
-	/* BOLT-offers #12:
-	 * Each form is signed using one or more *signature TLV elements*:
-	 * TLV types 240 through 1000 (inclusive)
-	 */
-	if (tlv_span(invreqbin, 0, 159, NULL)
-	    + tlv_span(invreqbin, 240, 1000, NULL) != tal_bytelen(invreqbin))
-		return fail_invreq(cmd, ir, "Fields beyond 160");
 
 	/* BOLT-offers #12:
 	 *
@@ -1072,16 +1047,16 @@ struct command_result *handle_invoice_request(struct command *cmd,
 
 	/* BOLT-offers #12:
 	 *
-	 * - otherwise (no `offer_node_id`, not a response to our offer):
+	 * - otherwise (no `offer_issuer_id` or `offer_paths`, not a response to our offer):
 	 */
 	/* FIXME-OFFERS: handle this! */
-	if (!ir->invreq->offer_node_id) {
+	if (!ir->invreq->offer_issuer_id && !ir->invreq->offer_paths) {
 		return fail_invreq(cmd, ir, "Not based on an offer");
 	}
 
 	/* BOLT-offers #12:
 	 *
-	 * - if `offer_node_id` is present (response to an offer):
+	 * - if `offer_issuer_id` or `offer_paths` are present (response to an offer):
 	 *   - MUST fail the request if the offer fields do not exactly match a
 	 *     valid, unexpired offer.
 	 */
@@ -1093,4 +1068,3 @@ struct command_result *handle_invoice_request(struct command *cmd,
 	json_add_sha256(req->js, "offer_id", &ir->offer_id);
 	return send_outreq(cmd->plugin, req);
 }
-

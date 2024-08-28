@@ -291,17 +291,54 @@ fail:
 	return false;
 }
 
+static const struct tlv_field *unknown_field(const struct tlv_field *field,
+					     const struct tlv_field *end)
+{
+	while (field < end) {
+		if (!field->meta)
+			return field;
+		field++;
+	}
+	return NULL;
+}
+
+static const struct tlv_field *next_unknown_field(const struct tlv_field *field,
+						  const struct tlv_field *end)
+{
+	return unknown_field(field + 1, end);
+}
+
+static const struct tlv_field *first_unknown_field(const struct tlv_field *fields,
+						   const struct tlv_field **end)
+{
+	*end = fields + tal_count(fields);
+	return unknown_field(fields, *end);
+}
+
 void towire_tlv(u8 **pptr,
 		const struct tlv_record_type *types, size_t num_types,
 		const void *record)
 {
+	const struct tlv_field *field, *end;
 	if (!record)
 		return;
+
+	/* First field is always "struct tlv_field *fields;" */
+	field = first_unknown_field(*(struct tlv_field **)record, &end);
 
 	for (size_t i = 0; i < num_types; i++) {
 		u8 *val;
 		if (i != 0)
 			assert(types[i].type > types[i-1].type);
+
+		/* Do any unknown fields first */
+		while (field && field->numtype < types[i].type) {
+			towire_bigsize(pptr, field->numtype);
+			towire_bigsize(pptr, field->length);
+			towire(pptr, field->value, field->length);
+			field = next_unknown_field(field, end);
+		}
+
 		val = types[i].towire(NULL, record);
 		if (!val)
 			continue;
@@ -317,19 +354,41 @@ void towire_tlv(u8 **pptr,
 		towire(pptr, val, tal_bytelen(val));
 		tal_free(val);
 	}
+
+	/* Add any trailing unknown fields */
+	while (field) {
+		towire_bigsize(pptr, field->numtype);
+		towire_bigsize(pptr, field->length);
+		towire(pptr, field->value, field->length);
+		field = next_unknown_field(field, end);
+	}
+
 }
 
-struct tlv_field *tlv_make_fields_(const struct tlv_record_type *types,
-				   size_t num_types,
-				   const void *record)
+void tlv_update_fields_(const struct tlv_record_type *types,
+			size_t num_types,
+			const void *record,
+			struct tlv_field **tlv_fields)
 {
+	/* We merge unknown fields from record */
+	const struct tlv_field *field, *end;
 	struct tlv_field *fields = tal_arr(record, struct tlv_field, 0);
+
+	field = first_unknown_field(*tlv_fields, &end);
 
 	for (size_t i = 0; i < num_types; i++) {
 		struct tlv_field f;
 		u8 *val;
 		if (i != 0)
 			assert(types[i].type > types[i-1].type);
+
+		/* Add any unknowns which precede this. */
+		while (field && field->numtype < types[i].type) {
+			tal_steal(fields, field->value);
+			tal_arr_expand(&fields, *field);
+			field = next_unknown_field(field, end);
+		}
+
 		val = types[i].towire(NULL, record);
 		if (!val)
 			continue;
@@ -340,5 +399,14 @@ struct tlv_field *tlv_make_fields_(const struct tlv_record_type *types,
 		f.value = tal_steal(fields, val);
 		tal_arr_expand(&fields, f);
 	}
-	return fields;
+
+	/* Add any unknowns at the end. */
+	while (field) {
+		tal_steal(fields, field->value);
+		tal_arr_expand(&fields, *field);
+		field = next_unknown_field(field, end);
+	}
+
+	tal_free(*tlv_fields);
+	*tlv_fields = fields;
 }

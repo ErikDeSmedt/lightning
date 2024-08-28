@@ -6,6 +6,12 @@ doc-wrongdir:
 
 GENERATE_MARKDOWN := doc/lightning-addgossip.7 \
 	doc/lightning-addpsbtoutput.7 \
+	doc/lightning-askrene-create-channel.7 \
+	doc/lightning-askrene-disable-node.7 \
+	doc/lightning-askrene-inform-channel.7 \
+	doc/lightning-askrene-listlayers.7 \
+	doc/lightning-askrene-reserve.7 \
+	doc/lightning-askrene-unreserve.7 \
 	doc/lightning-autoclean-once.7 \
 	doc/lightning-autoclean-status.7 \
 	doc/lightning-batching.7 \
@@ -53,6 +59,7 @@ GENERATE_MARKDOWN := doc/lightning-addgossip.7 \
 	doc/lightning-getinfo.7 \
 	doc/lightning-getlog.7 \
 	doc/lightning-getroute.7 \
+	doc/lightning-getroutes.7 \
 	doc/lightning-help.7 \
 	doc/lightning-invoice.7 \
 	doc/lightning-invoicerequest.7 \
@@ -90,6 +97,7 @@ GENERATE_MARKDOWN := doc/lightning-addgossip.7 \
 	doc/lightning-plugin.7 \
 	doc/lightning-preapproveinvoice.7 \
 	doc/lightning-preapprovekeysend.7 \
+	doc/lightning-reckless.7 \
 	doc/lightning-recoverchannel.7 \
 	doc/lightning-recover.7 \
 	doc/lightning-renepay.7 \
@@ -98,7 +106,6 @@ GENERATE_MARKDOWN := doc/lightning-addgossip.7 \
 	doc/lightning-sendcustommsg.7 \
 	doc/lightning-sendinvoice.7 \
 	doc/lightning-sendonion.7 \
-	doc/lightning-sendonionmessage.7 \
 	doc/lightning-sendpay.7 \
 	doc/lightning-sendpsbt.7 \
 	doc/lightning-setchannel.7 \
@@ -149,7 +156,7 @@ doc/schemas/lightning-sql.json: doc/schemas/lightning-sql-template.json plugins/
 
 doc-all: $(MANPAGES) doc/index.rst
 
-SCHEMAS := $(wildcard doc/schemas/lightning-*.json)
+SCHEMAS := $(wildcard doc/schemas/lightning-*.json) $(wildcard doc/schemas/notification/*.json)
 
 # Don't try to build lightning-sql.json tables with plugins/sql if we don't have sqlite3
 ifeq ($(HAVE_SQLITE3),0)
@@ -185,11 +192,14 @@ else
 LOWDOWN := lowdown
 endif
 
-$(MANPAGES): doc/%: doc/%.md tools/md2man.sh version_gen.h
-	@VERSION=$(VERSION) tools/md2man.sh $(LOWDOWN) $< > $@
+# For versions in documentation, we don't change with every git version, to
+# save build time.  We simply to pre-XXX and XXX.
+doc/.doc_version: version_gen.h
+	@if [ "$(VERSION)" = "$(CLN_NEXT_VERSION)" ]; then DOC_VERSION="$(VERSION)"; else DOC_VERSION="pre-$(CLN_NEXT_VERSION)"; fi; echo $$DOC_VERSION > $@.new
+	@if cmp $@.new $@ >/dev/null 2>&1; then rm -f $@.new; else mv $@.new $@; $(ECHO) Documentation version updated to `cat doc/.doc_version`; fi
 
-$(MANPAGES): $(FORCE)
-$(MARKDOWN_WITH_SCHEMA): $(FORCE)
+$(MANPAGES): doc/%: doc/%.md tools/md2man.sh doc/.doc_version
+	@VERSION=`cat doc/.doc_version` tools/md2man.sh $(LOWDOWN) $< > $@
 
 doc/protocol-%.svg: test/test_protocol
 	test/test_protocol --svg < test/commits/$*.script > $@
@@ -234,7 +244,7 @@ check-config-docs:
 	@for c in `grep -v '\[plugin ' doc/lightningd-config.5.md | sed -n 's/^ \*\*\([^*]*\)\*\*.*/\1/p' | grep -v '^\(help\|version\|mainnet\|testnet\|signet\|plugin\|important-plugin\|plugin-dir\|clear-plugins\)$$'`; do if ! grep -q '"'"$$c"'"' doc/schemas/lightning-listconfigs.json; then echo "$$c documented but not in schema!"; exit 1; fi; done
 
 doc-clean:
-	$(RM) $(MANPAGES) $(MARKDOWN_WITH_SCHEMA)
+	$(RM) $(MANPAGES) $(MARKDOWN_WITH_SCHEMA) doc/.doc_version
 	$(RM) doc/deployable-lightning.{aux,bbl,blg,dvi,log,out,tex}
 
 doc/index.rst: $(MANPAGES:=.md)

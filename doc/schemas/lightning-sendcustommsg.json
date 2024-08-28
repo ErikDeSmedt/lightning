@@ -48,21 +48,6 @@
       "If any of the above limitations is not respected the method returns an explicit error message stating the issue."
     ]
   },
-  "example_json_request": [
-    {
-      "id": "example:sendcustommsg#5",
-      "method": "sendcustommsg",
-      "params": {
-        "node_id": "0266e4598d1d3c415f572a8488830b60f7e744ed9235eb0b1ba93283b315c03518",
-        "msg": "77770012"
-      }
-    }
-  ],
-  "example_json_response": [
-    {
-      "status": "Message sent to connectd for delivery"
-    }
-  ],
   "author": [
     "Christian Decker <<decker.christian@gmail.com>> is mainly responsible."
   ],
@@ -72,5 +57,20 @@
   ],
   "resources": [
     "Main web site: <https://github.com/ElementsProject/lightning>"
+  ],
+  "examples": [
+    {
+      "request": {
+        "id": "example:sendcustommsg#1",
+        "method": "sendcustommsg",
+        "params": {
+          "node_id": "035d2b1192dfba134e10e540875d366ebc8bc353d5aa766b80c090b39c3a5d885d",
+          "msg": "77770012"
+        }
+      },
+      "response": {
+        "status": "Message sent to connectd for delivery"
+      }
+    }
   ]
 }

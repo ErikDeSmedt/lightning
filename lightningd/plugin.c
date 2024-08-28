@@ -15,6 +15,7 @@
 #include <common/features.h>
 #include <common/json_command.h>
 #include <common/memleak.h>
+#include <common/plugin.h>
 #include <common/timeout.h>
 #include <common/version.h>
 #include <connectd/connectd_wiregen.h>
@@ -356,6 +357,7 @@ struct plugin *plugin_register(struct plugins *plugins, const char* path TAKES,
 	p->checksum = file_checksum(plugins->ld, p->cmd);
 	p->shortname = path_basename(p, p->cmd);
 	p->start_cmd = start_cmd;
+	p->can_check = false;
 
 	p->plugin_state = UNCONFIGURED;
 	p->js_arr = tal_arr(p, struct json_stream *, 0);
@@ -1299,6 +1301,46 @@ struct plugin *find_plugin_for_command(struct lightningd *ld,
 	return NULL;
 }
 
+static struct command_result *plugin_rpcmethod_check(struct command *cmd,
+						     const char *buffer,
+						     const jsmntok_t *toks,
+						     const jsmntok_t *params)
+{
+	const jsmntok_t *idtok;
+	struct plugin *plugin;
+	struct jsonrpc_request *req;
+
+	plugin = find_plugin_for_command(cmd->ld, cmd->json_cmd->name);
+	if (!plugin)
+		fatal("No plugin for %s ?", cmd->json_cmd->name);
+
+	assert(command_check_only(cmd));
+
+	if (!plugin->can_check) {
+		log_unusual(plugin->log, "Plugin does not support check command for %s (id %s)",
+			    cmd->json_cmd->name, cmd->id);
+		return command_check_done(cmd);
+	}
+
+	/* Find id again (we've parsed them before, this should not fail!) */
+	idtok = json_get_member(buffer, toks, "id");
+	assert(idtok != NULL);
+
+	/* Send check command through, it says it can handle it! */
+	req = jsonrpc_request_start_raw(plugin, "check",
+					cmd->id, plugin->non_numeric_ids,
+					plugin->log,
+					plugin_notify_cb,
+					plugin_rpcmethod_cb, cmd);
+
+	json_stream_forward_change_id(req->stream, buffer, toks, idtok, req->id);
+	json_stream_double_cr(req->stream);
+	plugin_request_send(plugin, req);
+	req->stream = NULL;
+
+	return command_still_pending(cmd);
+}
+
 static struct command_result *plugin_rpcmethod_dispatch(struct command *cmd,
 							const char *buffer,
 							const jsmntok_t *toks,
@@ -1309,12 +1351,12 @@ static struct command_result *plugin_rpcmethod_dispatch(struct command *cmd,
 	struct jsonrpc_request *req;
 	bool cmd_ok;
 
-	if (cmd->mode == CMD_CHECK)
-		return command_param_failed();
-
 	plugin = find_plugin_for_command(cmd->ld, cmd->json_cmd->name);
 	if (!plugin)
 		fatal("No plugin for %s ?", cmd->json_cmd->name);
+
+	/* This should go to plugin_rpcmethod_check! */
+	assert(!command_check_only(cmd));
 
 	/* Find ID again (We've parsed them before, this should not fail!) */
 	idtok = json_get_member(buffer, toks, "id");
@@ -1347,34 +1389,17 @@ static const char *plugin_rpcmethod_add(struct plugin *plugin,
 					const char *buffer,
 					const jsmntok_t *meth)
 {
-	const jsmntok_t *nametok, *categorytok, *desctok, *longdesctok,
-		*usagetok, *deprtok;
+	const jsmntok_t *nametok, *usagetok, *deprtok;
 	struct json_command *cmd;
 	const char *usage, *err;
 
 	nametok = json_get_member(buffer, meth, "name");
-	categorytok = json_get_member(buffer, meth, "category");
-	desctok = json_get_member(buffer, meth, "description");
-	longdesctok = json_get_member(buffer, meth, "long_description");
 	usagetok = json_get_member(buffer, meth, "usage");
 	deprtok = json_get_member(buffer, meth, "deprecated");
 
 	if (!nametok || nametok->type != JSMN_STRING) {
 		return tal_fmt(plugin,
 			    "rpcmethod does not have a string \"name\": %.*s",
-			    meth->end - meth->start, buffer + meth->start);
-	}
-
-	if (!desctok || desctok->type != JSMN_STRING) {
-		return tal_fmt(plugin,
-			    "rpcmethod does not have a string "
-			    "\"description\": %.*s",
-			    meth->end - meth->start, buffer + meth->start);
-	}
-
-	if (longdesctok && longdesctok->type != JSMN_STRING) {
-		return tal_fmt(plugin,
-			    "\"long_description\" is not a string: %.*s",
 			    meth->end - meth->start, buffer + meth->start);
 	}
 
@@ -1386,15 +1411,6 @@ static const char *plugin_rpcmethod_add(struct plugin *plugin,
 
 	cmd = notleak(tal(plugin, struct json_command));
 	cmd->name = json_strdup(cmd, buffer, nametok);
-	if (categorytok)
-		cmd->category = json_strdup(cmd, buffer, categorytok);
-	else
-		cmd->category = "plugin";
-	cmd->description = json_strdup(cmd, buffer, desctok);
-	if (longdesctok)
-		cmd->verbose = json_strdup(cmd, buffer, longdesctok);
-	else
-		cmd->verbose = cmd->description;
 	if (usagetok)
 		usage = json_strdup(tmpctx, buffer, usagetok);
 	else
@@ -1407,6 +1423,7 @@ static const char *plugin_rpcmethod_add(struct plugin *plugin,
 
 	cmd->dev_only = false;
 	cmd->dispatch = plugin_rpcmethod_dispatch;
+	cmd->check = plugin_rpcmethod_check;
 	if (!jsonrpc_command_add(plugin->plugins->ld->jsonrpc, cmd, usage)) {
 		struct plugin *p =
 		    find_plugin_for_command(plugin->plugins->ld, cmd->name);
@@ -1800,6 +1817,17 @@ static const char *plugin_parse_getmanifest_response(const char *buffer,
 		plugin->non_numeric_ids = !lightningd_deprecated_out_ok(ld, ld->deprecated_ok,
 									"plugin", "nonnumericids",
 									"v23.08", "v24.08");
+	}
+
+	tok = json_get_member(buffer, resulttok, "cancheck");
+	if (tok) {
+		if (!json_to_bool(buffer, tok, &plugin->can_check))
+			return tal_fmt(plugin,
+				       "Invalid cancheck: %.*s",
+				       json_tok_full_len(tok),
+				       json_tok_full(buffer, tok));
+	} else {
+		plugin->can_check = false;
 	}
 
 	err = plugin_notifications_add(buffer, resulttok, plugin);
@@ -2277,7 +2305,7 @@ static void plugin_setconfig_done(const char *buffer,
 	 * while we were in callback, and moved opt_table! */
 	ot = opt_find_long(psr->optname, NULL);
 	if (!ot) {
-		log_broken(command_log(psr->cmd),
+		log_broken(command_logger(psr->cmd),
 			   "Missing opt %s on plugin return?", psr->optname);
 		was_pending(command_fail(psr->cmd, LIGHTNINGD,
 					 "Missing opt %s on plugin return?", psr->optname));
@@ -2291,7 +2319,7 @@ static void plugin_setconfig_done(const char *buffer,
 	return;
 
 bad_response:
-	log_broken(command_log(psr->cmd),
+	log_broken(command_logger(psr->cmd),
 		   "Invalid setconfig %s response from plugin: %.*s",
 		   psr->optname,
 		   json_tok_full_len(toks), json_tok_full(buffer, toks));
@@ -2324,12 +2352,25 @@ struct command_result *plugin_set_dynamic_opt(struct command *cmd,
 	psr->optname = tal_strdup(psr, ot->names + 2);
 	psr->success = success;
 
-	req = jsonrpc_request_start(cmd, "setconfig",
-				    cmd->id,
-				    plugin->non_numeric_ids,
-				    command_log(cmd),
-				    NULL, plugin_setconfig_done,
-				    psr);
+	if (command_check_only(cmd)) {
+		/* If plugin doesn't support check, we can't check */
+		if (!plugin->can_check)
+			return command_check_done(cmd);
+		req = jsonrpc_request_start(cmd, "check",
+					    cmd->id,
+					    plugin->non_numeric_ids,
+					    command_logger(cmd),
+					    NULL, plugin_setconfig_done,
+					    psr);
+		json_add_string(req->stream, "command_to_check", "setconfig");
+	} else {
+		req = jsonrpc_request_start(cmd, "setconfig",
+					    cmd->id,
+					    plugin->non_numeric_ids,
+					    command_logger(cmd),
+					    NULL, plugin_setconfig_done,
+					    psr);
+	}
 	json_add_string(req->stream, "config", psr->optname);
 	if (psr->val)
 		json_add_string(req->stream, "val", psr->val);
@@ -2402,10 +2443,9 @@ static bool plugin_subscriptions_contains(struct plugin *plugin,
 {
 	for (size_t i = 0; i < tal_count(plugin->subscriptions); i++) {
 		if (streq(method, plugin->subscriptions[i])
-		    /* Asterisk is magic "all" */
-		    || streq(plugin->subscriptions[i], "*")) {
+		    || is_asterix_notification(method,
+					       plugin->subscriptions[i]))
 			return true;
-		}
 	}
 
 	return false;
@@ -2415,7 +2455,7 @@ bool plugin_single_notify(struct plugin *p,
 			  const struct jsonrpc_notification *n TAKES)
 {
 	bool interested;
-	if (plugin_subscriptions_contains(p, n->method)) {
+	if (p->plugin_state == INIT_COMPLETE && plugin_subscriptions_contains(p, n->method)) {
 		plugin_send(p, json_stream_dup(p, n->stream, p->log));
 		interested = true;
 	} else

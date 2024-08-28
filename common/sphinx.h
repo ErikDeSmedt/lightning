@@ -53,14 +53,10 @@ enum route_next_case {
  */
 struct sphinx_path;
 
-/*
- * All the necessary information to generate a valid onion for this hop on a
- * sphinx path. The payload is preserialized in order since the onion
- * generation is payload agnostic. */
+/* A single hop, to be encrypted into an onion */
 struct sphinx_hop {
 	struct pubkey pubkey;
 	const u8 *raw_payload;
-	struct hmac hmac;
 };
 
 struct route_step {
@@ -107,16 +103,13 @@ bool onion_shared_secret(
  * @hoppayload: the per-hop payload destined for the processing node.
  * @assocdata: associated data to commit to in HMACs
  * @assocdatalen: length of the assocdata
- * @has_realm: used for HTLCs, where first byte 0 is magical.
  */
 struct route_step *process_onionpacket(
 	const tal_t * ctx,
 	const struct onionpacket *packet,
 	const struct secret *shared_secret,
 	const u8 *assocdata,
-	const size_t assocdatalen,
-	bool has_realm
-	);
+	const size_t assocdatalen);
 
 /**
  * serialize_onionpacket - Serialize an onionpacket to a buffer.
@@ -215,6 +208,13 @@ bool sphinx_add_hop_has_length(struct sphinx_path *path, const struct pubkey *pu
  */
 void sphinx_add_hop(struct sphinx_path *path, const struct pubkey *pubkey,
 		    const u8 *payload TAKES);
+
+/**
+ * Do not use, function is cursed.
+ */
+void sphinx_add_v0_hop(struct sphinx_path *path, const struct pubkey *pubkey,
+		       const struct short_channel_id *scid,
+		       struct amount_msat forward, u32 outgoing_cltv);
 
 /**
  * Compute the size of the serialized payloads.

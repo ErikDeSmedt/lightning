@@ -142,7 +142,7 @@ def test_scid_upgrade(node_factory, bitcoind):
     # Created through the power of sed "s/X'\([0-9]*\)78\([0-9]*\)78\([0-9]*\)'/X'\13A\23A\3'/"
     l1 = node_factory.get_node(dbfile='oldstyle-scids.sqlite3.xz',
                                start=False, expect_fail=True,
-                               allow_broken_log=True)
+                               broken_log='Refusing to irreversibly upgrade db from version 104 to|Refusing to upgrade db from version 104 to')
 
     # Will refuse to upgrade (if not in a release!)
     version = subprocess.check_output(['lightningd/lightningd',
@@ -193,6 +193,10 @@ def test_last_tx_psbt_upgrade(node_factory, bitcoind):
     upgraded_psbts = ['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']
 
     l1 = node_factory.get_node(dbfile='last_tx_upgrade.sqlite3.xz',
+                               # FIXME: gossipd gets upset, since it seems like the db with remote announcement_sigs was
+                               # actually from l2, not l1.  But if we make this l1, then last_tx changes
+                               broken_log='gossipd rejected our channel announcement',
+                               allow_bad_gossip=True,
                                options={'database-upgrade': True})
 
     b64_last_txs = [base64.b64encode(x['last_tx']).decode('utf-8') for x in l1.db_query('SELECT last_tx FROM channels ORDER BY id;')]
@@ -207,6 +211,8 @@ def test_last_tx_psbt_upgrade(node_factory, bitcoind):
     time.sleep(2)
 
     l2 = node_factory.get_node(dbfile='last_tx_closed.sqlite3.xz',
+                               broken_log='gossipd rejected our channel announcement',
+                               allow_bad_gossip=True,
                                options={'database-upgrade': True})
     last_txs = [x['last_tx'] for x in l2.db_query('SELECT last_tx FROM channels ORDER BY id;')]
 
@@ -214,12 +220,6 @@ def test_last_tx_psbt_upgrade(node_factory, bitcoind):
     assert last_txs[0][:4] == b'psbt'
 
     bitcoind.rpc.decoderawtransaction(last_txs[1].hex())
-
-    # FIXME: gossipd gets upset, since it seems like the db with remote announcement_sigs was
-    # actually from l2, not l1.  But if we make this l1, then last_tx changes, so we just
-    # filter out gossipd messages here (we will still detect other broken msgs!)
-    l1.daemon.logs = [l for l in l1.daemon.logs if 'gossipd' not in l]
-    l2.daemon.logs = [l for l in l2.daemon.logs if 'gossipd' not in l]
 
 
 @pytest.mark.slow_test
@@ -256,7 +256,7 @@ def test_backfill_scriptpubkeys(node_factory, bitcoind):
     # Test the first time, all entries are with option_static_remotekey
     l1 = node_factory.get_node(node_id=3, dbfile='pubkey_regen.sqlite.xz',
                                # Our db had the old non-DER sig in psbt!
-                               allow_broken_log=True,
+                               broken_log='Forced database repair of psbt',
                                options={'database-upgrade': True})
     results = l1.db_query('SELECT hex(prev_out_tx) AS txid, hex(scriptpubkey) AS script FROM outputs')
     scripts = [{'txid': x['txid'], 'scriptpubkey': x['script']} for x in results]
@@ -293,7 +293,7 @@ def test_backfill_scriptpubkeys(node_factory, bitcoind):
 
     l2 = node_factory.get_node(node_id=3, dbfile='pubkey_regen_commitment_point.sqlite3.xz',
                                # Our db had the old non-DER sig in psbt!
-                               allow_broken_log=True,
+                               broken_log='Forced database repair of psbt',
                                options={'database-upgrade': True})
     results = l2.db_query('SELECT hex(prev_out_tx) AS txid, hex(scriptpubkey) AS script FROM outputs')
     scripts = [{'txid': x['txid'], 'scriptpubkey': x['script']} for x in results]
@@ -319,7 +319,7 @@ def test_optimistic_locking(node_factory, bitcoind):
     We start a node, wait for it to settle its write so we have a window where
     we can interfere, and watch the world burn (safely).
     """
-    l1 = node_factory.get_node(may_fail=True, allow_broken_log=True)
+    l1 = node_factory.get_node(may_fail=True, broken_log='lightningd:')
 
     sync_blockheight(bitcoind, [l1])
     l1.rpc.getinfo()
@@ -373,7 +373,7 @@ def test_local_basepoints_cache(bitcoind, node_factory):
         dbfile='no-local-basepoints.sqlite3.xz',
         start=False,
         # Our db had the old non-DER sig in psbt!
-        allow_broken_log=True,
+        broken_log='Forced database repair of psbt',
         options={'database-upgrade': True}
     )
 
@@ -447,8 +447,7 @@ def test_sqlite3_builtin_backup(bitcoind, node_factory):
 
 @unittest.skipIf(os.getenv('TEST_DB_PROVIDER', 'sqlite3') != 'sqlite3', "Don't know how to swap dbs in Postgres")
 def test_db_sanity_checks(bitcoind, node_factory):
-    l1, l2 = node_factory.get_nodes(2, opts=[{'allow_broken_log': True,
-                                              'may_fail': True}, {}])
+    l1, l2 = node_factory.get_nodes(2, opts=[{'may_fail': True, 'broken_log': 'Wallet node_id does not match HSM|Wallet blockchain hash does not match network blockchain hash'}, {}])
 
     l1.stop()
     l2.stop()

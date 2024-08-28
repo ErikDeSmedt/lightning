@@ -76,6 +76,8 @@
 //!     default : (), // We provide no default here
 //!     description : "A config option of type string that takes no default",
 //!     deprecated : false,     // Option is not deprecated
+//!     dynamic: false, //Option is not dynamic
+//!     multi: false, //Option must not be multi, use StringArray instead
 //! };
 //! ```
 //!
@@ -130,7 +132,7 @@
 //!     Ok(())
 //! }
 //! ```
-use serde::ser::Serializer;
+use serde::ser::{SerializeSeq, Serializer};
 use serde::Serialize;
 
 pub mod config_type {
@@ -139,9 +141,17 @@ pub mod config_type {
     #[derive(Clone, Debug)]
     pub struct DefaultInteger;
     #[derive(Clone, Debug)]
+    pub struct IntegerArray;
+    #[derive(Clone, Debug)]
+    pub struct DefaultIntegerArray;
+    #[derive(Clone, Debug)]
     pub struct String;
     #[derive(Clone, Debug)]
     pub struct DefaultString;
+    #[derive(Clone, Debug)]
+    pub struct StringArray;
+    #[derive(Clone, Debug)]
+    pub struct DefaultStringArray;
     #[derive(Clone, Debug)]
     pub struct Boolean;
     #[derive(Clone, Debug)]
@@ -152,14 +162,22 @@ pub mod config_type {
 
 /// Config values are represented as an i64. No default is used
 pub type IntegerConfigOption<'a> = ConfigOption<'a, config_type::Integer>;
+// Config values are represented as a Vec<i64>. No default is used.
+pub type IntegerArrayConfigOption<'a> = ConfigOption<'a, config_type::IntegerArray>;
 /// Config values are represented as a String. No default is used.
 pub type StringConfigOption<'a> = ConfigOption<'a, config_type::String>;
+// Config values are represented as a Vec<String>. No default is used.
+pub type StringArrayConfigOption<'a> = ConfigOption<'a, config_type::StringArray>;
 /// Config values are represented as a boolean. No default is used.
 pub type BooleanConfigOption<'a> = ConfigOption<'a, config_type::Boolean>;
 /// Config values are repsentedas an i64. A default is used
 pub type DefaultIntegerConfigOption<'a> = ConfigOption<'a, config_type::DefaultInteger>;
+// Config values are represented as a Vec<i64>. A default is used
+pub type DefaultIntegerArrayConfigOption<'a> = ConfigOption<'a, config_type::DefaultIntegerArray>;
 /// Config values are repsentedas an String. A default is used
 pub type DefaultStringConfigOption<'a> = ConfigOption<'a, config_type::DefaultString>;
+// Config values are represented as a Vec<String>. A default is used
+pub type DefaultStringArrayConfigOption<'a> = ConfigOption<'a, config_type::DefaultStringArray>;
 /// Config values are repsentedas an bool. A default is used
 pub type DefaultBooleanConfigOption<'a> = ConfigOption<'a, config_type::DefaultBoolean>;
 /// Config value is represented as a flag
@@ -196,6 +214,26 @@ impl<'a> OptionType<'a> for config_type::DefaultString {
     }
 }
 
+impl<'a> OptionType<'a> for config_type::DefaultStringArray {
+    type OutputValue = Vec<String>;
+    type DefaultValue = &'a str;
+
+    fn convert_default(value: &Self::DefaultValue) -> Option<Value> {
+        Some(Value::String(value.to_string()))
+    }
+
+    fn from_value(value: &Option<Value>) -> Self::OutputValue {
+        match value {
+            Some(Value::StringArray(s)) => s.clone(),
+            _ => panic!("Type mismatch. Expected string-array but found {:?}", value),
+        }
+    }
+
+    fn get_value_type() -> ValueType {
+        ValueType::String
+    }
+}
+
 impl<'a> OptionType<'a> for config_type::DefaultInteger {
     type OutputValue = i64;
     type DefaultValue = i64;
@@ -204,10 +242,33 @@ impl<'a> OptionType<'a> for config_type::DefaultInteger {
         Some(Value::Integer(*value))
     }
 
-    fn from_value(value: &Option<Value>) -> i64 {
+    fn from_value(value: &Option<Value>) -> Self::OutputValue {
         match value {
             Some(Value::Integer(i)) => *i,
             _ => panic!("Type mismatch. Expected Integer but found {:?}", value),
+        }
+    }
+
+    fn get_value_type() -> ValueType {
+        ValueType::Integer
+    }
+}
+
+impl<'a> OptionType<'a> for config_type::DefaultIntegerArray {
+    type OutputValue = Vec<i64>;
+    type DefaultValue = i64;
+
+    fn convert_default(value: &Self::DefaultValue) -> Option<Value> {
+        Some(Value::Integer(*value))
+    }
+
+    fn from_value(value: &Option<Value>) -> Self::OutputValue {
+        match value {
+            Some(Value::IntegerArray(i)) => i.clone(),
+            _ => panic!(
+                "Type mismatch. Expected Integer-array but found {:?}",
+                value
+            ),
         }
     }
 
@@ -223,7 +284,7 @@ impl<'a> OptionType<'a> for config_type::DefaultBoolean {
     fn convert_default(value: &bool) -> Option<Value> {
         Some(Value::Boolean(*value))
     }
-    fn from_value(value: &Option<Value>) -> bool {
+    fn from_value(value: &Option<Value>) -> Self::OutputValue {
         match value {
             Some(Value::Boolean(b)) => *b,
             _ => panic!("Type mismatch. Expected Boolean but found {:?}", value),
@@ -243,7 +304,7 @@ impl<'a> OptionType<'a> for config_type::Flag {
         Some(Value::Boolean(false))
     }
 
-    fn from_value(value: &Option<Value>) -> bool {
+    fn from_value(value: &Option<Value>) -> Self::OutputValue {
         match value {
             Some(Value::Boolean(b)) => *b,
             _ => panic!("Type mismatch. Expected Boolean but found {:?}", value),
@@ -263,12 +324,36 @@ impl<'a> OptionType<'a> for config_type::String {
         None
     }
 
-    fn from_value(value: &Option<Value>) -> Option<String> {
+    fn from_value(value: &Option<Value>) -> Self::OutputValue {
         match value {
             Some(Value::String(s)) => Some(s.to_string()),
             None => None,
             _ => panic!(
                 "Type mismatch. Expected Option<string> but found {:?}",
+                value
+            ),
+        }
+    }
+
+    fn get_value_type() -> ValueType {
+        ValueType::String
+    }
+}
+
+impl<'a> OptionType<'a> for config_type::StringArray {
+    type OutputValue = Option<Vec<String>>;
+    type DefaultValue = ();
+
+    fn convert_default(_value: &()) -> Option<Value> {
+        None
+    }
+
+    fn from_value(value: &Option<Value>) -> Self::OutputValue {
+        match value {
+            Some(Value::StringArray(s)) => Some(s.clone()),
+            None => None,
+            _ => panic!(
+                "Type mismatch. Expected Option<Vec<String>> but found {:?}",
                 value
             ),
         }
@@ -302,6 +387,31 @@ impl<'a> OptionType<'a> for config_type::Integer {
         ValueType::Integer
     }
 }
+
+impl<'a> OptionType<'a> for config_type::IntegerArray {
+    type OutputValue = Option<Vec<i64>>;
+    type DefaultValue = ();
+
+    fn convert_default(_value: &()) -> Option<Value> {
+        None
+    }
+
+    fn from_value(value: &Option<Value>) -> Self::OutputValue {
+        match value {
+            Some(Value::IntegerArray(i)) => Some(i.clone()),
+            None => None,
+            _ => panic!(
+                "Type mismatch. Expected Option<Vec<Integer>> but found {:?}",
+                value
+            ),
+        }
+    }
+
+    fn get_value_type() -> ValueType {
+        ValueType::Integer
+    }
+}
+
 impl<'a> OptionType<'a> for config_type::Boolean {
     type OutputValue = Option<bool>;
     type DefaultValue = ();
@@ -342,6 +452,8 @@ pub enum Value {
     String(String),
     Integer(i64),
     Boolean(bool),
+    StringArray(Vec<String>),
+    IntegerArray(Vec<i64>),
 }
 
 impl Serialize for Value {
@@ -353,6 +465,20 @@ impl Serialize for Value {
             Value::String(s) => serializer.serialize_str(s),
             Value::Integer(i) => serializer.serialize_i64(*i),
             Value::Boolean(b) => serializer.serialize_bool(*b),
+            Value::StringArray(sa) => {
+                let mut seq = serializer.serialize_seq(Some(sa.len()))?;
+                for element in sa {
+                    seq.serialize_element(element)?;
+                }
+                seq.end()
+            }
+            Value::IntegerArray(sa) => {
+                let mut seq = serializer.serialize_seq(Some(sa.len()))?;
+                for element in sa {
+                    seq.serialize_element(element)?;
+                }
+                seq.end()
+            }
         }
     }
 }
@@ -373,6 +499,8 @@ impl Value {
             Value::String(s) => Some(&s),
             Value::Integer(_) => None,
             Value::Boolean(_) => None,
+            Value::StringArray(_) => None,
+            Value::IntegerArray(_) => None,
         }
     }
 
@@ -410,6 +538,40 @@ impl Value {
             _ => None,
         }
     }
+
+    /// Returns true if the `Value` is a Vec<String>. Returns false otherwise.
+    ///
+    /// For any Value on which `is_str_arr` returns true, `as_str_arr` is
+    /// guaranteed to return the Vec<String> value.
+    pub fn is_str_arr(&self) -> bool {
+        self.as_str_arr().is_some()
+    }
+
+    /// If the `Value` is a Vec<String>, returns the associated Vec<String>.
+    /// Returns None otherwise.
+    pub fn as_str_arr(&self) -> Option<&Vec<String>> {
+        match self {
+            Value::StringArray(sa) => Some(sa),
+            _ => None,
+        }
+    }
+
+    /// Returns true if the `Value` is a Vec<i64>. Returns false otherwise.
+    ///
+    /// For any Value on which `is_i64_arr` returns true, `as_i64_arr` is
+    /// guaranteed to return the Vec<i64> value.
+    pub fn is_i64_arr(&self) -> bool {
+        self.as_i64_arr().is_some()
+    }
+
+    /// If the `Value` is a Vec<i64>, returns the associated Vec<i64>.
+    /// Returns None otherwise.
+    pub fn as_i64_arr(&self) -> Option<&Vec<i64>> {
+        match self {
+            Value::IntegerArray(sa) => Some(sa),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -420,6 +582,8 @@ pub struct ConfigOption<'a, V: OptionType<'a>> {
     pub default: V::DefaultValue,
     pub description: &'a str,
     pub deprecated: bool,
+    pub dynamic: bool,
+    pub multi: bool,
 }
 
 impl<'a, V: OptionType<'a>> ConfigOption<'a, V> {
@@ -430,6 +594,8 @@ impl<'a, V: OptionType<'a>> ConfigOption<'a, V> {
             default: <V as OptionType>::convert_default(&self.default),
             description: self.description.to_string(),
             deprecated: self.deprecated,
+            dynamic: self.dynamic,
+            multi: self.multi,
         }
     }
 }
@@ -445,7 +611,13 @@ impl<'a> DefaultStringConfigOption<'a> {
             default: default,
             description: description,
             deprecated: false,
+            dynamic: false,
+            multi: false,
         }
+    }
+    pub fn dynamic(mut self) -> Self {
+        self.dynamic = true;
+        self
     }
 }
 
@@ -456,7 +628,51 @@ impl<'a> StringConfigOption<'a> {
             default: (),
             description: description,
             deprecated: false,
+            dynamic: false,
+            multi: false,
         }
+    }
+    pub fn dynamic(mut self) -> Self {
+        self.dynamic = true;
+        self
+    }
+}
+
+impl<'a> DefaultStringArrayConfigOption<'a> {
+    pub const fn new_str_arr_with_default(
+        name: &'a str,
+        default: &'a str,
+        description: &'a str,
+    ) -> Self {
+        Self {
+            name,
+            default,
+            description,
+            deprecated: false,
+            dynamic: false,
+            multi: true,
+        }
+    }
+    pub fn dynamic(mut self) -> Self {
+        self.dynamic = true;
+        self
+    }
+}
+
+impl<'a> StringArrayConfigOption<'a> {
+    pub const fn new_str_arr_no_default(name: &'a str, description: &'a str) -> Self {
+        Self {
+            name,
+            default: (),
+            description,
+            deprecated: false,
+            dynamic: false,
+            multi: true,
+        }
+    }
+    pub fn dynamic(mut self) -> Self {
+        self.dynamic = true;
+        self
     }
 }
 
@@ -467,7 +683,13 @@ impl<'a> DefaultIntegerConfigOption<'a> {
             default: default,
             description: description,
             deprecated: false,
+            dynamic: false,
+            multi: false,
         }
+    }
+    pub fn dynamic(mut self) -> Self {
+        self.dynamic = true;
+        self
     }
 }
 
@@ -478,7 +700,51 @@ impl<'a> IntegerConfigOption<'a> {
             default: (),
             description: description,
             deprecated: false,
+            dynamic: false,
+            multi: false,
         }
+    }
+    pub fn dynamic(mut self) -> Self {
+        self.dynamic = true;
+        self
+    }
+}
+
+impl<'a> DefaultIntegerArrayConfigOption<'a> {
+    pub const fn new_i64_arr_with_default(
+        name: &'a str,
+        default: i64,
+        description: &'a str,
+    ) -> Self {
+        Self {
+            name,
+            default,
+            description,
+            deprecated: false,
+            dynamic: false,
+            multi: true,
+        }
+    }
+    pub fn dynamic(mut self) -> Self {
+        self.dynamic = true;
+        self
+    }
+}
+
+impl<'a> IntegerArrayConfigOption<'a> {
+    pub const fn new_i64_arr_no_default(name: &'a str, description: &'a str) -> Self {
+        Self {
+            name,
+            default: (),
+            description,
+            deprecated: false,
+            dynamic: false,
+            multi: true,
+        }
+    }
+    pub fn dynamic(mut self) -> Self {
+        self.dynamic = true;
+        self
     }
 }
 
@@ -489,7 +755,13 @@ impl<'a> BooleanConfigOption<'a> {
             description,
             default: (),
             deprecated: false,
+            dynamic: false,
+            multi: false,
         }
+    }
+    pub fn dynamic(mut self) -> Self {
+        self.dynamic = true;
+        self
     }
 }
 
@@ -500,7 +772,13 @@ impl<'a> DefaultBooleanConfigOption<'a> {
             description,
             default: default,
             deprecated: false,
+            dynamic: false,
+            multi: false,
         }
+    }
+    pub fn dynamic(mut self) -> Self {
+        self.dynamic = true;
+        self
     }
 }
 
@@ -511,7 +789,13 @@ impl<'a> FlagConfigOption<'a> {
             description,
             default: (),
             deprecated: false,
+            dynamic: false,
+            multi: false,
         }
+    }
+    pub fn dynamic(mut self) -> Self {
+        self.dynamic = true;
+        self
     }
 }
 
@@ -530,6 +814,8 @@ pub struct UntypedConfigOption {
     description: String,
     #[serde(skip_serializing_if = "is_false")]
     deprecated: bool,
+    dynamic: bool,
+    multi: bool,
 }
 
 impl UntypedConfigOption {
@@ -538,6 +824,10 @@ impl UntypedConfigOption {
     }
     pub fn default(&self) -> &Option<Value> {
         &self.default
+    }
+    pub fn dynamic(mut self) -> Self {
+        self.dynamic = true;
+        self
     }
 }
 
@@ -569,6 +859,8 @@ mod test {
                         "description":"description",
                         "default": "default",
                         "type": "string",
+                        "dynamic": false,
+                        "multi": false,
                     }),
             ),
             (
@@ -578,15 +870,23 @@ mod test {
                         "description":"description",
                         "default": 42,
                         "type": "int",
+                        "dynamic": false,
+                        "multi": false,
                     }),
             ),
             (
-                ConfigOption::new_bool_with_default("name", true, "description").build(),
+                {
+                    ConfigOption::new_bool_with_default("name", true, "description")
+                        .build()
+                        .dynamic()
+                },
                 json!({
                 "name": "name",
                         "description":"description",
                         "default": true,
                         "type": "bool",
+                        "dynamic": true,
+                        "multi": false,
                     }),
             ),
             (
@@ -595,7 +895,31 @@ mod test {
                     "name" : "name",
                     "description": "description",
                     "type" : "flag",
-                    "default" : false
+                    "default" : false,
+                    "dynamic": false,
+                    "multi": false,
+                }),
+            ),
+            (
+                ConfigOption::new_str_arr_with_default("name", "Default1", "description").build(),
+                json!({
+                    "name" : "name",
+                    "description": "description",
+                    "type" : "string",
+                    "default" : "Default1",
+                    "dynamic": false,
+                    "multi": true,
+                }),
+            ),
+            (
+                ConfigOption::new_i64_arr_with_default("name", -46, "description").build(),
+                json!({
+                    "name" : "name",
+                    "description": "description",
+                    "type" : "int",
+                    "default" : -46,
+                    "dynamic": false,
+                    "multi": true,
                 }),
             ),
         ];

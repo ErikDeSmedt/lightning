@@ -2,6 +2,7 @@
 #include <assert.h>
 #include <bitcoin/script.h>
 #include <ccan/tal/str/str.h>
+#include <common/json_stream.h>
 #include <common/lease_rates.h>
 #include <common/pseudorand.h>
 #include <inttypes.h>
@@ -20,19 +21,32 @@ const char *funder_opt_name(enum funder_opt opt)
 	abort();
 }
 
-char *funding_option(struct plugin *plugin, const char *arg, enum funder_opt *opt)
+char *funding_option(struct plugin *plugin, const char *arg, bool check_only, enum funder_opt *opt)
 {
+	enum funder_opt v;
 	if (streq(arg, "match"))
-		*opt = MATCH;
+		v = MATCH;
 	else if (streq(arg, "available"))
-		*opt = AVAILABLE;
+		v = AVAILABLE;
 	else if (streq(arg, "fixed"))
-		*opt = FIXED;
+		v = FIXED;
 	else
 		return tal_fmt(tmpctx, "'%s' is not a valid option"
 			       " (match, available, fixed)",
 			       arg);
+
+	if (!check_only)
+		*opt = v;
 	return NULL;
+}
+
+bool jsonfmt_funding_option(struct plugin *plugin,
+			    struct json_stream *js,
+			    const char *fieldname,
+			    enum funder_opt *opt)
+{
+	json_add_string(js, fieldname, funder_opt_name(*opt));
+	return true;
 }
 
 const char *funder_policy_desc(const tal_t *ctx,

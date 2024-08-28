@@ -3,7 +3,6 @@
 #include "config.h"
 #include <ccan/compiler/compiler.h>
 #include <ccan/short_types/short_types.h>
-#include <ccan/structeq/structeq.h>
 #include <ccan/tal/tal.h>
 #include <common/gossip_constants.h>
 
@@ -17,6 +16,12 @@ static inline bool short_channel_id_eq(struct short_channel_id a,
 				       struct short_channel_id b)
 {
 	return a.u64 == b.u64;
+}
+
+static inline size_t short_channel_id_hash(struct short_channel_id scid)
+{
+	/* scids cost money to generate, so simple hash works here */
+	return (scid.u64 >> 32) ^ (scid.u64 >> 16) ^ scid.u64;
 }
 
 /* BOLT #7:
@@ -35,6 +40,12 @@ struct short_channel_id_dir {
 	/* 0 == from lesser id node, 1 == to lesser id node */
 	int dir;
 };
+
+static inline bool short_channel_id_dir_eq(const struct short_channel_id_dir *a,
+					   const struct short_channel_id_dir *b)
+{
+	return short_channel_id_eq(a->scid, b->scid) && a->dir == b->dir;
+}
 
 static inline u32 short_channel_id_blocknum(struct short_channel_id scid)
 {

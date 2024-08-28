@@ -42,9 +42,6 @@ void fromwire_basepoints(const u8 **ptr UNNEEDED, size_t *max UNNEEDED,
 /* Generated stub for fromwire_chain_coin_mvt */
 void fromwire_chain_coin_mvt(const u8 **cursor UNNEEDED, size_t *max UNNEEDED, struct chain_coin_mvt *mvt UNNEEDED)
 { fprintf(stderr, "fromwire_chain_coin_mvt called!\n"); abort(); }
-/* Generated stub for fromwire_ext_key */
-void fromwire_ext_key(const u8 **cursor UNNEEDED, size_t *max UNNEEDED, struct ext_key *bip32 UNNEEDED)
-{ fprintf(stderr, "fromwire_ext_key called!\n"); abort(); }
 /* Generated stub for fromwire_hsmd_get_per_commitment_point_reply */
 bool fromwire_hsmd_get_per_commitment_point_reply(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, struct pubkey *per_commitment_point UNNEEDED, struct secret **old_commitment_secret UNNEEDED)
 { fprintf(stderr, "fromwire_hsmd_get_per_commitment_point_reply called!\n"); abort(); }
@@ -106,12 +103,14 @@ void memleak_status_broken(void *unused UNNEEDED, const char *fmt UNNEEDED, ...)
 { fprintf(stderr, "memleak_status_broken called!\n"); abort(); }
 /* Generated stub for new_coin_channel_close */
 struct chain_coin_mvt *new_coin_channel_close(const tal_t *ctx UNNEEDED,
+					      const struct channel_id *chan_id UNNEEDED,
 					      const struct bitcoin_txid *txid UNNEEDED,
 					      const struct bitcoin_outpoint *out UNNEEDED,
 					      u32 blockheight UNNEEDED,
 					      const struct amount_msat amount UNNEEDED,
 					      const struct amount_sat output_val UNNEEDED,
-					      u32 output_count)
+					      u32 output_count UNNEEDED,
+					      bool is_splice)
 
 { fprintf(stderr, "new_coin_channel_close called!\n"); abort(); }
 /* Generated stub for new_coin_external_deposit */
@@ -225,9 +224,6 @@ void towire_basepoints(u8 **pptr UNNEEDED, const struct basepoints *b UNNEEDED)
 /* Generated stub for towire_chain_coin_mvt */
 void towire_chain_coin_mvt(u8 **pptr UNNEEDED, const struct chain_coin_mvt *mvt UNNEEDED)
 { fprintf(stderr, "towire_chain_coin_mvt called!\n"); abort(); }
-/* Generated stub for towire_ext_key */
-void towire_ext_key(u8 **pptr UNNEEDED, const struct ext_key *bip32 UNNEEDED)
-{ fprintf(stderr, "towire_ext_key called!\n"); abort(); }
 /* Generated stub for towire_hsmd_get_per_commitment_point */
 u8 *towire_hsmd_get_per_commitment_point(const tal_t *ctx UNNEEDED, u64 n UNNEEDED)
 { fprintf(stderr, "towire_hsmd_get_per_commitment_point called!\n"); abort(); }

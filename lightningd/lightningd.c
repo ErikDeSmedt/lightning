@@ -132,6 +132,8 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	ld->dev_gossip_time = 0;
 	ld->dev_fast_gossip = false;
 	ld->dev_fast_gossip_prune = false;
+	ld->dev_throttle_gossip = false;
+	ld->dev_suppress_gossip = false;
 	ld->dev_fast_reconnect = false;
 	ld->dev_force_privkey = NULL;
 	ld->dev_force_bip32_seed = NULL;
@@ -146,6 +148,14 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	ld->dev_no_ping_timer = false;
 	ld->dev_any_channel_type = false;
 	ld->dev_allow_shutdown_destination_change = false;
+	ld->dev_hsmd_no_preapprove_check = false;
+	ld->dev_hsmd_fail_preapprove = false;
+	ld->dev_handshake_no_reply = false;
+
+	/*~ We try to ensure enough fds for twice the number of channels
+	 * we start with.  We have a developer option to change that factor
+	 * for testing. */
+	ld->fd_limit_multiplier = 2;
 
 	/*~ This is a CCAN list: an embedded double-linked list.  It's not
 	 * really typesafe, but relies on convention to access the contents.
@@ -408,10 +418,10 @@ const char *subdaemon_path(const tal_t *ctx, const struct lightningd *ld, const 
 	const char *alt = strmap_get(&ld->alt_subdaemons, short_name);
 	if (alt) {
 		/* path_join will honor absolute paths as well. */
-		dpath = path_join(ctx, ld->daemon_dir, alt);
+		dpath = path_join(ctx, ld->subdaemon_dir, alt);
 	} else {
 		/* This subdaemon is found in the standard place. */
-		dpath = path_join(ctx, ld->daemon_dir, name);
+		dpath = path_join(ctx, ld->subdaemon_dir, name);
 	}
 	return dpath;
 }
@@ -520,42 +530,12 @@ static const char *find_my_directory(const tal_t *ctx, const char *argv0)
 	return path_dirname(ctx, take(me));
 }
 
-/*~ This returns the PKGLIBEXEC path which is where binaries get installed.
- * Note the `TAKES` annotation which indicates that the `my_path` parameter
- * can be take(); in which case, this function will handle freeing it.
- *
- * TAKES is only a convention unfortunately, and ignored by the compiler.
- */
-static const char *find_my_pkglibexec_path(struct lightningd *ld,
-					   const char *my_path TAKES)
-{
-	const char *pkglibexecdir;
-
-	/*~`path_join` is declared in ccan/path/path.h as:
-	 *
-	 *     char *path_join(const tal_t *ctx,
-	 *                     const char *base TAKES, const char *a TAKES);
-	 *
-	 * So, as we promised with 'TAKES' in our own declaration, if the
-	 * caller has called `take()` the `my_path` parameter, path_join()
-	 * will free it. */
-	pkglibexecdir = path_join(NULL, my_path, BINTOPKGLIBEXECDIR);
-
-	/*~ The plugin dir is in ../libexec/c-lightning/plugins, which (unlike
-	 * those given on the command line) does not need to exist. */
-	plugins_set_builtin_plugins_dir(ld->plugins,
-					path_join(tmpctx,
-						  pkglibexecdir, "plugins"));
-
-	/*~ Sometimes take() can be more efficient, since the routine can
-	 * manipulate the string in place.  This is the case here. */
-	return path_simplify(ld, take(pkglibexecdir));
-}
-
 /* Determine the correct daemon dir. */
-static const char *find_daemon_dir(struct lightningd *ld, const char *argv0)
+static void find_subdaemons_and_plugins(struct lightningd *ld, const char *argv0)
 {
-	const char *my_path = find_my_directory(ld, argv0);
+	const char *my_path = find_my_directory(tmpctx, argv0);
+	const char *prefix;
+
 	/* If we're running in-tree, all the subdaemons are with lightningd. */
 	if (has_all_subdaemons(my_path)) {
 		/* In this case, look for built-in plugins in ../plugins */
@@ -563,11 +543,18 @@ static const char *find_daemon_dir(struct lightningd *ld, const char *argv0)
 						path_join(tmpctx,
 							  my_path,
 							  "../plugins"));
-		return my_path;
+		ld->subdaemon_dir = tal_steal(ld, my_path);
+		return;
 	}
 
-	/* Otherwise we assume they're in the installed dir. */
-	return find_my_pkglibexec_path(ld, take(my_path));
+	/* Assume we're running the installed version.  Override
+	 * for "make installccheck" though. */
+	prefix = getenv("DEV_LIGHTNINGD_DESTDIR_PREFIX");
+	if (!prefix)
+		prefix = "";
+	ld->subdaemon_dir = tal_fmt(ld, "%s%s", prefix, PKGLIBEXECDIR);
+	plugins_set_builtin_plugins_dir(ld->plugins,
+					tal_fmt(tmpctx, "%s%s", prefix, PLUGINDIR));
 }
 
 /*~ We like to free everything on exit, so valgrind doesn't complain (valgrind
@@ -893,7 +880,7 @@ static struct feature_set *default_features(const tal_t *ctx)
 	static const u32 features[] = {
 		COMPULSORY_FEATURE(OPT_DATA_LOSS_PROTECT),
 		OPTIONAL_FEATURE(OPT_UPFRONT_SHUTDOWN_SCRIPT),
-		COMPULSORY_FEATURE(OPT_GOSSIP_QUERIES),
+		OPTIONAL_FEATURE(OPT_GOSSIP_QUERIES),
 		COMPULSORY_FEATURE(OPT_VAR_ONION),
 		COMPULSORY_FEATURE(OPT_PAYMENT_SECRET),
 		OPTIONAL_FEATURE(OPT_BASIC_MPP),
@@ -904,6 +891,7 @@ static struct feature_set *default_features(const tal_t *ctx)
 		OPTIONAL_FEATURE(OPT_PAYMENT_METADATA),
 		OPTIONAL_FEATURE(OPT_SCID_ALIAS),
 		OPTIONAL_FEATURE(OPT_ZEROCONF),
+		OPTIONAL_FEATURE(OPT_ONION_MESSAGES),
 		OPTIONAL_FEATURE(OPT_CHANNEL_TYPE),
 		OPTIONAL_FEATURE(OPT_ROUTE_BLINDING),
 		/* Removed later for elements */
@@ -1049,10 +1037,102 @@ bool lightningd_deprecated_in_ok(struct lightningd *ld,
 			     complain_deprecated, &depr_in);
 }
 
+/*~ We fork out new processes very very often; every channel gets its own
+ * process, for example, and we have `hsmd` and `gossipd` and the plugins as
+ * well.  Now, we also keep around several file descriptors (`fd`s), including
+ * file descriptors to communicate with `hsmd` which is a privileged process
+ * with access to private keys and is therefore very sensitive.  Thus, we need
+ * to close all file descriptors other than what the forked-out new process
+ * should have ASAP.
+ *
+ * We do this by using the `ccan/closefrom` module, which implements an
+ * emulation for the `closefrom` syscall on BSD and Solaris.  This emulation
+ * tries to use the fastest facility available on the system (`close_range`
+ * syscall on Linux 5.9+, snooping through `/proc/$PID/fd` on many OSs (but
+ * requires procps to be mounted), the actual `closefrom` call if available,
+ * etc.).  As a fallback if none of those are available on the system,
+ * however, it just iterates over the theoretical range of possible file
+ * descriptors.
+ *
+ * On some systems, that theoretical range can be very high, up to `INT_MAX`
+ * in the worst case.  If the `closefrom` emulation has to fall back to this
+ * loop, it can be very slow; fortunately, the emulation will also inform us
+ * of that via the `closefrom_may_be_slow` function, and also has
+ * `closefrom_limit` to limit the number of allowed file descriptors *IF AND
+ * ONLY IF* `closefrom_may_be_slow()` is true.
+ *
+ * On systems with a fast `closefrom` then `closefrom_limit` does nothing.
+ *
+ * Previously we always imposed a limit of 1024 file descriptors (because we
+ * used to always iterate up to limit instead of using some OS facility,
+ * because those were non-portable and needed code for each OS), until
+ * @whitslack went and made >1000 channels and hit the 1024 limit.
+ */
+static void setup_fd_limit(struct lightningd *ld, size_t num_channels)
+{
+	struct rlimit nofile;
+	/* This is more than you could have on a single IP anyway. */
+	size_t desired_fds = 65536;
+
+	if (getrlimit(RLIMIT_NOFILE, &nofile) != 0) {
+		log_broken(ld->log,
+			   "Could not get file descriptor limit: %s",
+			   strerror(errno));
+		return;
+	}
+
+	/* Aim for twice as many fds as current channels, for growth. */
+	if (num_channels * ld->fd_limit_multiplier > desired_fds)
+		desired_fds = num_channels * ld->fd_limit_multiplier;
+
+	if (nofile.rlim_cur < desired_fds) {
+		if (desired_fds > nofile.rlim_max) {
+			/* Sure, we would *like* 65536, but we're happy with 2x channels. */
+			if (num_channels * ld->fd_limit_multiplier > nofile.rlim_max) {
+				log_unusual(ld->log,
+					    "WARNING: we have %zu channels but file descriptors limited to %zu!",
+					    num_channels, (size_t)nofile.rlim_max);
+			}
+			nofile.rlim_cur = nofile.rlim_max;
+		} else {
+			nofile.rlim_cur = desired_fds;
+		}
+		log_debug(ld->log,
+			  "Increasing file descriptor limit to %zu (%zu channels, max is %zu)",
+			  (size_t)nofile.rlim_cur,
+			  num_channels,
+			  (size_t)nofile.rlim_max);
+
+		if (setrlimit(RLIMIT_NOFILE, &nofile) != 0) {
+			log_broken(ld->log,
+				   "Could not increase file limit to %zu: %s",
+				   (size_t)nofile.rlim_cur,
+				   strerror(errno));
+		}
+	}
+
+	/*~ If `closefrom_may_be_slow`, we limit ourselves to 4096 file
+	 * descriptors; tell the user about it as that limits the number
+	 * of channels they can have.
+	 * We do not really expect most users to ever reach that many,
+	 * but: https://github.com/ElementsProject/lightning/issues/4868
+	 */
+	if (closefrom_may_be_slow()) {
+		log_info(ld->log,
+			 "We have self-limited number of open file "
+			 "descriptors to 4096, but that will result in a "
+			 "'Too many open files' error if you ever reach "
+			 ">4000 channels.  Please upgrade your OS kernel "
+			 "(Linux 5.9+, FreeBSD 8.0+), or mount proc or "
+			 "/dev/fd (if running in chroot) if you are "
+			 "approaching that many channels.");
+		closefrom_limit(4096);
+	}
+}
+
 int main(int argc, char *argv[])
 {
 	struct lightningd *ld;
-	u32 min_blockheight, max_blockheight;
 	int connectd_gossipd_fd;
 	int stop_fd;
 	struct timers *timers;
@@ -1063,6 +1143,7 @@ int main(int argc, char *argv[])
 	int exit_code = 0;
 	char **orig_argv;
 	bool try_reexec;
+	size_t num_channels;
 
 	trace_span_start("lightningd/startup", argv);
 
@@ -1071,44 +1152,6 @@ int main(int argc, char *argv[])
 
 	/*~ This handles --dev-debug-self really early, which we otherwise ignore */
 	daemon_developer_mode(argv);
-
-	/*~ We fork out new processes very very often; every channel gets its
-	 * own process, for example, and we have `hsmd` and `gossipd` and
-	 * the plugins as well.
-	 * Now, we also keep around several file descriptors (`fd`s), including
-	 * file descriptors to communicate with `hsmd` which is a privileged
-	 * process with access to private keys and is therefore very sensitive.
-	 * Thus, we need to close all file descriptors other than what the
-	 * forked-out new process should have ASAP.
-	 *
-	 * We do this by using the `ccan/closefrom` module, which implements
-	 * an emulation for the `closefrom` syscall on BSD and Solaris.
-	 * This emulation tries to use the fastest facility available on the
-	 * system (`close_range` syscall on Linux 5.9+, snooping through
-	 * `/proc/$PID/fd` on many OSs (but requires procps to be mounted),
-	 * the actual `closefrom` call if available, etc.).
-	 * As a fallback if none of those are available on the system, however,
-	 * it just iterates over the theoretical range of possible file
-	 * descriptors.
-	 *
-	 * On some systems, that theoretical range can be very high, up to
-	 * `INT_MAX` in the worst case.
-	 * If the `closefrom` emulation has to fall back to this loop, it
-	 * can be very slow; fortunately, the emulation will also inform
-	 * us of that via the `closefrom_may_be_slow` function, and also has
-	 * `closefrom_limit` to limit the number of allowed file descriptors
-	 * *IF AND ONLY IF* `closefrom_may_be_slow()` is true.
-	 *
-	 * On systems with a fast `closefrom` then `closefrom_limit` does
-	 * nothing.
-	 *
-	 * Previously we always imposed a limit of 1024 file descriptors
-	 * (because we used to always iterate up to limit instead of using
-	 * some OS facility, because those were non-portable and needed
-	 * code for each OS), until @whitslack went and made >1000 channels
-	 * and hit the 1024 limit.
-	 */
-	closefrom_limit(4096);
 
 	/*~ This sets up SIGCHLD to make sigchld_rfd readable. */
 	sigchld_rfd = setup_sig_handlers();
@@ -1149,10 +1192,8 @@ int main(int argc, char *argv[])
 	orig_argv[0] = path_join(orig_argv, take(path_cwd(NULL)), argv[0]);
 	orig_argv[argc] = NULL;
 
-	/* Figure out where our daemons are first. */
-	ld->daemon_dir = find_daemon_dir(ld, argv[0]);
-	if (!ld->daemon_dir)
-		errx(EXITCODE_SUBDAEMON_FAIL, "Could not find daemons");
+	/* Figure out where our subdaemons are first. */
+	find_subdaemons_and_plugins(ld, argv[0]);
 
 	/* Set up the feature bits for what we support */
 	ld->our_features = default_features(ld);
@@ -1269,22 +1310,6 @@ int main(int argc, char *argv[])
 	init_txfilter(ld->wallet, ld->bip32_base, ld->owned_txfilter);
 	trace_span_end(ld->wallet);
 
-	/*~ Get the blockheight we are currently at, UINT32_MAX is used to signal
-	 * an uninitialized wallet and that we should start off of bitcoind's
-	 * current height */
-	wallet_blocks_heights(ld->wallet, UINT32_MAX,
-			      &min_blockheight, &max_blockheight);
-
-	/*~ If we were asked to rescan from an absolute height (--rescan < 0)
-	 * then just go there. Otherwise compute the diff to our current height,
-	 * lowerbounded by 0. */
-	if (ld->config.rescan < 0)
-		max_blockheight = -ld->config.rescan;
-	else if (max_blockheight < (u32)ld->config.rescan)
-		max_blockheight = 0;
-	else if (max_blockheight != UINT32_MAX)
-		max_blockheight -= ld->config.rescan;
-
 	/*~ Finish our runes initialization (includes reading from db) */
 	runes_finish_init(ld->runes);
 
@@ -1297,7 +1322,7 @@ int main(int argc, char *argv[])
 	/*~ Initialize block topology.  This does its own io_loop to
 	 * talk to bitcoind, so does its own db transactions. */
 	trace_span_start("setup_topology", ld->topology);
-	setup_topology(ld->topology, min_blockheight, max_blockheight);
+	setup_topology(ld->topology);
 	trace_span_end(ld->topology);
 
 	db_begin_transaction(ld->wallet->db);
@@ -1305,10 +1330,15 @@ int main(int argc, char *argv[])
 	/*~ Pull peers, channels and HTLCs from db. Needs to happen after the
 	 *  topology is initialized since some decisions rely on being able to
 	 *  know the blockheight. */
-	unconnected_htlcs_in = notleak(load_channels_from_wallet(ld));
+	unconnected_htlcs_in = notleak(load_channels_from_wallet(ld,
+								 &num_channels));
 	db_commit_transaction(ld->wallet->db);
 
- 	/*~ The gossip daemon looks after the routing gossip;
+	/*~ Now we have channels, try to ensure we have enough file descriptors
+	 * to cover 2x that many. */
+	setup_fd_limit(ld, num_channels);
+
+	/*~ The gossip daemon looks after the routing gossip;
 	 *  channel_announcement, channel_update, node_announcement and gossip
 	 *  queries.   It also hands us the latest channel_updates for our
 	 *  channels. */
@@ -1362,7 +1392,7 @@ int main(int argc, char *argv[])
 	 * tal_bytelen() to get the length. */
 	log_info(ld->log, "--------------------------------------------------");
 	log_info(ld->log, "Server started with public key %s, alias %s (color #%s) and lightningd %s",
-		 fmt_node_id(tmpctx, &ld->id),
+		 fmt_node_id(tmpctx, &ld->our_nodeid),
 		 json_escape(tmpctx, (const char *)ld->alias)->s,
 		 tal_hex(tmpctx, ld->rgb), version());
 	ld->state = LD_STATE_RUNNING;
@@ -1373,21 +1403,6 @@ int main(int argc, char *argv[])
 						    ld->recover);
 		plugin_hook_call_recover(ld, NULL, payload);
 	}
-	/*~ If `closefrom_may_be_slow`, we limit ourselves to 4096 file
-	 * descriptors; tell the user about it as that limits the number
-	 * of channels they can have.
-	 * We do not really expect most users to ever reach that many,
-	 * but: https://github.com/ElementsProject/lightning/issues/4868
-	 */
-	if (closefrom_may_be_slow())
-		log_info(ld->log,
-			 "We have self-limited number of open file "
-			 "descriptors to 4096, but that will result in a "
-			 "'Too many open files' error if you ever reach "
-			 ">4000 channels.  Please upgrade your OS kernel "
-			 "(Linux 5.9+, FreeBSD 8.0+), or mount proc or "
-			 "/dev/fd (if running in chroot) if you are "
-			 "approaching that many channels.");
 
 	/*~ If we have channels closing, make sure we re-xmit the last
 	 * transaction, in case bitcoind lost it. */

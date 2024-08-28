@@ -31,6 +31,9 @@ bool fromwire_channel_id(const u8 **cursor UNNEEDED, size_t *max UNNEEDED,
 /* Generated stub for fromwire_node_id */
 void fromwire_node_id(const u8 **cursor UNNEEDED, size_t *max UNNEEDED, struct node_id *id UNNEEDED)
 { fprintf(stderr, "fromwire_node_id called!\n"); abort(); }
+/* Generated stub for pubkey_from_node_id */
+bool pubkey_from_node_id(struct pubkey *key UNNEEDED, const struct node_id *id UNNEEDED)
+{ fprintf(stderr, "pubkey_from_node_id called!\n"); abort(); }
 /* Generated stub for status_fmt */
 void status_fmt(enum log_level level UNNEEDED,
 		const struct node_id *peer UNNEEDED,
@@ -564,7 +567,7 @@ int main(int argc, const char *argv[])
 	 * In the following:
 	 *  - *local* transactions are considered, which implies that all
 	 *    payments to *local* are delayed.
-	 *  - It's assumed that *local* is the funder.
+	 *  - It's assumed that *local* is the opener.
 	 *  - Private keys are displayed as 32 bytes plus a trailing 1
 	 *    (Bitcoin's convention for "compressed" private keys, i.e. keys for
 	 *    which the public key is compressed).

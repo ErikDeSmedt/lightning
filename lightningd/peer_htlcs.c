@@ -93,7 +93,7 @@ static bool htlc_out_update_state(struct channel *channel,
 	return true;
 }
 
-/* BOLT-route-blinding #4:
+/* BOLT #4:
  *   - if `blinding_point` is set in the incoming `update_add_htlc`:
  *     - MUST return an `invalid_onion_blinding` error.
  *   - if `current_blinding_point` is set in the onion payload and it is not the
@@ -629,10 +629,12 @@ const u8 *send_htlc_out(const tal_t *ctx,
 							channel_update_for_error(tmpctx, out));
 	}
 
+	/* Note: we allow outgoing HTLCs before sync, for fast startup. */
 	if (!topology_synced(out->peer->ld->topology)) {
-		log_info(out->log, "Attempt to send HTLC but still syncing"
-			 " with bitcoin network");
-		return towire_temporary_node_failure(ctx);
+		log_debug(out->log, "Sending HTLC while still syncing"
+			  " with bitcoin network (%u vs %u)",
+			  get_block_height(out->peer->ld->topology),
+			  get_network_blockheight(out->peer->ld->topology));
 	}
 
 	/* Make peer's daemon own it, catch if it dies. */
@@ -803,16 +805,16 @@ static void forward_htlc(struct htlc_in *hin,
 
 	/* BOLT #4:
 	 *
-	 *   - if the `cltv_expiry` is unreasonably far in the future:
+	 *  - if the `cltv_expiry` is more than `max_htlc_cltv` in the future:
 	 *     - return an `expiry_too_far` error.
 	 */
 	if (get_block_height(ld->topology)
-	    + ld->config.locktime_max < outgoing_cltv_value) {
+	    + ld->config.max_htlc_cltv < outgoing_cltv_value) {
 		log_debug(hin->key.channel->log,
 			  "Expiry cltv %u too far from current %u + max %u",
 			  outgoing_cltv_value,
 			  get_block_height(ld->topology),
-			  ld->config.locktime_max);
+			  ld->config.max_htlc_cltv);
 		failmsg = towire_expiry_too_far(tmpctx);
 		goto fail;
 	}
@@ -933,8 +935,6 @@ static bool htlc_accepted_hook_deserialize(struct htlc_accepted_hook_payload *re
 
 		rs->raw_payload = prepend_length(rs, take(payload));
 		request->payload = onion_decode(request,
-						feature_offered(ld->our_features->bits[INIT_FEATURE],
-								OPT_ROUTE_BLINDING),
 						rs,
 						hin->blinding,
 						ld->accept_extra_tlv_types,
@@ -1100,7 +1100,8 @@ htlc_accepted_hook_final(struct htlc_accepted_hook_payload *request STEALS)
 	/* *Now* we barf if it failed to decode */
 	if (!request->payload) {
 		log_debug(channel->log,
-			  "Failing HTLC because of an invalid payload");
+			  "Failing HTLC because of an invalid payload (TLV %"PRIu64" pos %zu)",
+			  request->failtlvtype, request->failtlvpos);
 		local_fail_in_htlc(hin,
 				   take(towire_invalid_onion_payload(
 						NULL, request->failtlvtype,
@@ -1264,9 +1265,6 @@ static bool peer_accepted_htlc(const tal_t *ctx,
 	struct onionpacket *op;
 	struct lightningd *ld = channel->peer->ld;
 	struct htlc_accepted_hook_payload *hook_payload;
-	const bool opt_blinding
-		= feature_offered(ld->our_features->bits[INIT_FEATURE],
-				  OPT_ROUTE_BLINDING);
 
 
 	*failmsg = NULL;
@@ -1339,7 +1337,7 @@ static bool peer_accepted_htlc(const tal_t *ctx,
 
 	rs = process_onionpacket(tmpctx, op, hin->shared_secret,
 				 hin->payment_hash.u.u8,
-				 sizeof(hin->payment_hash), true);
+				 sizeof(hin->payment_hash));
 	if (!rs) {
 		*badonion = WIRE_INVALID_ONION_HMAC;
 		log_debug(channel->log,
@@ -1354,8 +1352,6 @@ static bool peer_accepted_htlc(const tal_t *ctx,
 
 	hook_payload->route_step = tal_steal(hook_payload, rs);
 	hook_payload->payload = onion_decode(hook_payload,
-					     feature_offered(ld->our_features->bits[INIT_FEATURE],
-							     OPT_ROUTE_BLINDING),
 					     rs,
 					     hin->blinding,
 					     ld->accept_extra_tlv_types,
@@ -1369,8 +1365,7 @@ static bool peer_accepted_htlc(const tal_t *ctx,
 	hook_payload->next_onion = serialize_onionpacket(hook_payload, rs->next);
 
 	/* We could have blinding from hin or from inside onion. */
-	if (opt_blinding
-	    && hook_payload->payload && hook_payload->payload->blinding) {
+	if (hook_payload->payload && hook_payload->payload->blinding) {
 		struct sha256 sha;
 		blinding_hash_e_and_ss(hook_payload->payload->blinding,
 				       &hook_payload->payload->blinding_ss,
@@ -1432,7 +1427,7 @@ static void fulfill_our_htlc_out(struct channel *channel, struct htlc_out *hout,
 		/* Did we abandon the incoming?  Oops! */
 		if (hout->in->failonion) {
 			/* FIXME: Accounting? */
-			log_unusual(channel->log, "FUNDS LOSS of %s: peer took funds onchain before we could time out the HTLC, but we abandoned incoming HTLC to save the incoming channel",
+			log_broken(channel->log, "FUNDS LOSS of %s: peer took funds onchain before we could time out the HTLC, but we abandoned incoming HTLC to save the incoming channel",
 				    fmt_amount_msat(tmpctx, hout->msat));
 		} else {
 			struct short_channel_id scid = channel_scid_or_local_alias(hout->key.channel);
@@ -1749,8 +1744,9 @@ void onchain_failed_our_htlc(const struct channel *channel,
 					 ? fromwire_peektype(hout->failmsg)
 					 : 0);
 	} else {
-		log_broken(channel->log, "HTLC id %"PRIu64" is from nowhere?",
-			   htlc->id);
+		/* This happens if we abandoned the incoming HTLC to avoid closure */
+		log_unusual(channel->log, "HTLC id %"PRIu64" is from nowhere: did we abandon it?",
+			    htlc->id);
 
 		/* Immediate corruption sanity check if this happens */
 		htable_check(&ld->htlcs_out->raw, "onchain_failed_our_htlc out");
@@ -2696,6 +2692,10 @@ static void consider_failing_incoming(struct lightningd *ld,
 	if (height + 3 < hout->in->cltv_expiry)
 		return;
 
+	/* Unless incoming is already onchain, then it can't get worse! */
+	if (!channel_state_can_remove_htlc(hout->in->key.channel->state))
+		return;
+
 	log_unusual(hout->key.channel->log,
 		    "Abandoning unresolved onchain HTLC at block %u"
 		    " (expired at %u) to avoid peer closing incoming HTLC at block %u",
@@ -2923,9 +2923,7 @@ static struct command_result *json_dev_ignore_htlcs(struct command *cmd,
 
 static const struct json_command dev_ignore_htlcs = {
 	"dev-ignore-htlcs",
-	"developer",
 	json_dev_ignore_htlcs,
-	"Set ignoring incoming HTLCs for peer {id} to {ignore}",
 	.dev_only = true,
 };
 
@@ -3005,8 +3003,6 @@ static struct command_result *json_listhtlcs(struct command *cmd,
 
 static const struct json_command listhtlcs_command = {
 	"listhtlcs",
-	"channels",
 	json_listhtlcs,
-	"List all known HTLCS (optionally, just for [id] (scid or channel id))"
 };
 AUTODATA(json_command, &listhtlcs_command);

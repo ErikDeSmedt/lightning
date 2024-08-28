@@ -9,6 +9,7 @@
 #include <common/gossip_store.h>
 #include <common/gossmap.h>
 #include <common/pseudorand.h>
+#include <common/sciddir_or_pubkey.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <gossipd/gossip_store_wiregen.h>
@@ -48,6 +49,9 @@ HTABLE_DEFINE_TYPE(ptrint_t, nodeidx_id, nodeid_hash, nodeidx_eq_id,
 		   nodeidx_htable);
 
 struct gossmap {
+	/* We updated this every time we reopen, so we know to update iterators! */
+	u64 generation;
+
 	/* The file descriptor and filename to monitor */
 	int fd;
 	/* NULL means we don't own fd */
@@ -440,7 +444,8 @@ void gossmap_remove_node(struct gossmap *map, struct gossmap_node *node)
  *     * [`point`:`node_id_2`]
  */
 static struct gossmap_chan *add_channel(struct gossmap *map,
-					size_t cannounce_off)
+					size_t cannounce_off,
+					size_t msglen)
 {
 	/* Note that first two bytes are message type */
 	const size_t feature_len_off = 2 + (64 + 64 + 64 + 64);
@@ -458,9 +463,22 @@ static struct gossmap_chan *add_channel(struct gossmap *map,
 	map_nodeid(map, cannounce_off + plus_scid_off + 8, &node_id[0]);
 	map_nodeid(map, cannounce_off + plus_scid_off + 8 + PUBKEY_CMPR_LEN, &node_id[1]);
 
-	/* We 1should not get duplicates. */
+	/* We should not get duplicates. */
 	scid.u64 = map_be64(map, cannounce_off + plus_scid_off);
-	assert(!gossmap_find_chan(map, &scid));
+	chan = gossmap_find_chan(map, &scid);
+	if (chan) {
+		/* FIXME: Report this better! */
+		warnx("gossmap: redundant channel_announce for %s, offsets %u and %zu!",
+		      fmt_short_channel_id(tmpctx, scid),
+		      chan->cann_off, cannounce_off);
+		return NULL;
+	}
+
+	/* gossipd writes WIRE_GOSSIP_STORE_CHANNEL_AMOUNT after this (not for
+	 * local channels), so ignore channel_announcement until that appears */
+	if (msglen
+	    && (map->map_size < cannounce_off + msglen + sizeof(struct gossip_hdr) + sizeof(u16) + sizeof(u64)))
+		return NULL;
 
 	/* We carefully map pointers to indexes, since new_node can move them! */
 	n[0] = gossmap_find_node(map, &node_id[0]);
@@ -627,6 +645,7 @@ static bool reopen_store(struct gossmap *map, size_t ended_off)
 
 	close(map->fd);
 	map->fd = fd;
+	map->generation++;
 	return gossmap_refresh_mayfail(map, NULL);
 }
 
@@ -656,9 +675,11 @@ static bool map_catchup(struct gossmap *map, bool *changed)
 
 		off = map->map_end + sizeof(ghdr);
 		type = map_be16(map, off);
-		if (type == WIRE_CHANNEL_ANNOUNCEMENT)
-			add_channel(map, off);
-		else if (type == WIRE_CHANNEL_UPDATE)
+		if (type == WIRE_CHANNEL_ANNOUNCEMENT) {
+			/* Don't read yet if amount field is not there! */
+			if (!add_channel(map, off, be16_to_cpu(ghdr.len)))
+				break;
+		} else if (type == WIRE_CHANNEL_UPDATE)
 			update_channel(map, off);
 		else if (type == WIRE_GOSSIP_STORE_DELETE_CHAN)
 			remove_channel_by_deletemsg(map, off);
@@ -932,7 +953,7 @@ void gossmap_apply_localmods(struct gossmap *map,
 				continue;
 
 			/* Create new channel, pointing into local. */
-			chan = add_channel(map, map->map_size + mod->local_off);
+			chan = add_channel(map, map->map_size + mod->local_off, 0);
 		}
 
 		/* Save old, overwrite (keep nodeidx) */
@@ -1036,6 +1057,7 @@ struct gossmap *gossmap_load(const tal_t *ctx, const char *filename,
 			     size_t *num_channel_updates_rejected)
 {
 	map = tal(ctx, struct gossmap);
+	map->generation = 0;
 	map->fname = tal_strdup(map, filename);
 	map->fd = open(map->fname, O_RDONLY);
 	if (map->fd < 0)
@@ -1131,7 +1153,7 @@ bool gossmap_chan_get_capacity(const struct gossmap *map,
 	off += sizeof(ghdr) + be16_to_cpu(ghdr.len);
 
 	/* Partial write, this can happen. */
-	if (off + sizeof(ghdr) + 2 > map->map_size)
+	if (off + sizeof(ghdr) + sizeof(u16) + sizeof(u64) > map->map_size)
 		return false;
 
 	/* Get type of next field. */
@@ -1443,4 +1465,198 @@ u8 *gossmap_node_get_features(const tal_t *ctx,
 
 	map_copy(map, n->nann_off + feature_len_off + 2, ret, feature_len);
 	return ret;
+}
+
+bool gossmap_scidd_pubkey(struct gossmap *gossmap,
+			  struct sciddir_or_pubkey *sciddpk)
+{
+	struct gossmap_chan *chan;
+	struct gossmap_node *node;
+	struct node_id id;
+
+	if (sciddpk->is_pubkey)
+		return true;
+
+	chan = gossmap_find_chan(gossmap, &sciddpk->scidd.scid);
+	if (!chan)
+		return false;
+
+	node = gossmap_nth_node(gossmap, chan, sciddpk->scidd.dir);
+	gossmap_node_get_id(gossmap, node, &id);
+	/* Shouldn't fail! */
+	return sciddir_or_pubkey_from_node_id(sciddpk, &id);
+}
+
+size_t gossmap_lengths(const struct gossmap *map, size_t *total)
+{
+	*total = map->map_size;
+	return map->map_end;
+}
+
+struct gossmap_iter {
+	u64 generation;
+	u64 offset;
+};
+
+/* For iterating the gossmap: returns iterator at start. */
+struct gossmap_iter *gossmap_iter_new(const tal_t *ctx,
+				      const struct gossmap *map)
+{
+	struct gossmap_iter *iter = tal(ctx, struct gossmap_iter);
+	iter->generation = map->generation;
+	/* Skip version byte */
+	iter->offset = 1;
+
+	return iter;
+}
+
+/* Copy an existing iterator (same offset) */
+struct gossmap_iter *gossmap_iter_dup(const tal_t *ctx,
+				      const struct gossmap_iter *iter)
+{
+	return tal_dup(ctx, struct gossmap_iter, iter);
+}
+
+/* FIXME: I tried returning a direct ptr into mmap where possible, but
+ * we would have to re-engineer packet paths to handle non-talarr msgs! */
+const void *gossmap_stream_next(const tal_t *ctx,
+				const struct gossmap *map,
+				struct gossmap_iter *iter,
+				u32 *timestamp)
+{
+	/* We grab hdr and type together.  Beware alignment! */
+	struct hdr {
+		union {
+			struct gossip_hdr ghdr;
+			struct {
+				u8 raw_hdr[sizeof(struct gossip_hdr)];
+				be16 type;
+			} type;
+		} u;
+	};
+	struct hdr h;
+
+	/* If we have reopened (unlikely!), we need to restart iteration */
+	if (iter->generation != map->generation) {
+		iter->generation = map->generation;
+		/* Skip version byte */
+		iter->offset = 1;
+	}
+
+	while (iter->offset + sizeof(h.u.type) <= map->map_size) {
+		void *ret;
+		size_t len;
+
+		map_copy(map, iter->offset, &h, sizeof(h.u.type));
+
+		/* Make sure we can read entire record. */
+		len = be16_to_cpu(h.u.ghdr.len);
+		if (iter->offset + sizeof(h.u.ghdr) + len > map->map_size)
+			break;
+
+		/* Increase iterator now we're committed. */
+		iter->offset += sizeof(h.u.ghdr) + len;
+
+		/* Ignore deleted and dying */
+		if (be16_to_cpu(h.u.ghdr.flags) &
+		    (GOSSIP_STORE_DELETED_BIT|GOSSIP_STORE_DYING_BIT))
+			continue;
+
+		/* Use a switch as insurance against addition of new public
+		 * gossip messages! */
+		switch ((enum peer_wire)be16_to_cpu(h.u.type.type)) {
+		case WIRE_CHANNEL_ANNOUNCEMENT:
+		case WIRE_CHANNEL_UPDATE:
+		case WIRE_NODE_ANNOUNCEMENT:
+			ret = tal_arr(ctx, u8, len);
+			map_copy(map, iter->offset - len, ret, len);
+			if (timestamp)
+				*timestamp = be32_to_cpu(h.u.ghdr.timestamp);
+			return ret;
+
+		case WIRE_INIT:
+		case WIRE_ERROR:
+		case WIRE_WARNING:
+		case WIRE_PING:
+		case WIRE_PONG:
+		case WIRE_TX_ADD_INPUT:
+		case WIRE_TX_ADD_OUTPUT:
+		case WIRE_TX_REMOVE_INPUT:
+		case WIRE_TX_REMOVE_OUTPUT:
+		case WIRE_TX_COMPLETE:
+		case WIRE_TX_SIGNATURES:
+		case WIRE_TX_INIT_RBF:
+		case WIRE_TX_ACK_RBF:
+		case WIRE_TX_ABORT:
+		case WIRE_OPEN_CHANNEL:
+		case WIRE_ACCEPT_CHANNEL:
+		case WIRE_FUNDING_CREATED:
+		case WIRE_FUNDING_SIGNED:
+		case WIRE_CHANNEL_READY:
+		case WIRE_OPEN_CHANNEL2:
+		case WIRE_ACCEPT_CHANNEL2:
+		case WIRE_STFU:
+		case WIRE_SPLICE:
+		case WIRE_SPLICE_ACK:
+		case WIRE_SPLICE_LOCKED:
+		case WIRE_SHUTDOWN:
+		case WIRE_CLOSING_SIGNED:
+		case WIRE_UPDATE_ADD_HTLC:
+		case WIRE_UPDATE_FULFILL_HTLC:
+		case WIRE_UPDATE_FAIL_HTLC:
+		case WIRE_UPDATE_FAIL_MALFORMED_HTLC:
+		case WIRE_COMMITMENT_SIGNED:
+		case WIRE_REVOKE_AND_ACK:
+		case WIRE_UPDATE_FEE:
+		case WIRE_UPDATE_BLOCKHEIGHT:
+		case WIRE_CHANNEL_REESTABLISH:
+		case WIRE_PEER_STORAGE:
+		case WIRE_YOUR_PEER_STORAGE:
+		case WIRE_ANNOUNCEMENT_SIGNATURES:
+		case WIRE_QUERY_SHORT_CHANNEL_IDS:
+		case WIRE_REPLY_SHORT_CHANNEL_IDS_END:
+		case WIRE_QUERY_CHANNEL_RANGE:
+		case WIRE_REPLY_CHANNEL_RANGE:
+		case WIRE_GOSSIP_TIMESTAMP_FILTER:
+		case WIRE_ONION_MESSAGE:
+			break;
+		}
+	}
+	return NULL;
+}
+
+/* For fast-forwarding to the given timestamp */
+void gossmap_iter_fast_forward(const struct gossmap *map,
+			       struct gossmap_iter *iter,
+			       u64 timestamp)
+{
+	/* If we have reopened (unlikely!), we need to restart iteration */
+	if (iter->generation != map->generation) {
+		iter->generation = map->generation;
+		iter->offset = 1;
+	}
+
+	while (iter->offset + sizeof(struct gossip_hdr) <= map->map_size) {
+		struct gossip_hdr ghdr;
+
+		map_copy(map, iter->offset, &ghdr, sizeof(ghdr));
+
+		if (be32_to_cpu(ghdr.timestamp) >= timestamp)
+			break;
+
+		iter->offset += be16_to_cpu(ghdr.len) + sizeof(ghdr);
+	}
+}
+
+void gossmap_iter_end(const struct gossmap *map, struct gossmap_iter *iter)
+{
+	if (iter->generation != map->generation)
+		iter->generation = map->generation;
+
+	iter->offset = map->map_end;
+}
+
+int gossmap_fd(const struct gossmap *map)
+{
+	return map->fd;
 }

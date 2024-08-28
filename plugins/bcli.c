@@ -59,6 +59,7 @@ struct bitcoind {
 
 	/* Passthrough parameters for bitcoin-cli */
 	char *rpcuser, *rpcpass, *rpcconnect, *rpcport;
+	u64 rpcclienttimeout;
 
 	/* Whether we fake fees (regtest) */
 	bool fake_fees;
@@ -104,6 +105,16 @@ static const char **gather_argsv(const tal_t *ctx, const char *cmd, va_list ap)
 		add_arg(&args, chainparams->cli_args);
 	if (bitcoind->datadir)
 		add_arg(&args, tal_fmt(args, "-datadir=%s", bitcoind->datadir));
+	if (bitcoind->rpcclienttimeout) {
+		/* Use the maximum value of rpcclienttimeout and retry_timeout to avoid
+		   the bitcoind backend hanging for too long. */
+		if (bitcoind->retry_timeout &&
+		    bitcoind->retry_timeout > bitcoind->rpcclienttimeout)
+			bitcoind->rpcclienttimeout = bitcoind->retry_timeout;
+
+		add_arg(&args,
+			tal_fmt(args, "-rpcclienttimeout=%"PRIu64, bitcoind->rpcclienttimeout));
+	}
 	if (bitcoind->rpcconnect)
 		add_arg(&args,
 			tal_fmt(args, "-rpcconnect=%s", bitcoind->rpcconnect));
@@ -485,18 +496,6 @@ estimatefees_null_response(struct bitcoin_cli *bcli)
 	json_array_end(response);
 	json_add_u32(response, "feerate_floor", 1000);
 
-	if (command_deprecated_out_ok(bcli->cmd, "dummy_null",
-				      "v23.05", "v24.05")) {
-		json_add_null(response, "opening");
-		json_add_null(response, "mutual_close");
-		json_add_null(response, "unilateral_close");
-		json_add_null(response, "delayed_to_us");
-		json_add_null(response, "htlc_resolution");
-		json_add_null(response, "penalty");
-		json_add_null(response, "min_acceptable");
-		json_add_null(response, "max_acceptable");
-	}
-
 	return command_finished(bcli->cmd, response);
 }
 
@@ -560,9 +559,13 @@ struct getrawblock_stash {
 	const char *block_hash;
 	u32 block_height;
 	const char *block_hex;
+	int *peers;
 };
 
-static struct command_result *process_getrawblock(struct bitcoin_cli *bcli)
+/* Mutual recursion. */
+static struct command_result *getrawblock(struct bitcoin_cli *bcli);
+
+static struct command_result *process_rawblock(struct bitcoin_cli *bcli)
 {
 	struct json_stream *response;
 	struct getrawblock_stash *stash = bcli->stash;
@@ -577,6 +580,126 @@ static struct command_result *process_getrawblock(struct bitcoin_cli *bcli)
 	return command_finished(bcli->cmd, response);
 }
 
+static struct command_result *process_getblockfrompeer(struct bitcoin_cli *bcli)
+{
+	/* Remove the peer that we tried to get the block from and move along,
+	 * we may also check on errors here */
+	struct getrawblock_stash *stash = bcli->stash;
+
+	if (bcli->exitstatus && *bcli->exitstatus != 0) {
+		/* We still continue with the execution if we can not fetch the
+		 * block from peer */
+		plugin_log(bcli->cmd->plugin, LOG_DBG,
+			   "failed to fetch block %s from peer %i, skip.",
+			   stash->block_hash, stash->peers[tal_count(stash->peers) - 1]);
+	} else {
+		plugin_log(bcli->cmd->plugin, LOG_DBG,
+			   "try to fetch block %s from peer %i.",
+			   stash->block_hash, stash->peers[tal_count(stash->peers) - 1]);
+	}
+	tal_resize(&stash->peers, tal_count(stash->peers) - 1);
+
+	/* `getblockfrompeer` is an async call. sleep for a second to allow the
+	 * block to be delivered by the peer. fixme: We could also sleep for
+	 * double the last ping here (with sanity limit)*/
+	sleep(1);
+
+	return getrawblock(bcli);
+}
+
+static struct command_result *process_getpeerinfo(struct bitcoin_cli *bcli)
+{
+	const jsmntok_t *t, *toks;
+	struct getrawblock_stash *stash = bcli->stash;
+	size_t i;
+
+	toks =
+	    json_parse_simple(bcli->output, bcli->output, bcli->output_bytes);
+
+	if (!toks) {
+		return command_err_bcli_badjson(bcli, "cannot parse");
+	}
+
+	stash->peers = tal_arr(bcli->stash, int, 0);
+
+	json_for_each_arr(i, t, toks)
+	{
+		int id;
+		if (json_scan(tmpctx, bcli->output, t, "{id:%}",
+			      JSON_SCAN(json_to_int, &id)) == NULL) {
+			// fixme: future optimization: a) filter for full nodes,
+			// b) sort by last ping
+			tal_arr_expand(&stash->peers, id);
+		}
+	}
+
+	if (tal_count(stash->peers) <= 0) {
+		/* We don't have peers yet, retry from `getrawblock` */
+		plugin_log(bcli->cmd->plugin, LOG_DBG,
+			   "got an empty peer list.");
+		return getrawblock(bcli);
+	}
+
+	start_bitcoin_cli(NULL, bcli->cmd, process_getblockfrompeer, true,
+			  BITCOIND_HIGH_PRIO, stash, "getblockfrompeer",
+			  stash->block_hash,
+			  take(tal_fmt(NULL, "%i", stash->peers[0])), NULL);
+
+	return command_still_pending(bcli->cmd);
+}
+
+static struct command_result *process_getrawblock(struct bitcoin_cli *bcli)
+{
+	/* We failed to get the raw block. */
+	if (bcli->exitstatus && *bcli->exitstatus != 0) {
+		struct getrawblock_stash *stash = bcli->stash;
+
+		plugin_log(bcli->cmd->plugin, LOG_DBG,
+			   "failed to fetch block %s from the bitcoin backend (maybe pruned).",
+			   stash->block_hash);
+
+		if (bitcoind->version >= 230000) {
+			/* `getblockformpeer` was introduced in v23.0.0 */
+
+			if (!stash->peers) {
+				/* We don't have peers to fetch blocks from, get
+				 * some! */
+				start_bitcoin_cli(NULL, bcli->cmd,
+						  process_getpeerinfo, true,
+						  BITCOIND_HIGH_PRIO, stash,
+						  "getpeerinfo", NULL);
+
+				return command_still_pending(bcli->cmd);
+			}
+
+			if (tal_count(stash->peers) > 0) {
+				/* We have peers left that we can ask for the
+				 * block */
+				start_bitcoin_cli(
+				    NULL, bcli->cmd, process_getblockfrompeer,
+				    true, BITCOIND_HIGH_PRIO, stash,
+				    "getblockfrompeer", stash->block_hash,
+				    take(tal_fmt(NULL, "%i", stash->peers[0])),
+				    NULL);
+
+				return command_still_pending(bcli->cmd);
+			}
+
+			/* We failed to fetch the block from from any peer we
+			 * got. */
+			plugin_log(
+			    bcli->cmd->plugin, LOG_DBG,
+			    "asked all known peers about block %s, retry",
+			    stash->block_hash);
+			stash->peers = tal_free(stash->peers);
+		}
+
+		return NULL;
+	}
+
+	return process_rawblock(bcli);
+}
+
 static struct command_result *
 getrawblockbyheight_notfound(struct bitcoin_cli *bcli)
 {
@@ -587,6 +710,19 @@ getrawblockbyheight_notfound(struct bitcoin_cli *bcli)
 	json_add_null(response, "block");
 
 	return command_finished(bcli->cmd, response);
+}
+
+static struct command_result *getrawblock(struct bitcoin_cli *bcli)
+{
+	struct getrawblock_stash *stash = bcli->stash;
+
+	start_bitcoin_cli(NULL, bcli->cmd, process_getrawblock, true,
+			  BITCOIND_HIGH_PRIO, stash, "getblock",
+			  stash->block_hash,
+			  /* Non-verbose: raw block. */
+			  "0", NULL);
+
+	return command_still_pending(bcli->cmd);
 }
 
 static struct command_result *process_getblockhash(struct bitcoin_cli *bcli)
@@ -607,15 +743,7 @@ static struct command_result *process_getblockhash(struct bitcoin_cli *bcli)
 		return command_err_bcli_badjson(bcli, "bad blockhash");
 	}
 
-	start_bitcoin_cli(NULL, bcli->cmd, process_getrawblock, false,
-			  BITCOIND_HIGH_PRIO, stash,
-			  "getblock",
-			  stash->block_hash,
-			  /* Non-verbose: raw block. */
-			  "0",
-			  NULL);
-
-	return command_still_pending(bcli->cmd);
+	return getrawblock(bcli);
 }
 
 /* Get a raw block given its height.
@@ -637,6 +765,7 @@ static struct command_result *getrawblockbyheight(struct command *cmd,
 
 	stash = tal(cmd, struct getrawblock_stash);
 	stash->block_height = *height;
+	stash->peers = NULL;
 	tal_free(height);
 
 	start_bitcoin_cli(NULL, cmd, process_getblockhash, true,
@@ -663,7 +792,7 @@ static struct command_result *getchaininfo(struct command *cmd,
          * However, I currently don't have a better idea on how to handle this situation. */
 	u32 *height UNUSED;
 	if (!param(cmd, buf, toks,
-		   p_req("last_height", param_number, &height),
+		   p_opt("last_height", param_number, &height),
 		   NULL))
 		return command_param_failed();
 
@@ -703,16 +832,6 @@ static void json_add_feerate(struct json_stream *result, const char *fieldname,
 	}
 }
 
-static u32 feerate_for_block(const struct estimatefees_stash *stash, u32 blocks)
-{
-	for (size_t i = 0; i < ARRAY_SIZE(stash->perkb); i++) {
-		if (estimatefee_params[i].blocks != blocks)
-			continue;
-		return stash->perkb[i];
-	}
-	abort();
-}
-
 static struct command_result *estimatefees_next(struct command *cmd,
 						struct estimatefees_stash *stash)
 {
@@ -731,48 +850,7 @@ static struct command_result *estimatefees_next(struct command *cmd,
 	}
 
 	response = jsonrpc_stream_success(cmd);
-	if (command_deprecated_out_ok(cmd, "opening",
-				      "v23.05", "v24.05"))
-		json_add_feerate(response, "opening", cmd, stash,
-				 feerate_for_block(stash, 12));
-	if (command_deprecated_out_ok(cmd, "mutual_close",
-				      "v23.05", "v24.05"))
-		json_add_feerate(response, "mutual_close", cmd, stash,
-				 feerate_for_block(stash, 100));
-	if (command_deprecated_out_ok(cmd, "unilateral_close",
-				      "v23.05", "v24.05"))
-		json_add_feerate(response, "unilateral_close", cmd, stash,
-				 feerate_for_block(stash, 6));
-	if (command_deprecated_out_ok(cmd, "delayed_to_us",
-				      "v23.05", "v24.05"))
-		json_add_feerate(response, "delayed_to_us", cmd, stash,
-				 feerate_for_block(stash, 12));
-	if (command_deprecated_out_ok(cmd, "htlc_resolution",
-				      "v23.05", "v24.05"))
-		json_add_feerate(response, "htlc_resolution", cmd, stash,
-				 feerate_for_block(stash, 6));
-	if (command_deprecated_out_ok(cmd, "penalty",
-				      "v23.05", "v24.05"))
-		json_add_feerate(response, "penalty", cmd, stash,
-				 feerate_for_block(stash, 12));
-		/* We divide the slow feerate for the minimum acceptable, lightningd
-		 * will use floor if it's hit, though. */
-	if (command_deprecated_out_ok(cmd, "min_acceptable",
-				      "v23.05", "v24.05"))
-		json_add_feerate(response, "min_acceptable", cmd, stash,
-				 feerate_for_block(stash, 100) / 2);
-		/* BOLT #2:
-		 *
-		 * Given the variance in fees, and the fact that the transaction may be
-		 * spent in the future, it's a good idea for the fee payer to keep a good
-		 * margin (say 5x the expected fee requirement)
-		 */
-	if (command_deprecated_out_ok(cmd, "max_acceptable",
-				      "v23.05", "v24.05"))
-		json_add_feerate(response, "max_acceptable", cmd, stash,
-				 feerate_for_block(stash, 2) * 10);
-
-	/* Modern style: present an ordered array of block deadlines, and a floor. */
+	/* Present an ordered array of block deadlines, and a floor. */
 	json_array_start(response, "feerates");
 	for (size_t i = 0; i < ARRAY_SIZE(stash->perkb); i++) {
 		if (!stash->perkb[i])
@@ -872,17 +950,7 @@ static struct command_result *sendrawtransaction(struct command *cmd,
 		return command_param_failed();
 
 	if (*allowhighfees) {
-		if (bitcoind->version >= 190001)
-			/* Starting in 19.0.1, second argument is
-			 * maxfeerate, which when set to 0 means
-			 * no max feerate.
-			 */
 			highfeesarg = "0";
-		else
-			/* in older versions, second arg is allowhighfees,
-			 * set to true to allow high fees.
-			 */
-			highfeesarg = "true";
 	} else
 		highfeesarg = NULL;
 
@@ -1051,39 +1119,22 @@ static const char *init(struct plugin *p, const char *buffer UNUSED,
 static const struct plugin_command commands[] = {
 	{
 		"getrawblockbyheight",
-		"bitcoin",
-		"Get the bitcoin block at a given height",
-		"",
 		getrawblockbyheight
 	},
 	{
 		"getchaininfo",
-		"bitcoin",
-		"Get the chain id, the header count, the block count,"
-		" and whether this is IBD.",
-		"",
 		getchaininfo
 	},
 	{
 		"estimatefees",
-		"bitcoin",
-		"Get the urgent, normal and slow Bitcoin feerates as"
-		" sat/kVB.",
-		"",
 		estimatefees
 	},
 	{
 		"sendrawtransaction",
-		"bitcoin",
-		"Send a raw transaction to the Bitcoin network.",
-		"",
 		sendrawtransaction
 	},
 	{
 		"getutxout",
-		"bitcoin",
-		"Get information about an output, identified by a {txid} an a {vout}",
-		"",
 		getutxout
 	},
 };
@@ -1105,6 +1156,9 @@ static struct bitcoind *new_bitcoind(const tal_t *ctx)
 	bitcoind->rpcpass = NULL;
 	bitcoind->rpcconnect = NULL;
 	bitcoind->rpcport = NULL;
+	/* Do not exceed retry_timeout value to avoid a bitcoind hang,
+	   although normal rpcclienttimeout default value is 900. */
+	bitcoind->rpcclienttimeout = 60;
 	bitcoind->dev_no_fake_fees = false;
 
 	return bitcoind;
@@ -1117,41 +1171,45 @@ int main(int argc, char *argv[])
 	/* Initialize our global context object here to handle startup options. */
 	bitcoind = new_bitcoind(NULL);
 
-	plugin_main(argv, init, PLUGIN_STATIC, false /* Do not init RPC on startup*/,
+	plugin_main(argv, init, NULL, PLUGIN_STATIC, false /* Do not init RPC on startup*/,
 		    NULL, commands, ARRAY_SIZE(commands),
 		    NULL, 0, NULL, 0, NULL, 0,
 		    plugin_option("bitcoin-datadir",
 				  "string",
 				  "-datadir arg for bitcoin-cli",
-				  charp_option, &bitcoind->datadir),
+				  charp_option, NULL, &bitcoind->datadir),
 		    plugin_option("bitcoin-cli",
 				  "string",
 				  "bitcoin-cli pathname",
-				  charp_option, &bitcoind->cli),
+				  charp_option, NULL, &bitcoind->cli),
 		    plugin_option("bitcoin-rpcuser",
 				  "string",
 				  "bitcoind RPC username",
-				  charp_option, &bitcoind->rpcuser),
+				  charp_option, NULL, &bitcoind->rpcuser),
 		    plugin_option("bitcoin-rpcpassword",
 				  "string",
 				  "bitcoind RPC password",
-				  charp_option, &bitcoind->rpcpass),
+				  charp_option, NULL, &bitcoind->rpcpass),
 		    plugin_option("bitcoin-rpcconnect",
 				  "string",
 				  "bitcoind RPC host to connect to",
-				  charp_option, &bitcoind->rpcconnect),
+				  charp_option, NULL, &bitcoind->rpcconnect),
 		    plugin_option("bitcoin-rpcport",
 				  "int",
 				  "bitcoind RPC host's port",
-				  charp_option, &bitcoind->rpcport),
+				  charp_option, NULL, &bitcoind->rpcport),
+		    plugin_option("bitcoin-rpcclienttimeout",
+				  "int",
+				  "bitcoind RPC timeout in seconds during HTTP requests",
+				  u64_option, u64_jsonfmt, &bitcoind->rpcclienttimeout),
 		    plugin_option("bitcoin-retry-timeout",
-				  "string",
+				  "int",
 				  "how long to keep retrying to contact bitcoind"
 				  " before fatally exiting",
-				  u64_option, &bitcoind->retry_timeout),
+				  u64_option, u64_jsonfmt, &bitcoind->retry_timeout),
 		    plugin_option_dev("dev-no-fake-fees",
 				      "bool",
 				      "Suppress fee faking for regtest",
-				      bool_option, &bitcoind->dev_no_fake_fees),
+				      bool_option, NULL, &bitcoind->dev_no_fake_fees),
 		    NULL);
 }

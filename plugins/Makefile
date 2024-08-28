@@ -31,13 +31,9 @@ PLUGIN_PAY_LIB_SRC := plugins/libplugin-pay.c
 PLUGIN_PAY_LIB_HEADER := plugins/libplugin-pay.h
 PLUGIN_PAY_LIB_OBJS := $(PLUGIN_PAY_LIB_SRC:.c=.o)
 
-PLUGIN_OFFERS_SRC := plugins/offers.c plugins/offers_offer.c plugins/offers_invreq_hook.c plugins/offers_inv_hook.c
+PLUGIN_OFFERS_SRC := plugins/offers.c plugins/offers_offer.c plugins/offers_invreq_hook.c plugins/offers_inv_hook.c plugins/establish_onion_path.c plugins/fetchinvoice.c
 PLUGIN_OFFERS_OBJS := $(PLUGIN_OFFERS_SRC:.c=.o)
 PLUGIN_OFFERS_HEADER := $(PLUGIN_OFFERS_SRC:.c=.h)
-
-PLUGIN_FETCHINVOICE_SRC := plugins/fetchinvoice.c
-PLUGIN_FETCHINVOICE_OBJS := $(PLUGIN_FETCHINVOICE_SRC:.c=.o)
-PLUGIN_FETCHINVOICE_HEADER :=
 
 PLUGIN_SQL_SRC := plugins/sql.c
 PLUGIN_SQL_HEADER :=
@@ -67,12 +63,14 @@ PLUGIN_FUNDER_HEADER :=				\
 	plugins/funder_policy.h
 PLUGIN_FUNDER_OBJS := $(PLUGIN_FUNDER_SRC:.c=.o)
 
+PLUGIN_RECKLESSRPC_SRC := plugins/recklessrpc.c
+PLUGIN_RECKLESSRPC_OBJS := $(PLUGIN_RECKLESSRPC_SRC:.c=.o)
+
 PLUGIN_ALL_SRC :=				\
 	$(PLUGIN_AUTOCLEAN_SRC)			\
 	$(PLUGIN_chanbackup_SRC)		\
 	$(PLUGIN_BCLI_SRC)			\
 	$(PLUGIN_COMMANDO_SRC)			\
-	$(PLUGIN_FETCHINVOICE_SRC)		\
 	$(PLUGIN_FUNDER_SRC)			\
 	$(PLUGIN_TOPOLOGY_SRC)			\
 	$(PLUGIN_KEYSEND_SRC)			\
@@ -82,7 +80,8 @@ PLUGIN_ALL_SRC :=				\
 	$(PLUGIN_PAY_LIB_SRC)			\
 	$(PLUGIN_PAY_SRC)			\
 	$(PLUGIN_SPENDER_SRC)			\
-	$(PLUGIN_RECOVER_SRC)
+	$(PLUGIN_RECOVER_SRC)			\
+	$(PLUGIN_RECKLESSRPC_SRC)
 
 PLUGIN_ALL_HEADER :=				\
 	$(PLUGIN_PAY_HEADER)			\
@@ -97,19 +96,21 @@ C_PLUGINS :=					\
 	plugins/chanbackup			\
 	plugins/bcli				\
 	plugins/commando			\
-	plugins/fetchinvoice			\
 	plugins/funder				\
 	plugins/topology			\
 	plugins/keysend				\
 	plugins/offers				\
 	plugins/pay				\
+	plugins/recklessrpc			\
 	plugins/recover				\
 	plugins/txprepare			\
 	plugins/cln-renepay			\
-	plugins/spenderp
+	plugins/spenderp			\
+	plugins/cln-askrene
 
 PY_PLUGINS :=					\
-	plugins/clnrest/clnrest.py
+	plugins/clnrest/clnrest \
+	plugins/wss-proxy/wss-proxy
 
 ifeq ($(HAVE_SQLITE3),1)
 C_PLUGINS += plugins/sql
@@ -158,6 +159,7 @@ PLUGIN_COMMON_OBJS :=				\
 	common/deprecation.o			\
 	common/features.o			\
 	common/hash_u5.o			\
+	common/json_command.o			\
 	common/json_param.o			\
 	common/json_parse.o			\
 	common/json_parse_simple.o		\
@@ -166,6 +168,7 @@ PLUGIN_COMMON_OBJS :=				\
 	common/lease_rates.o			\
 	common/memleak.o			\
 	common/node_id.o			\
+	common/plugin.o				\
 	common/psbt_open.o			\
 	common/pseudorand.o			\
 	common/random_select.o			\
@@ -179,6 +182,7 @@ PLUGIN_COMMON_OBJS :=				\
 	wire/tlvstream.o			\
 	wire/towire.o
 
+include plugins/askrene/Makefile
 include plugins/bkpr/Makefile
 include plugins/renepay/Makefile
 
@@ -190,7 +194,7 @@ ALL_PROGRAMS += $(C_PLUGINS)
 # Make all plugins depend on all plugin headers, for simplicity.
 $(PLUGIN_ALL_OBJS): $(PLUGIN_ALL_HEADER)
 
-plugins/pay: $(PLUGIN_PAY_OBJS) $(PLUGIN_LIB_OBJS) $(PLUGIN_PAY_LIB_OBJS) $(PLUGIN_COMMON_OBJS) $(JSMN_OBJS) common/gossmap.o common/fp16.o common/route.o common/dijkstra.o common/bolt12.o common/bolt12_merkle.o wire/bolt12_wiregen.o bitcoin/block.o common/blindedpay.o common/blindedpath.o common/hmac.o common/blinding.o common/onion_encode.o common/gossmods_listpeerchannels.o wire/onion_wiregen.o
+plugins/pay: $(PLUGIN_PAY_OBJS) $(PLUGIN_LIB_OBJS) $(PLUGIN_PAY_LIB_OBJS) $(PLUGIN_COMMON_OBJS) $(JSMN_OBJS) common/gossmap.o common/fp16.o common/route.o common/dijkstra.o common/bolt12.o common/bolt12_merkle.o wire/bolt12_wiregen.o bitcoin/block.o common/blindedpay.o common/blindedpath.o common/hmac.o common/blinding.o common/onion_encode.o common/gossmods_listpeerchannels.o common/sciddir_or_pubkey.o wire/onion_wiregen.o
 
 plugins/autoclean: $(PLUGIN_AUTOCLEAN_OBJS) $(PLUGIN_LIB_OBJS) $(PLUGIN_COMMON_OBJS) $(JSMN_OBJS)
 
@@ -200,24 +204,24 @@ plugins/commando: $(PLUGIN_COMMANDO_OBJS) $(PLUGIN_LIB_OBJS) $(PLUGIN_COMMON_OBJ
 
 # Topology wants to decode node_announcement, and peer_wiregen which
 # pulls in some of bitcoin/.
-plugins/topology: common/route.o common/dijkstra.o common/gossmap.o common/fp16.o wire/peer_wiregen.o wire/channel_type_wiregen.o bitcoin/block.o bitcoin/preimage.o common/gossmods_listpeerchannels.o  $(PLUGIN_TOPOLOGY_OBJS) $(PLUGIN_LIB_OBJS) $(PLUGIN_COMMON_OBJS) $(JSMN_OBJS)
+plugins/topology: common/route.o common/dijkstra.o common/gossmap.o common/sciddir_or_pubkey.o common/fp16.o wire/peer_wiregen.o wire/channel_type_wiregen.o bitcoin/block.o bitcoin/preimage.o common/gossmods_listpeerchannels.o  $(PLUGIN_TOPOLOGY_OBJS) $(PLUGIN_LIB_OBJS) $(PLUGIN_COMMON_OBJS) $(JSMN_OBJS)
 
 plugins/txprepare: $(PLUGIN_TXPREPARE_OBJS) $(PLUGIN_LIB_OBJS) $(PLUGIN_COMMON_OBJS) $(JSMN_OBJS)
 
 plugins/bcli: $(PLUGIN_BCLI_OBJS) $(PLUGIN_LIB_OBJS) $(PLUGIN_COMMON_OBJS) $(JSMN_OBJS)
 
-plugins/keysend: wire/tlvstream.o wire/onion_wiregen.o $(PLUGIN_KEYSEND_OBJS) $(PLUGIN_LIB_OBJS) $(PLUGIN_PAY_LIB_OBJS) $(PLUGIN_COMMON_OBJS) $(JSMN_OBJS) common/gossmap.o common/fp16.o common/route.o common/dijkstra.o common/blindedpay.o common/blindedpath.o common/hmac.o common/blinding.o common/onion_encode.o common/gossmods_listpeerchannels.o
+plugins/keysend: wire/tlvstream.o wire/onion_wiregen.o $(PLUGIN_KEYSEND_OBJS) $(PLUGIN_LIB_OBJS) $(PLUGIN_PAY_LIB_OBJS) $(PLUGIN_COMMON_OBJS) $(JSMN_OBJS) common/gossmap.o common/fp16.o common/route.o common/dijkstra.o common/blindedpay.o common/blindedpath.o common/hmac.o common/blinding.o common/onion_encode.o common/gossmods_listpeerchannels.o common/sciddir_or_pubkey.o 
 $(PLUGIN_KEYSEND_OBJS): $(PLUGIN_PAY_LIB_HEADER)
 
 plugins/spenderp: bitcoin/block.o bitcoin/preimage.o bitcoin/psbt.o common/psbt_open.o common/json_channel_type.o common/channel_type.o common/features.o wire/peer_wiregen.o $(PLUGIN_SPENDER_OBJS) $(PLUGIN_LIB_OBJS) $(PLUGIN_COMMON_OBJS) $(JSMN_OBJS)
 
-plugins/offers: $(PLUGIN_OFFERS_OBJS) $(PLUGIN_LIB_OBJS) $(PLUGIN_COMMON_OBJS) common/addr.o common/bolt12.o common/bolt12_merkle.o common/bolt11_json.o common/iso4217.o $(WIRE_OBJS) $(WIRE_BOLT12_OBJS) bitcoin/block.o common/channel_id.o bitcoin/preimage.o common/blindedpath.o common/invoice_path_id.o common/blinding.o common/hmac.o $(JSMN_OBJS)
-
-plugins/fetchinvoice: $(PLUGIN_FETCHINVOICE_OBJS) $(PLUGIN_LIB_OBJS) $(PLUGIN_COMMON_OBJS) common/bolt12.o common/bolt12_merkle.o common/iso4217.o $(WIRE_OBJS) $(WIRE_BOLT12_OBJS) bitcoin/block.o common/channel_id.o bitcoin/preimage.o $(JSMN_OBJS) common/gossmap.o common/fp16.o common/dijkstra.o common/route.o common/blindedpath.o common/hmac.o common/blinding.o common/gossmods_listpeerchannels.o
+plugins/offers: $(PLUGIN_OFFERS_OBJS) $(PLUGIN_LIB_OBJS) $(PLUGIN_COMMON_OBJS) common/addr.o common/bolt12.o common/bolt12_merkle.o common/bolt11_json.o common/iso4217.o $(WIRE_OBJS) $(WIRE_BOLT12_OBJS) bitcoin/block.o common/channel_id.o bitcoin/preimage.o common/blindedpath.o common/bolt12_id.o common/blinding.o common/hmac.o common/json_blinded_path.o common/gossmap.o common/fp16.o $(JSMN_OBJS) common/dijkstra.o common/route.o common/gossmods_listpeerchannels.o common/onion_message.o
 
 plugins/funder: bitcoin/psbt.o common/psbt_open.o $(PLUGIN_FUNDER_OBJS) $(PLUGIN_LIB_OBJS) $(PLUGIN_COMMON_OBJS) $(JSMN_OBJS)
 
-plugins/recover:  common/gossmap.o common/fp16.o $(PLUGIN_RECOVER_OBJS) $(PLUGIN_LIB_OBJS) $(PLUGIN_COMMON_OBJS) $(JSMN_OBJS)
+plugins/recover:  common/gossmap.o common/sciddir_or_pubkey.o common/fp16.o $(PLUGIN_RECOVER_OBJS) $(PLUGIN_LIB_OBJS) $(PLUGIN_COMMON_OBJS) $(JSMN_OBJS)
+
+plugins/recklessrpc: $(PLUGIN_RECKLESSRPC_OBJS) $(PLUGIN_LIB_OBJS) $(PLUGIN_COMMON_OBJS) $(JSMN_OBJS)
 
 # This covers all the low-level list RPCs which return simple arrays
 SQL_LISTRPCS := listchannels listforwards listhtlcs listinvoices listnodes listoffers listpeers listpeerchannels listclosedchannels listtransactions listsendpays bkpr-listaccountevents bkpr-listincome
@@ -253,14 +257,19 @@ PLUGIN_BASES := $(PLUGINS:plugins/%=%) $(PY_PLUGINS:plugins/%=%)
 plugins/list_of_builtin_plugins_gen.h: plugins/Makefile Makefile config.vars
 	@$(call VERBOSE,GEN $@,echo "static const char *list_of_builtin_plugins[] = { $(PLUGIN_BASES:%=\"%\",) NULL };" > $@)
 
+target/${RUST_PROFILE}/examples/cln-subscribe-wildcard: ${CLN_PLUGIN_SRC} plugins/examples/cln-subscribe-wildcard.rs
+	cargo build ${CARGO_OPTS} --example cln-subscribe-wildcard
+
 CLN_PLUGIN_EXAMPLES := \
 	target/${RUST_PROFILE}/examples/cln-plugin-startup \
 	target/${RUST_PROFILE}/examples/cln-plugin-reentrant \
-	target/${RUST_PROFILE}/examples/cln-rpc-getinfo
+	target/${RUST_PROFILE}/examples/cln-rpc-getinfo \
+	target/${RUST_PROFILE}/examples/cln-subscribe-wildcard
 
 CLN_PLUGIN_SRC = $(shell find plugins/src -name "*.rs")
+CLN_GRPC_PLUGIN_SRC = $(shell find plugins/grpc-plugin/src -name "*.rs")
 
-target/${RUST_PROFILE}/cln-grpc: ${CLN_PLUGIN_SRC}
+target/${RUST_PROFILE}/cln-grpc: ${CLN_PLUGIN_SRC} ${CLN_GRPC_PLUGIN_SRC}
 	cargo build ${CARGO_OPTS} --bin cln-grpc
 
 ifneq ($(RUST),0)

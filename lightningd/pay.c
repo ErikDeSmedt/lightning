@@ -353,10 +353,10 @@ immediate_routing_failure(const tal_t *ctx,
 	routing_failure->erring_index = 0;
 	routing_failure->failcode = failcode;
 	routing_failure->erring_node =
-	    tal_dup(routing_failure, struct node_id, &ld->id);
+	    tal_dup(routing_failure, struct node_id, &ld->our_nodeid);
 	routing_failure->erring_channel =
 	    tal_dup(routing_failure, struct short_channel_id, &channel0);
-	routing_failure->channel_dir = node_id_idx(&ld->id, dstid);
+	routing_failure->channel_dir = node_id_idx(&ld->our_nodeid, dstid);
 	routing_failure->msg = NULL;
 
 	return routing_failure;
@@ -378,14 +378,14 @@ local_routing_failure(const tal_t *ctx,
 	routing_failure->failcode = failcode;
 
 	routing_failure->erring_node =
-	    tal_dup(routing_failure, struct node_id, &ld->id);
+	    tal_dup(routing_failure, struct node_id, &ld->our_nodeid);
 
 	if (payment->route_nodes != NULL && payment->route_channels != NULL) {
 		routing_failure->erring_channel =
 		    tal_dup(routing_failure, struct short_channel_id,
 			    &payment->route_channels[0]);
 		routing_failure->channel_dir =
-		    node_id_idx(&ld->id, &payment->route_nodes[0]);
+		    node_id_idx(&ld->our_nodeid, &payment->route_nodes[0]);
 	} else {
 		routing_failure->erring_channel = NULL;
 	}
@@ -444,7 +444,7 @@ remote_routing_failure(const tal_t *ctx,
 		erring_channel = &route_channels[origin_index];
 		/* Single hop? */
 		if (origin_index == 0)
-			dir = node_id_idx(&ld->id,
+			dir = node_id_idx(&ld->our_nodeid,
 					  &route_nodes[origin_index]);
 		else
 			dir = node_id_idx(&route_nodes[origin_index - 1],
@@ -732,7 +732,8 @@ static const u8 *send_onion(const tal_t *ctx, struct lightningd *ld,
 	const u8 *onion;
 	unsigned int base_expiry;
 
-	base_expiry = get_block_height(ld->topology) + 1;
+	/* Use bitcoind's block height, even if we're behind in processing */
+	base_expiry = get_network_blockheight(ld->topology) + 1;
 	onion = serialize_onionpacket(tmpctx, packet);
 	return send_htlc_out(ctx, channel, first_hop->amount,
 			     base_expiry + first_hop->delay,
@@ -1066,8 +1067,8 @@ send_payment_core(struct lightningd *ld,
 					   "peer found");
 
 		json_add_routefail_info(data, 0, WIRE_UNKNOWN_NEXT_PEER,
-					&ld->id, NULL,
-					node_id_idx(&ld->id,
+					&ld->our_nodeid, NULL,
+					node_id_idx(&ld->our_nodeid,
 						    &first_hop->node_id),
 					NULL);
 		json_object_end(data);
@@ -1149,7 +1150,8 @@ send_payment(struct lightningd *ld,
 	     const char *description TAKES,
 	     const struct sha256 *local_invreq_id,
 	     const struct secret *payment_secret,
-	     const u8 *payment_metadata)
+	     const u8 *payment_metadata,
+	     bool dev_legacy_hop)
 {
 	unsigned int base_expiry;
 	struct onionpacket *packet;
@@ -1162,8 +1164,9 @@ send_payment(struct lightningd *ld,
 	bool ret;
 	u8 *onion;
 
-	/* Expiry for HTLCs is absolute.  And add one to give some margin. */
-	base_expiry = get_block_height(ld->topology) + 1;
+	/* Expiry for HTLCs is absolute.  And add one to give some margin,
+	   and use bitcoind's block height, even if we're behind in processing */
+	base_expiry = get_network_blockheight(ld->topology) + 1;
 
 	path = sphinx_path_new(tmpctx, rhash->u.u8);
 	/* Extract IDs for each hop: create_onionpacket wants array. */
@@ -1174,6 +1177,14 @@ send_payment(struct lightningd *ld,
 	for (i = 0; i < n_hops - 1; i++) {
 		ret = pubkey_from_node_id(&pubkey, &ids[i]);
 		assert(ret);
+
+		if (dev_legacy_hop && i == n_hops - 2) {
+			sphinx_add_v0_hop(path, &pubkey,
+					  &route[i + 1].scid,
+					  route[i + 1].amount,
+					  base_expiry + route[i + 1].delay);
+			continue;
+		}
 
 		sphinx_add_hop_has_length(path, &pubkey,
 			       take(onion_nonfinal_hop(NULL,
@@ -1330,9 +1341,7 @@ static struct command_result *json_sendonion(struct command *cmd,
 
 static const struct json_command sendonion_command = {
 	"sendonion",
-	"payment",
 	json_sendonion,
-	"Send a payment with a pre-computed onion."
 };
 AUTODATA(json_command, &sendonion_command);
 
@@ -1423,7 +1432,7 @@ static struct command_result *self_payment(struct lightningd *ld,
 				     partid,
 				     groupid,
 				     PAYMENT_PENDING,
-				     &ld->id,
+				     &ld->our_nodeid,
 				     msat,
 				     msat,
 				     msat,
@@ -1447,7 +1456,7 @@ static struct command_result *self_payment(struct lightningd *ld,
 		/* tell_waiters_failed expects one of these! */
 		fail = tal(payment, struct routing_failure);
 		fail->failcode = WIRE_INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS;
-		fail->erring_node = &ld->id;
+		fail->erring_node = &ld->our_nodeid;
 		fail->erring_index = 0;
 		fail->erring_channel = NULL;
 		fail->msg = NULL;
@@ -1504,6 +1513,7 @@ static struct command_result *json_sendpay(struct command *cmd,
 	struct secret *payment_secret;
 	struct sha256 *local_invreq_id;
 	u8 *payment_metadata;
+	bool *dev_legacy_hop;
 
 	if (!param_check(cmd, buffer, params,
 			 p_req("route", param_route_hops, &route),
@@ -1518,6 +1528,7 @@ static struct command_result *json_sendpay(struct command *cmd,
 			 p_opt("groupid", param_u64, &group),
 			 p_opt("payment_metadata", param_bin_from_hex, &payment_metadata),
 			 p_opt("description", param_string, &description),
+			 p_opt_dev("dev_legacy_hop", param_bool, &dev_legacy_hop, false),
 		   NULL))
 		return command_param_failed();
 
@@ -1580,14 +1591,12 @@ static struct command_result *json_sendpay(struct command *cmd,
 			    final_amount,
 			    msat ? *msat : final_amount,
 			    label, invstring, description, local_invreq_id,
-			    payment_secret, payment_metadata);
+			    payment_secret, payment_metadata, *dev_legacy_hop);
 }
 
 static const struct json_command sendpay_command = {
 	"sendpay",
-	"payment",
 	json_sendpay,
-	"Send along {route} in return for preimage of {payment_hash}"
 };
 AUTODATA(json_command, &sendpay_command);
 
@@ -1631,10 +1640,7 @@ static struct command_result *json_waitsendpay(struct command *cmd,
 
 static const struct json_command waitsendpay_command = {
 	"waitsendpay",
-	"payment",
 	json_waitsendpay,
-	"Wait for payment attempt on {payment_hash} to succeed or fail, "
-	"but only up to {timeout} seconds."
 };
 AUTODATA(json_command, &waitsendpay_command);
 
@@ -1794,9 +1800,7 @@ static struct command_result *json_listsendpays(struct command *cmd,
 
 static const struct json_command listsendpays_command = {
 	"listsendpays",
-	"payment",
 	json_listsendpays,
-	"Show sendpay, old and current, optionally limiting to {bolt11} or {payment_hash}."
 };
 AUTODATA(json_command, &listsendpays_command);
 
@@ -1898,9 +1902,7 @@ static struct command_result *json_delpay(struct command *cmd,
 
 static const struct json_command delpay_command = {
 	"delpay",
-	"payment",
 	json_delpay,
-	"Delete payment with {payment_hash} and {status}",
 };
 AUTODATA(json_command, &delpay_command);
 
@@ -1965,8 +1967,6 @@ static struct command_result *json_createonion(struct command *cmd,
 
 static const struct json_command createonion_command = {
 	"createonion",
-	"payment",
 	json_createonion,
-	"Create an onion going through the provided nodes, each with its own payload"
 };
 AUTODATA(json_command, &createonion_command);

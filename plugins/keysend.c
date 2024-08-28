@@ -74,13 +74,14 @@ static void keysend_cb(struct keysend_data *d, struct payment *p) {
 		   featurebit method.*/
 
 		if (p->result != NULL &&
-		    node_id_eq(p->destination, p->result->erring_node) &&
+		    node_id_eq(p->route_destination, p->result->erring_node) &&
 		    p->result->failcode == WIRE_INVALID_ONION_PAYLOAD) {
 			return payment_abort(
 			    p,
+			    PAY_DESTINATION_PERM_FAIL,
 			    "Recipient %s reported an invalid payload, this "
 			    "usually means they don't support keysend.",
-			    fmt_node_id(tmpctx, p->destination));
+			    fmt_node_id(tmpctx, p->route_destination));
 		}
 	}
 
@@ -107,59 +108,6 @@ REGISTER_PAYMENT_MODIFIER(keysend, struct keysend_data *, keysend_init,
 			  keysend_cb);
 /*
  * End of keysend modifier
- *****************************************************************************/
-
-/*****************************************************************************
- * check_preapprovekeysend
- *
- * @desc submit the keysend to the HSM for approval, fail the payment if not approved.
- *
- * This paymod checks the keysend for approval with the HSM, which might:
- * - check with the user for specific approval
- * - enforce velocity controls
- * - automatically approve the keysend (default)
- */
-
-static struct command_result *
-check_preapprovekeysend_allow(struct command *cmd,
-			      const char *buf,
-			      const jsmntok_t *result,
-			      struct payment *p)
-{
-	/* On success, an empty object is returned. */
-	payment_continue(p);
-	return command_still_pending(cmd);
-}
-
-static struct command_result *preapprovekeysend_rpc_failure(struct command *cmd,
-							    const char *buffer,
-							    const jsmntok_t *toks,
-							    struct payment *p)
-{
-	payment_abort(p,
-		      "Failing payment due to a failed RPC call: %.*s",
-		      toks->end - toks->start, buffer + toks->start);
-	return command_still_pending(cmd);
-}
-
-static void check_preapprovekeysend_start(void *d UNUSED, struct payment *p)
-{
-	/* Ask the HSM if the keysend is OK to pay */
-	struct out_req *req;
-	req = jsonrpc_request_start(p->plugin, NULL, "preapprovekeysend",
-				    &check_preapprovekeysend_allow,
-				    &preapprovekeysend_rpc_failure, p);
-	json_add_node_id(req->js, "destination", p->destination);
-	json_add_sha256(req->js, "payment_hash", p->payment_hash);
-	json_add_amount_msat(req->js, "amount_msat", p->our_amount);
-	(void) send_outreq(p->plugin, req);
-}
-
-REGISTER_PAYMENT_MODIFIER(check_preapprovekeysend, void *, NULL,
-			  check_preapprovekeysend_start);
-
-/*
- * End of check_preapprovekeysend modifier
  *****************************************************************************/
 
 /* Deprecated: comma-separated string containing integers */
@@ -212,10 +160,19 @@ static const char *init(struct plugin *p, const char *buf UNUSED,
 		 JSON_SCAN(json_to_node_id, &my_id));
 
 	accepted_extra_tlvs = notleak(tal_arr(NULL, u64, 0));
+	/* BOLT #4:
+	 * ## `max_htlc_cltv` Selection
+	 *
+	 * This ... value is defined as 2016 blocks, based on historical value
+	 * deployed by Lightning implementations.
+	 */
+	/* FIXME: Typo in spec for CLTV in descripton!  But it breaks our spelling check, so we omit it above */
+	maxdelay_default = 2016;
 	/* accept-htlc-tlv-types deprecated in v23.08, but still grab it! */
+	/* max-locktime-blocks deprecated in v24.05, but still grab it! */
 	rpc_scan(p, "listconfigs", take(json_out_obj(NULL, NULL, NULL)),
 		 "{configs:{"
-		 "max-locktime-blocks:{value_int:%},"
+		 "max-locktime-blocks?:{value_int:%},"
 		 "accept-htlc-tlv-types?:{value_str:%},"
 		 "accept-htlc-tlv-type:{values_int:%}}}",
 		 JSON_SCAN(json_to_u32, &maxdelay_default),
@@ -227,16 +184,31 @@ static const char *init(struct plugin *p, const char *buf UNUSED,
 
 struct payment_modifier *pay_mods[] = {
     &keysend_pay_mod,
-    &check_preapprovekeysend_pay_mod,
     &local_channel_hints_pay_mod,
     &directpay_pay_mod,
     &shadowroute_pay_mod,
     &routehints_pay_mod,
     &exemptfee_pay_mod,
-    &waitblockheight_pay_mod,
     &retry_pay_mod,
     NULL,
 };
+
+static struct command_result *
+preapprovekeysend_succeed(struct command *cmd,
+			  const char *buf,
+			  const jsmntok_t *result,
+			  struct payment *p)
+{
+	/* Now we can conclude `check` command */
+	if (command_check_only(cmd)) {
+		return command_check_done(cmd);
+	}
+
+	/* We're keeping this around now */
+	tal_steal(cmd->plugin, notleak(p));
+	payment_start(p);
+	return command_still_pending(cmd);
+}
 
 static struct command_result *json_keysend(struct command *cmd, const char *buf,
 					   const jsmntok_t *params)
@@ -251,8 +223,9 @@ static struct command_result *json_keysend(struct command *cmd, const char *buf,
 	struct route_info **hints;
 	struct tlv_field *extra_fields;
 	bool *dev_use_shadow;
+	struct out_req *req;
 
-	if (!param(cmd, buf, params,
+	if (!param_check(cmd, buf, params,
 		   p_req("destination", param_node_id, &destination),
 		   p_req("amount_msat", param_msat, &msat),
 		   p_opt("label", param_string, &label),
@@ -272,7 +245,8 @@ static struct command_result *json_keysend(struct command *cmd, const char *buf,
 	p->local_id = &my_id;
 	p->json_buffer = tal_dup_talarr(p, const char, buf);
 	p->json_toks = params;
-	p->destination = tal_steal(p, destination);
+	p->route_destination = tal_steal(p, destination);
+	p->pay_destination = p->route_destination;
 	p->payment_secret = NULL;
 	p->payment_metadata = NULL;
 	p->blindedpath = NULL;
@@ -292,7 +266,7 @@ static struct command_result *json_keysend(struct command *cmd, const char *buf,
 	p->deadline = timeabs_add(time_now(), time_from_sec(*retryfor));
 	p->getroute->riskfactorppm = 10000000;
 
-	if (node_id_eq(&my_id, p->destination)) {
+	if (node_id_eq(&my_id, p->route_destination)) {
 		return command_fail(
 		    cmd, JSONRPC2_INVALID_PARAMS,
 		    "We are the destination. Keysend cannot be used to send funds to yourself");
@@ -313,19 +287,28 @@ static struct command_result *json_keysend(struct command *cmd, const char *buf,
 	payment_mod_exemptfee_get_data(p)->amount = *exemptfee;
 	payment_mod_shadowroute_get_data(p)->use_shadow = *dev_use_shadow;
 	p->label = tal_steal(p, label);
-	payment_start(p);
-	/* We're keeping this around now */
-	tal_steal(cmd->plugin, notleak(p));
-	return command_still_pending(cmd);
+
+	/* We do pre-approval immediately (note: even if command_check_only!) */
+	if (command_check_only(cmd)) {
+		req = jsonrpc_request_start(p->plugin, cmd, "check",
+					    preapprovekeysend_succeed,
+					    forward_error, p);
+		json_add_string(req->js, "command_to_check", "preapprovekeysend");
+	} else {
+		req = jsonrpc_request_start(p->plugin, cmd, "preapprovekeysend",
+					    preapprovekeysend_succeed,
+					    forward_error, p);
+	}
+	json_add_node_id(req->js, "destination", p->route_destination);
+	json_add_sha256(req->js, "payment_hash", p->payment_hash);
+	json_add_amount_msat(req->js, "amount_msat", p->our_amount);
+	return send_outreq(cmd->plugin, req);
 }
 
 static const struct plugin_command commands[] = {
     {
 	    "keysend",
-	    "payment",
-	    "Send a payment without an invoice to a node",
-            "Send an unsolicited payment of {amount} to {destination}, by providing the recipient the necessary information to claim the payment",
-            json_keysend
+		json_keysend
     },
 };
 
@@ -612,7 +595,7 @@ int main(int argc, char *argv[])
 		features->bits[i] = tal_arr(features, u8, 0);
 	set_feature_bit(&features->bits[NODE_ANNOUNCE_FEATURE], KEYSEND_FEATUREBIT);
 
-	plugin_main(argv, init, PLUGIN_STATIC, true, features, commands,
+	plugin_main(argv, init, NULL, PLUGIN_STATIC, true, features, commands,
 		    ARRAY_SIZE(commands), NULL, 0, hooks, ARRAY_SIZE(hooks),
 		    notification_topics, ARRAY_SIZE(notification_topics), NULL);
 }

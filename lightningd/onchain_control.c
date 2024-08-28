@@ -518,6 +518,51 @@ static u32 infinite_block_deadline(const struct chain_topology *topo)
 	return get_block_height(topo) + 300;
 }
 
+/**
+ * slow_sweep_dealine -- A smart(-ish) way of estimating sweep fees.
+ *
+ * We use the `close_blockheight` as the basis for the target. We then
+ * target to have the funds back at most 2 weeks after the close,
+ * linearly increasing the confirmation target until we get
+ * close. However, we also don't want to panic and set a target that
+ * is too close, in order not to waste too many funds on the sweep
+ * fees.
+ */
+static u32 slow_sweep_deadline(const struct chain_topology *topo,
+			       const struct channel *c)
+{
+	u32 closeheight, deadline, height = get_block_height(topo);
+
+	if (c->close_blockheight) {
+		closeheight = *c->close_blockheight;
+	} else {
+		log_unusual(c->log,
+			    "Missing close_blockheight?  Using current height "
+			    "+ 300 = %d",
+			    height + 300);
+		return height + 300;
+	}
+
+	/* A two week deadline seems like a not too bad default. We
+	 * should likely tweak this to hit the desired cost vs. idle
+	 * time tradeoff. */
+	deadline = closeheight + 2016;
+
+	/* If we missed the deadline, don't panic, let's continue with
+	 * a somewhat reasonable target, and hope for the best. No
+	 * need to ramp up to confirmation target 1, we're supposed to
+	 * be slow. */
+	if (deadline < height + 12)
+		return height + 12;
+
+	/* At the same time don't be too lenient, we want this to
+	 * confirm and not just idle around forever. */
+	if (deadline > height + 300)
+		return height + 300;
+
+	return deadline;
+}
+
 static struct onchain_signing_info *new_signing_info(const tal_t *ctx,
 						     struct channel *channel,
 						     enum onchaind_wire msgtype)
@@ -1104,7 +1149,8 @@ static void handle_onchaind_spend_to_us(struct channel *channel,
 	}
 
 	/* No real deadline on this, it's just returning to our wallet. */
-	info->deadline_block = infinite_block_deadline(channel->peer->ld->topology);
+	info->deadline_block =
+	    slow_sweep_deadline(channel->peer->ld->topology, channel);
 	create_onchain_tx(channel, &out, out_sats,
 			  channel->channel_info.their_config.to_self_delay, 0,
 			  sign_tx_to_us, info,
@@ -1196,7 +1242,7 @@ static void handle_onchaind_spend_htlc_success(struct channel *channel,
 	u8 **witness;
 	struct bitcoin_signature sig;
 	const struct onchain_witness_element **welements;
-	const bool option_anchor_outputs = channel_has(channel, OPT_ANCHOR_OUTPUTS);
+	const bool option_anchor_outputs = channel_has(channel, OPT_ANCHOR_OUTPUTS_DEPRECATED);
 	const bool option_anchors_zero_fee_htlc_tx = channel_has(channel, OPT_ANCHORS_ZERO_FEE_HTLC_TX);
 
 	info = new_signing_info(msg, channel, WIRE_ONCHAIND_SPEND_HTLC_SUCCESS);
@@ -1277,7 +1323,7 @@ static void handle_onchaind_spend_htlc_timeout(struct channel *channel,
 	u8 **witness;
 	struct bitcoin_signature sig;
 	const struct onchain_witness_element **welements;
-	const bool option_anchor_outputs = channel_has(channel, OPT_ANCHOR_OUTPUTS);
+	const bool option_anchor_outputs = channel_has(channel, OPT_ANCHOR_OUTPUTS_DEPRECATED);
 	const bool option_anchors_zero_fee_htlc_tx = channel_has(channel, OPT_ANCHORS_ZERO_FEE_HTLC_TX);
 
 	info = new_signing_info(msg, channel, WIRE_ONCHAIND_SPEND_HTLC_TIMEOUT);
@@ -1504,7 +1550,6 @@ enum watch_result onchaind_funding_spent(struct channel *channel,
 	u8 *msg;
 	struct bitcoin_txid our_last_txid;
 	struct lightningd *ld = channel->peer->ld;
-	struct pubkey final_key;
 	int hsmfd;
 	enum state_change reason;
 
@@ -1540,6 +1585,11 @@ enum watch_result onchaind_funding_spent(struct channel *channel,
 				  channel->dbid,
 				  HSM_PERM_SIGN_ONCHAIN_TX
 				  | HSM_PERM_COMMITMENT_POINT);
+	if (hsmfd < 0) {
+		log_broken(channel->log, "Could not get hsm fd for onchaind: %s",
+			   strerror(errno));
+		return KEEP_WATCHING;
+	}
 
 	channel_set_owner(channel, new_channel_subd(channel, ld,
 						    "lightning_onchaind",
@@ -1558,8 +1608,6 @@ enum watch_result onchaind_funding_spent(struct channel *channel,
 			   strerror(errno));
 		return KEEP_WATCHING;
 	}
-
-	bip32_pubkey(ld, &final_key, channel->final_key_idx);
 
 	struct ext_key final_wallet_ext_key;
 	if (bip32_key_from_parent(
@@ -1606,8 +1654,6 @@ enum watch_result onchaind_funding_spent(struct channel *channel,
 				  channel->shutdown_scriptpubkey[LOCAL],
 				  channel->shutdown_scriptpubkey[REMOTE],
 				  channel->final_key_idx,
-				  &final_wallet_ext_key,
-				  &final_key,
 				  channel->opener,
 				  &channel->local_basepoints,
 				  &channel->channel_info.theirbase,
@@ -1619,12 +1665,11 @@ enum watch_result onchaind_funding_spent(struct channel *channel,
 				  channel->last_htlc_sigs,
 				  channel->min_possible_feerate,
 				  channel->max_possible_feerate,
-				  channel->future_per_commitment_point,
 				  &channel->local_funding_pubkey,
 				  &channel->channel_info.remote_fundingkey,
 				  channel->static_remotekey_start[LOCAL],
 				  channel->static_remotekey_start[REMOTE],
-				   channel_has(channel, OPT_ANCHOR_OUTPUTS),
+				   channel_has(channel, OPT_ANCHOR_OUTPUTS_DEPRECATED),
 				   channel_has(channel, OPT_ANCHORS_ZERO_FEE_HTLC_TX),
 				  feerate_min(ld, NULL));
 	subd_send_msg(channel->owner, take(msg));

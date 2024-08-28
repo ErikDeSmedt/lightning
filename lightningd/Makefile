@@ -69,6 +69,9 @@ ALL_C_SOURCES += $(LIGHTNINGD_SRC) $(LIGHTNINGD_SRC_NOHDR)
 ALL_C_HEADERS += $(LIGHTNINGD_HDRS)
 ALL_PROGRAMS += lightningd/lightningd
 
+# We explicitly check header versions in lightningd.c
+lightningd/lightningd.o: header_versions_gen.h
+
 # Common source we use.
 LIGHTNINGD_COMMON_OBJS :=			\
 	common/addr.o				\
@@ -86,6 +89,7 @@ LIGHTNINGD_COMMON_OBJS :=			\
 	common/bolt11.o				\
 	common/bolt11_json.o			\
 	common/bolt12.o				\
+	common/bolt12_id.o			\
 	common/bolt12_merkle.o			\
 	common/codex32.o			\
 	common/channel_config.o			\
@@ -112,10 +116,10 @@ LIGHTNINGD_COMMON_OBJS :=			\
 	common/htlc_trim.o			\
 	common/htlc_tx.o			\
 	common/htlc_wire.o			\
-	common/invoice_path_id.o		\
 	common/key_derive.o			\
 	common/keyset.o				\
 	common/json_channel_type.o		\
+	common/json_command.o			\
 	common/json_filter.o			\
 	common/json_param.o			\
 	common/json_parse.o			\
@@ -131,9 +135,10 @@ LIGHTNINGD_COMMON_OBJS :=			\
 	common/penalty_base.o			\
 	common/per_peer_state.o			\
 	common/permute_tx.o			\
-	common/psbt_keypath.o		\
+	common/psbt_keypath.o			\
 	common/psbt_open.o			\
 	common/pseudorand.o			\
+	common/plugin.o				\
 	common/random_select.o			\
 	common/setup.o				\
 	common/shutdown_scriptpubkey.o		\

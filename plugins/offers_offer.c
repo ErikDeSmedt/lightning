@@ -3,10 +3,14 @@
 #include <ccan/array_size/array_size.h>
 #include <ccan/tal/str/str.h>
 #include <common/bolt12.h>
+#include <common/bolt12_id.h>
+#include <common/gossmap.h>
 #include <common/iso4217.h>
 #include <common/json_param.h>
 #include <common/json_stream.h>
+#include <common/onion_message.h>
 #include <common/overflows.h>
+#include <plugins/offers.h>
 #include <plugins/offers_offer.h>
 #include <sodium/randombytes.h>
 
@@ -162,18 +166,10 @@ static struct command_result *param_recurrence_base(struct command *cmd,
 						    const jsmntok_t *tok,
 						    struct recurrence_base **base)
 {
-	/* Make copy so we can manipulate it */
-	jsmntok_t t = *tok;
-
 	*base = tal(cmd, struct recurrence_base);
-	if (command_deprecated_in_ok(cmd, "recurrence_base.at_prefix", "v24.02", "v24.05")
-	    && json_tok_startswith(buffer, &t, "@")) {
-		t.start++;
-		(*base)->start_any_period = false;
-	} else
-		(*base)->start_any_period = true;
+	(*base)->start_any_period = true;
 
-	if (!json_to_u64(buffer, &t, &(*base)->basetime))
+	if (!json_to_u64(buffer, tok, &(*base)->basetime))
 		return command_fail_badparam(cmd, name, buffer, tok,
 					     "not a valid basetime");
 	return NULL;
@@ -233,7 +229,7 @@ static struct command_result *param_recurrence_paywindow(struct command *cmd,
 }
 
 struct offer_info {
-	const struct tlv_offer *offer;
+	struct tlv_offer *offer;
 	const char *label;
 	bool *single_use;
 };
@@ -281,6 +277,67 @@ static struct command_result *create_offer(struct command *cmd,
 	return send_outreq(cmd->plugin, req);
 }
 
+static struct command_result *found_best_peer(struct command *cmd,
+					      const struct chaninfo *best,
+					      struct offer_info *offinfo)
+{
+	/* BOLT-offers #12:
+	 *   - if it is connected only by private channels:
+	 *     - MUST include `offer_paths` containing one or more paths to the node from
+	 *       publicly reachable nodes.
+	 */
+	if (!best) {
+		/* FIXME: Make this a warning in the result! */
+		plugin_log(cmd->plugin, LOG_UNUSUAL,
+			   "No incoming channel to public peer, so no blinded path");
+	} else {
+		struct pubkey *ids;
+		struct secret blinding_path_secret;
+		struct sha256 offer_id;
+
+		/* Note: "id" of offer minus paths */
+		offer_offer_id(offinfo->offer, &offer_id);
+
+		/* Make a small 1-hop path to us */
+		ids = tal_arr(tmpctx, struct pubkey, 2);
+		ids[0] = best->id;
+		ids[1] = id;
+
+		/* So we recognize this */
+		/* We can check this when they try to take up offer. */
+		bolt12_path_secret(&offerblinding_base, &offer_id,
+				   &blinding_path_secret);
+
+		offinfo->offer->offer_paths = tal_arr(offinfo->offer, struct blinded_path *, 1);
+		offinfo->offer->offer_paths[0]
+			= incoming_message_blinded_path(offinfo->offer->offer_paths,
+							ids,
+							NULL,
+							&blinding_path_secret);
+	}
+
+	return create_offer(cmd, offinfo);
+}
+
+static struct command_result *maybe_add_path(struct command *cmd,
+					     struct offer_info *offinfo)
+{
+	/* BOLT-offers #12:
+	 *   - if it is connected only by private channels:
+	 *     - MUST include `offer_paths` containing one or more paths to the node from
+	 *       publicly reachable nodes.
+	 */
+	if (!offinfo->offer->offer_paths) {
+		struct node_id local_nodeid;
+
+		node_id_from_pubkey(&local_nodeid, &id);
+		if (!gossmap_find_node(get_gossmap(cmd->plugin), &local_nodeid))
+			return find_best_peer(cmd, OPT_ONION_MESSAGES,
+					      found_best_peer, offinfo);
+	}
+	return create_offer(cmd, offinfo);
+}
+
 static struct command_result *currency_done(struct command *cmd,
 					    const char *buf,
 					    const jsmntok_t *result,
@@ -290,7 +347,88 @@ static struct command_result *currency_done(struct command *cmd,
 	if (!json_get_member(buf, result, "msat"))
 		return forward_error(cmd, buf, result, offinfo);
 
-	return create_offer(cmd, offinfo);
+	return maybe_add_path(cmd, offinfo);
+}
+
+static bool json_to_sciddir_or_pubkey(const char *buffer, const jsmntok_t *tok,
+				      struct sciddir_or_pubkey *sciddir_or_pubkey)
+{
+	struct pubkey pk;
+	struct short_channel_id_dir scidd;
+
+	if (json_to_pubkey(buffer, tok, &pk)) {
+		sciddir_or_pubkey_from_pubkey(sciddir_or_pubkey, &pk);
+		return true;
+	} else if (json_to_short_channel_id_dir(buffer, tok, &scidd)) {
+		sciddir_or_pubkey_from_scidd(sciddir_or_pubkey, &scidd);
+		return true;
+	}
+
+	return false;
+}
+
+struct path {
+	/* Optional: a scid as the entry point */
+	struct short_channel_id_dir *first_scidd;
+	/* A node id for every element on the path */
+	struct pubkey *path;
+};
+
+static struct command_result *param_paths(struct command *cmd, const char *name,
+					  const char *buffer, const jsmntok_t *tok,
+					  struct path ***paths)
+{
+	size_t i;
+	const jsmntok_t *t;
+
+	if (tok->type != JSMN_ARRAY)
+		return command_fail_badparam(cmd, name, buffer, tok, "Must be array");
+
+	*paths = tal_arr(cmd, struct path *, tok->size);
+	json_for_each_arr(i, t, tok) {
+		size_t j;
+		const jsmntok_t *p;
+
+		if (t->type != JSMN_ARRAY || t->size == 0) {
+			return command_fail_badparam(cmd, name, buffer, t,
+						     "Must be array of non-empty arrays");
+		}
+
+		(*paths)[i] = tal(*paths, struct path);
+		(*paths)[i]->path = tal_arr((*paths)[i], struct pubkey, t->size);
+		json_for_each_arr(j, p, t) {
+			struct pubkey pk;
+			if (j == 0) {
+				struct sciddir_or_pubkey init;
+				if (!json_to_sciddir_or_pubkey(buffer, p, &init)) {
+					return command_fail_badparam(cmd, name, buffer, p,
+								     "invalid pubkey/sciddir");
+				}
+				if (!init.is_pubkey) {
+					(*paths)[i]->first_scidd = tal_dup((*paths)[i],
+									  struct short_channel_id_dir,
+									  &init.scidd);
+					if (!gossmap_scidd_pubkey(get_gossmap(cmd->plugin), &init)) {
+						return command_fail_badparam(cmd, name, buffer, p,
+									     "unknown sciddir");
+					}
+				} else {
+					(*paths)[i]->first_scidd = NULL;
+				}
+				pk = init.pubkey;
+			} else {
+				if (!json_to_pubkey(buffer, p, &pk)) {
+					return command_fail_badparam(cmd, name, buffer, p,
+								     "invalid pubkey");
+				}
+			}
+			if (j == t->size - 1 && !pubkey_eq(&pk, &id))
+				return command_fail_badparam(cmd, name, buffer, p,
+							     "final pubkey must be this node");
+			(*paths)[i]->path[j] = pk;
+		}
+	}
+	return NULL;
 }
 
 struct command_result *json_offer(struct command *cmd,
@@ -300,12 +438,13 @@ struct command_result *json_offer(struct command *cmd,
 	const char *desc, *issuer;
 	struct tlv_offer *offer;
 	struct offer_info *offinfo = tal(cmd, struct offer_info);
+	struct path **paths;
 
 	offinfo->offer = offer = tlv_offer_new(offinfo);
 
 	if (!param(cmd, buffer, params,
 		   p_req("amount", param_amount, offer),
-		   p_req("description", param_escaped_string, &desc),
+		   p_opt("description", param_escaped_string, &desc),
 		   p_opt("issuer", param_escaped_string, &issuer),
 		   p_opt("label", param_escaped_string, &offinfo->label),
 		   p_opt("quantity_max", param_u64, &offer->offer_quantity_max),
@@ -325,7 +464,7 @@ struct command_result *json_offer(struct command *cmd,
 		   p_opt("recurrence_start_any_period",
 			 param_recurrence_start_any_period,
 			 &offer->offer_recurrence_base),
-		   /* FIXME: hints support! */
+		   p_opt("dev_paths", param_paths, &paths),
 		   NULL))
 		return command_param_failed();
 
@@ -365,12 +504,18 @@ struct command_result *json_offer(struct command *cmd,
 						     "needs recurrence");
 	}
 
+	if (desc)
+		offer->offer_description
+			= tal_dup_arr(offer, char, desc, strlen(desc), 0);
+
 	/* BOLT-offers #12:
-	 * - MUST set `offer_description` to a complete description of the
-	 *   purpose of the payment.
+	 *
+	 * - if `offer_amount` is set and `offer_description` is not set:
+	 *    - MUST NOT respond to the offer.
 	 */
-	offer->offer_description
-		= tal_dup_arr(offer, char, desc, strlen(desc), 0);
+	if (!offer->offer_description && offer->offer_amount)
+		return command_fail_badparam(cmd, "description", buffer, params,
+					     "description is required for the user to know what it was they paid for");
 
 	/* BOLT-offers #12:
 	 * - if it sets `offer_issuer`:
@@ -385,10 +530,37 @@ struct command_result *json_offer(struct command *cmd,
 	}
 
 	/* BOLT-offers #12:
-	 * - MUST set `offer_node_id` to the node's public key to request the
-	 *   invoice from.
+	 * - if it includes `offer_paths`:
+	 *...
+	 * - otherwise:
+	 *   - MUST set `offer_issuer_id` to the node's public key to request the
+	 *     invoice from.
 	 */
-	offer->offer_node_id = tal_dup(offer, struct pubkey, &id);
+	offer->offer_issuer_id = tal_dup(offer, struct pubkey, &id);
+
+	/* Now rest of offer will not change: we use pathless offer to create secret. */
+	if (paths) {
+		struct secret blinding_path_secret;
+		struct sha256 offer_id;
+		/* Note: "id" of offer minus paths */
+		offer_offer_id(offer, &offer_id);
+
+		/* We can check this when they try to take up offer. */
+		bolt12_path_secret(&offerblinding_base, &offer_id,
+				   &blinding_path_secret);
+
+		offer->offer_paths = tal_arr(offer, struct blinded_path *, tal_count(paths));
+		for (size_t i = 0; i < tal_count(paths); i++) {
+			offer->offer_paths[i] = incoming_message_blinded_path(offer->offer_paths,
+									      paths[i]->path,
+									      NULL,
+									      &blinding_path_secret);
+			/* Override entry point if they said to */
+			if (paths[i]->first_scidd)
+				sciddir_or_pubkey_from_scidd(&offer->offer_paths[i]->first_node_id,
+							     paths[i]->first_scidd);
+		}
+	}
 
 	/* If they specify a different currency, warn if we can't
 	 * convert it! */
@@ -405,7 +577,82 @@ struct command_result *json_offer(struct command *cmd,
 		return send_outreq(cmd->plugin, req);
 	}
 
-	return create_offer(cmd, offinfo);
+	return maybe_add_path(cmd, offinfo);
+}
+
+static struct command_result *call_createinvoicerequest(struct command *cmd,
+							struct tlv_invoice_request *invreq,
+							bool single_use,
+							const char *label)
+{
+	struct out_req *req;
+
+	req = jsonrpc_request_start(cmd->plugin, cmd, "createinvoicerequest",
+				    check_result, forward_error,
+				    invreq);
+	json_add_string(req->js, "bolt12", invrequest_encode(tmpctx, invreq));
+	json_add_bool(req->js, "savetodb", true);
+	json_add_bool(req->js, "single_use", single_use);
+	if (label)
+		json_add_string(req->js, "recurrence_label", label);
+	return send_outreq(cmd->plugin, req);
+}
+
+struct invrequest_data {
+	struct tlv_invoice_request *invreq;
+	bool single_use;
+	const char *label;
+};
+
+static struct command_result *found_best_peer_invrequest(struct command *cmd,
+							 const struct chaninfo *best,
+							 struct invrequest_data *irdata)
+{
+	if (!best) {
+		/* FIXME: Make this a warning in the result! */
+		plugin_log(cmd->plugin, LOG_UNUSUAL,
+			   "No incoming channel to public peer, so no blinded path for invoice request");
+	} else {
+		struct pubkey *ids;
+		struct secret blinding_path_secret;
+		struct sha256 invreq_id;
+
+		/* BOLT-offers #12:
+		 *   - MUST set `invreq_paths` as it would set (or not set) `offer_paths` for an offer.
+		 */
+		/* BOLT-offers #12:
+		 *
+		 *   - if it is connected only by private channels:
+		 *     - MUST include `offer_paths` containing one or more paths to the node from
+		 *       publicly reachable nodes.
+		 */
+		/* Note: "id" of invreq minus paths (which we haven't added yet!) */
+		invreq_invreq_id(irdata->invreq, &invreq_id);
+
+		/* Make a small 1-hop path to us */
+		ids = tal_arr(tmpctx, struct pubkey, 2);
+		ids[0] = best->id;
+		ids[1] = id;
+
+		/* So we recognize this */
+		/* We can check this when they try to take up invoice_request. */
+		bolt12_path_secret(&offerblinding_base, &invreq_id,
+				   &blinding_path_secret);
+
+		plugin_log(cmd->plugin, LOG_DBG,
+			   "Setting blinided path (invreq_id = %s, path_secret = %s)",
+			   fmt_sha256(tmpctx, &invreq_id),
+			   fmt_secret(tmpctx, &blinding_path_secret));
+		irdata->invreq->invreq_paths = tal_arr(irdata->invreq, struct blinded_path *, 1);
+		irdata->invreq->invreq_paths[0]
+			= incoming_message_blinded_path(irdata->invreq->invreq_paths,
+							ids,
+							NULL,
+							&blinding_path_secret);
+	}
+
+	return call_createinvoicerequest(cmd,
+					 irdata->invreq, irdata->single_use, irdata->label);
 }
 
 struct command_result *json_invoicerequest(struct command *cmd,
@@ -414,15 +661,15 @@ struct command_result *json_invoicerequest(struct command *cmd,
 {
 	const char *desc, *issuer, *label;
 	struct tlv_invoice_request *invreq;
-	struct out_req *req;
 	struct amount_msat *msat;
 	bool *single_use;
+	struct node_id local_nodeid;
 
 	invreq = tlv_invoice_request_new(cmd);
 
 	if (!param(cmd, buffer, params,
 		   p_req("amount", param_msat, &msat),
-		   p_req("description", param_escaped_string, &desc),
+		   p_opt("description", param_escaped_string, &desc),
 		   p_opt("issuer", param_escaped_string, &issuer),
 		   p_opt("label", param_escaped_string, &label),
 		   p_opt("absolute_expiry", param_u64,
@@ -437,15 +684,20 @@ struct command_result *json_invoicerequest(struct command *cmd,
 
 	/* BOLT-offers #12:
 	 * - otherwise (not responding to an offer):
-	 *   - MUST set (or not set) `offer_description`, `offer_absolute_expiry`, `offer_paths` and `offer_issuer` as it would for an offer.
-	 *   - MUST set `invreq_payer_id` as it would set `offer_node_id` for an offer.
-	 *   - MUST NOT include `signature`, `offer_metadata`, `offer_chains`, `offer_amount`, `offer_currency`, `offer_features`, `offer_quantity_max` or `offer_node_id`
+	 *   - MUST set `offer_description` to a complete description of the purpose of the payment.
+	 *   - MUST set (or not set) `offer_absolute_expiry` and `offer_issuer` as it would for an offer.
+	 *   - MUST set `invreq_payer_id` (as it would set `offer_issuer_id` for an offer).
+	 *   - MUST set `invreq_paths` as it would set (or not set) `offer_paths` for an offer.
+	 *   - MUST NOT include `signature`, `offer_metadata`, `offer_chains`, `offer_amount`, `offer_currency`, `offer_features`, `offer_quantity_max`, `offer_paths` or `offer_issuer_id`
 	 *   - if the chain for the invoice is not solely bitcoin:
 	 *     - MUST specify `invreq_chain` the offer is valid for.
-	 *   - MUST set `invreq_amount`.
+	 *     - MUST set `invreq_amount`.
 	 */
-	invreq->offer_description
-		= tal_dup_arr(invreq, char, desc, strlen(desc), 0);
+	if (desc)
+		invreq->offer_description = tal_dup_arr(invreq, char, desc, strlen(desc), 0);
+	else
+		invreq->offer_description = NULL;
+
 	if (issuer) {
 		invreq->offer_issuer
 			= tal_dup_arr(invreq, char, issuer, strlen(issuer), 0);
@@ -464,32 +716,38 @@ struct command_result *json_invoicerequest(struct command *cmd,
 	invreq->invreq_amount
 		= tal_dup(invreq, u64, &msat->millisatoshis); /* Raw: wire */
 
-	/* FIXME: enable blinded paths! */
-
 	/* BOLT-offers #12:
 	 * - MUST set `invreq_metadata` to an unpredictable series of bytes.
 	 */
+	invreq->invreq_metadata = tal_arr(invreq, u8, 16);
+	randombytes_buf(invreq->invreq_metadata,
+			tal_bytelen(invreq->invreq_metadata));
+
 	/* BOLT-offers #12:
 	 * - otherwise (not responding to an offer):
 	 *...
-	 *   - MUST set `invreq_payer_id` as it would set `offer_node_id` for an offer.
+	 *   - MUST set `invreq_payer_id` (as it would set `offer_issuer_id` for an offer).
 	 */
-	/* createinvoicerequest sets these! */
+	/* FIXME: Allow invoicerequests using aliases! */
+	invreq->invreq_payer_id = tal_dup(invreq, struct pubkey, &id);
 
 	/* BOLT-offers #12:
 	 * - if it supports bolt12 invoice request features:
 	 *   - MUST set `invreq_features`.`features` to the bitmap of features.
 	 */
-	req = jsonrpc_request_start(cmd->plugin, cmd, "createinvoicerequest",
-				    check_result, forward_error,
-				    invreq);
-	json_add_string(req->js, "bolt12", invrequest_encode(tmpctx, invreq));
-	json_add_bool(req->js, "savetodb", true);
-	/* FIXME: Allow invoicerequests using aliases! */
-	json_add_bool(req->js, "exposeid", true);
-	json_add_bool(req->js, "single_use", *single_use);
-	if (label)
-		json_add_string(req->js, "recurrence_label", label);
-	return send_outreq(cmd->plugin, req);
+
+	/* FIXME: We only set blinded path if private, we should allow
+	 * setting otherwise! */
+	node_id_from_pubkey(&local_nodeid, &id);
+	if (!gossmap_find_node(get_gossmap(cmd->plugin), &local_nodeid)) {
+		struct invrequest_data *idata = tal(cmd, struct invrequest_data);
+		idata->invreq = invreq;
+		idata->single_use = *single_use;
+		idata->label = label;
+		return find_best_peer(cmd, OPT_ONION_MESSAGES,
+				      found_best_peer_invrequest, idata);
+	}
+
+	return call_createinvoicerequest(cmd, invreq, *single_use, label);
 }
 

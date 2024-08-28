@@ -14,6 +14,12 @@ Core Lightning Documentation
  .. block_start manpages
    lightning-addgossip <lightning-addgossip.7.md>
    lightning-addpsbtoutput <lightning-addpsbtoutput.7.md>
+   lightning-askrene-create-channel <lightning-askrene-create-channel.7.md>
+   lightning-askrene-disable-node <lightning-askrene-disable-node.7.md>
+   lightning-askrene-inform-channel <lightning-askrene-inform-channel.7.md>
+   lightning-askrene-listlayers <lightning-askrene-listlayers.7.md>
+   lightning-askrene-reserve <lightning-askrene-reserve.7.md>
+   lightning-askrene-unreserve <lightning-askrene-unreserve.7.md>
    lightning-autoclean-once <lightning-autoclean-once.7.md>
    lightning-autoclean-status <lightning-autoclean-status.7.md>
    lightning-batching <lightning-batching.7.md>
@@ -62,6 +68,7 @@ Core Lightning Documentation
    lightning-getinfo <lightning-getinfo.7.md>
    lightning-getlog <lightning-getlog.7.md>
    lightning-getroute <lightning-getroute.7.md>
+   lightning-getroutes <lightning-getroutes.7.md>
    lightning-help <lightning-help.7.md>
    lightning-hsmtool <lightning-hsmtool.8.md>
    lightning-invoice <lightning-invoice.7.md>
@@ -101,6 +108,7 @@ Core Lightning Documentation
    lightning-plugin <lightning-plugin.7.md>
    lightning-preapproveinvoice <lightning-preapproveinvoice.7.md>
    lightning-preapprovekeysend <lightning-preapprovekeysend.7.md>
+   lightning-reckless <lightning-reckless.7.md>
    lightning-recover <lightning-recover.7.md>
    lightning-recoverchannel <lightning-recoverchannel.7.md>
    lightning-renepay <lightning-renepay.7.md>
@@ -109,7 +117,6 @@ Core Lightning Documentation
    lightning-sendcustommsg <lightning-sendcustommsg.7.md>
    lightning-sendinvoice <lightning-sendinvoice.7.md>
    lightning-sendonion <lightning-sendonion.7.md>
-   lightning-sendonionmessage <lightning-sendonionmessage.7.md>
    lightning-sendpay <lightning-sendpay.7.md>
    lightning-sendpsbt <lightning-sendpsbt.7.md>
    lightning-setchannel <lightning-setchannel.7.md>

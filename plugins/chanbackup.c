@@ -518,7 +518,7 @@ static struct command_result *json_state_changed(struct command *cmd,
 
 	if (json_tok_streq(buf, statetok, "CLOSED") ||
 	    json_tok_streq(buf, statetok, "CHANNELD_AWAITING_LOCKIN") ||
-	    json_tok_streq(buf, statetok, "DUALOPENED_AWAITING_LOCKIN")) {
+	    json_tok_streq(buf, statetok, "DUALOPEND_AWAITING_LOCKIN")) {
 		struct out_req *req;
 		req = jsonrpc_request_start(cmd->plugin,
                                             cmd,
@@ -815,18 +815,10 @@ static const struct plugin_hook hooks[] = {
 static const struct plugin_command commands[] = {
 	{
 		"emergencyrecover",
-		"recovery",
-		"Populates the DB with stub channels",
-		"returns stub channel-id's on completion",
 		json_emergencyrecover,
 	},
 	{
 		"restorefrompeer",
-		"recovery",
-		"Checks if i have got a backup from a peer, and if so, will stub "
-		"those channels in the database and if is successful, will return "
-		"list of channels that have been successfully stubbed",
-		"return channel-id's on completion",
 		json_restorefrompeer,
 	},
 };
@@ -835,7 +827,7 @@ int main(int argc, char *argv[])
 {
         setup_locale();
 
-	plugin_main(argv, init, PLUGIN_STATIC, true, NULL,
+	plugin_main(argv, init, NULL, PLUGIN_STATIC, true, NULL,
 		    commands, ARRAY_SIZE(commands),
 		    notifs, ARRAY_SIZE(notifs), hooks, ARRAY_SIZE(hooks),
 		    NULL, 0,  /* Notification topics we publish */

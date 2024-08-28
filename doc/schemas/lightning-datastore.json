@@ -114,81 +114,6 @@
     "- 1206: One of the parents already exists with a value.",
     "- -32602: invalid parameters"
   ],
-  "example_json_request": [
-    {
-      "id": "example:datastore#1",
-      "method": "datastore",
-      "params": {
-        "key": [
-          "test_libplugin",
-          "name"
-        ],
-        "string": "foobar",
-        "hex": null,
-        "mode": "must-replace",
-        "generation": null
-      }
-    },
-    {
-      "id": "example:datastore#2",
-      "method": "datastore",
-      "params": {
-        "key": "somekey",
-        "string": null,
-        "hex": "61",
-        "mode": "create-or-append",
-        "generation": null
-      }
-    },
-    {
-      "id": "example:datastore#3",
-      "method": "datastore",
-      "params": {
-        "key": [
-          "a",
-          "d",
-          "e",
-          "f",
-          "g"
-        ],
-        "string": "somedatatostoreinthedatastore",
-        "hex": null,
-        "mode": null,
-        "generation": null
-      }
-    }
-  ],
-  "example_json_response": [
-    {
-      "key": [
-        "test_libplugin",
-        "name"
-      ],
-      "generation": 1,
-      "hex": "666f6f626172",
-      "string": "foobar"
-    },
-    {
-      "key": [
-        "somekey"
-      ],
-      "generation": 3,
-      "hex": "736f6d6564617461",
-      "string": "somedata"
-    },
-    {
-      "key": [
-        "a",
-        "d",
-        "e",
-        "f",
-        "g"
-      ],
-      "generation": 0,
-      "hex": "736f6d6564617461746f73746f7265696e7468656461746173746f7265",
-      "string": "somedatatostoreinthedatastore"
-    }
-  ],
   "author": [
     "Rusty Russell <<rusty@rustcorp.com.au>> is mainly responsible."
   ],
@@ -199,5 +124,88 @@
   ],
   "resources": [
     "Main web site: <https://github.com/ElementsProject/lightning>"
+  ],
+  "examples": [
+    {
+      "request": {
+        "id": "example:datastore#1",
+        "method": "datastore",
+        "params": {
+          "key": "somekey",
+          "hex": "61",
+          "mode": "create-or-append"
+        }
+      },
+      "response": {
+        "key": [
+          "somekey"
+        ],
+        "generation": 0,
+        "hex": "61",
+        "string": "a"
+      }
+    },
+    {
+      "request": {
+        "id": "example:datastore#2",
+        "method": "datastore",
+        "params": {
+          "key": [
+            "test",
+            "name"
+          ],
+          "string": "saving data to the store",
+          "mode": "must-create"
+        }
+      },
+      "response": {
+        "key": [
+          "test",
+          "name"
+        ],
+        "generation": 0,
+        "hex": "736176696e67206461746120746f207468652073746f7265",
+        "string": "saving data to the store"
+      }
+    },
+    {
+      "request": {
+        "id": "example:datastore#3",
+        "method": "datastore",
+        "params": {
+          "key": "otherkey",
+          "string": "foo",
+          "mode": "must-create"
+        }
+      },
+      "response": {
+        "key": [
+          "otherkey"
+        ],
+        "generation": 0,
+        "hex": "666f6f",
+        "string": "foo"
+      }
+    },
+    {
+      "request": {
+        "id": "example:datastore#4",
+        "method": "datastore",
+        "params": {
+          "key": "otherkey",
+          "string": "bar",
+          "mode": "must-append",
+          "generation": 0
+        }
+      },
+      "response": {
+        "key": [
+          "otherkey"
+        ],
+        "generation": 1,
+        "hex": "666f6f626172",
+        "string": "foobar"
+      }
+    }
   ]
 }

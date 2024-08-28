@@ -62,6 +62,8 @@ static struct chain_event *stmt2chain_event(const tal_t *ctx, struct db_stmt *st
 	else
 		e->desc = NULL;
 
+	e->splice_close = db_col_int(stmt, "e.spliced") == 1;
+
 	return e;
 }
 
@@ -122,6 +124,26 @@ static struct channel_event *stmt2channel_event(const tal_t *ctx, struct db_stmt
 	return e;
 }
 
+static struct channel_event **find_channel_events(const tal_t *ctx,
+						  struct db_stmt *stmt TAKES)
+{
+	struct channel_event **results;
+
+	db_query_prepared(stmt);
+	if (stmt->error)
+		db_fatal(stmt->db, "find_channel_events err: %s", stmt->error);
+	results = tal_arr(ctx, struct channel_event *, 0);
+	while (db_step(stmt)) {
+		struct channel_event *e = stmt2channel_event(results, stmt);
+		tal_arr_expand(&results, e);
+	}
+
+	if (taken(stmt))
+		tal_free(stmt);
+
+	return results;
+}
+
 static struct rebalance *stmt2rebalance(const tal_t *ctx, struct db_stmt *stmt)
 {
 	struct rebalance *r = tal(ctx, struct rebalance);
@@ -162,6 +184,7 @@ struct chain_event **list_chain_events_timebox(const tal_t *ctx,
 				     ", e.ignored"
 				     ", e.stealable"
 				     ", e.ev_desc"
+				     ", e.spliced"
 				     " FROM chain_events e"
 				     " LEFT OUTER JOIN accounts a"
 				     " ON e.account_id = a.id"
@@ -204,6 +227,7 @@ struct chain_event **account_get_chain_events(const tal_t *ctx,
 				     ", e.ignored"
 				     ", e.stealable"
 				     ", e.ev_desc"
+				     ", e.spliced"
 				     " FROM chain_events e"
 				     " LEFT OUTER JOIN accounts a"
 				     " ON e.account_id = a.id"
@@ -239,6 +263,7 @@ static struct chain_event **find_txos_for_tx(const tal_t *ctx,
 				     ", e.ignored"
 				     ", e.stealable"
 				     ", e.ev_desc"
+				     ", e.spliced"
 				     " FROM chain_events e"
 				     " LEFT OUTER JOIN accounts a"
 				     " ON e.account_id = a.id"
@@ -548,7 +573,9 @@ struct account *find_close_account(const tal_t *ctx,
 				     " ON e.account_id = a.id"
 				     " WHERE "
 				     "  e.tag = ?"
-				     "  AND e.spending_txid = ?"));
+				     "  AND e.spending_txid = ?"
+				     /* ignore splicing 'close' events */
+				     "  AND e.spliced = 0 "));
 
 	db_bind_text(stmt, mvt_tag_str(CHANNEL_CLOSE));
 	db_bind_txid(stmt, txid);
@@ -678,6 +705,7 @@ struct chain_event *find_chain_event_by_id(const tal_t *ctx,
 				     ", e.ignored"
 				     ", e.stealable"
 				     ", e.ev_desc"
+				     ", e.spliced"
 				     " FROM chain_events e"
 				     " LEFT OUTER JOIN accounts a"
 				     " ON e.account_id = a.id"
@@ -726,6 +754,7 @@ static struct chain_event *find_chain_event(const tal_t *ctx,
 					     ", e.ignored"
 					     ", e.stealable"
 					     ", e.ev_desc"
+					     ", e.spliced"
 					     " FROM chain_events e"
 					     " LEFT OUTER JOIN accounts a"
 					     " ON e.account_id = a.id"
@@ -755,6 +784,7 @@ static struct chain_event *find_chain_event(const tal_t *ctx,
 					     ", e.ignored"
 					     ", e.stealable"
 					     ", e.ev_desc"
+					     ", e.spliced"
 					     " FROM chain_events e"
 					     " LEFT OUTER JOIN accounts a"
 					     " ON e.account_id = a.id"
@@ -946,7 +976,6 @@ struct channel_event **account_get_channel_events(const tal_t *ctx,
 						  struct account *acct)
 {
 	struct db_stmt *stmt;
-	struct channel_event **results;
 
 	stmt = db_prepare_v2(db, SQL("SELECT"
 				     "  e.id"
@@ -969,16 +998,37 @@ struct channel_event **account_get_channel_events(const tal_t *ctx,
 				     " ORDER BY e.timestamp, e.id"));
 
 	db_bind_u64(stmt, acct->db_id);
-	db_query_prepared(stmt);
+	return find_channel_events(ctx, take(stmt));
+}
 
-	results = tal_arr(ctx, struct channel_event *, 0);
-	while (db_step(stmt)) {
-		struct channel_event *e = stmt2channel_event(results, stmt);
-		tal_arr_expand(&results, e);
-	}
-	tal_free(stmt);
+struct channel_event **get_channel_events_by_id(const tal_t *ctx,
+						struct db *db,
+						struct sha256 *id)
+{
+	struct db_stmt *stmt;
 
-	return results;
+	stmt = db_prepare_v2(db, SQL("SELECT"
+				     "  e.id"
+				     ", a.name"
+				     ", e.account_id"
+				     ", e.tag"
+				     ", e.credit"
+				     ", e.debit"
+				     ", e.fees"
+				     ", e.currency"
+				     ", e.payment_id"
+				     ", e.part_id"
+				     ", e.timestamp"
+				     ", e.ev_desc"
+				     ", e.rebalance_id"
+				     " FROM channel_events e"
+				     " LEFT OUTER JOIN accounts a"
+				     " ON a.id = e.account_id"
+				     " WHERE e.payment_id = ?"
+				     " ORDER BY e.timestamp, e.id"));
+
+	db_bind_sha256(stmt, id);
+	return find_channel_events(ctx, take(stmt));
 }
 
 static struct onchain_fee *stmt2onchain_fee(const tal_t *ctx,
@@ -998,11 +1048,30 @@ static struct onchain_fee *stmt2onchain_fee(const tal_t *ctx,
 	return of;
 }
 
+static struct onchain_fee **find_onchain_fees(const tal_t *ctx,
+					      struct db_stmt *stmt TAKES)
+{
+	struct onchain_fee **results;
+
+	db_query_prepared(stmt);
+	if (stmt->error)
+		db_fatal(stmt->db, "find_onchain_fees err: %s", stmt->error);
+	results = tal_arr(ctx, struct onchain_fee *, 0);
+	while (db_step(stmt)) {
+		struct onchain_fee *of = stmt2onchain_fee(results, stmt);
+		tal_arr_expand(&results, of);
+	}
+
+	if (taken(stmt))
+		tal_free(stmt);
+
+	return results;
+}
+
 struct onchain_fee **account_get_chain_fees(const tal_t *ctx, struct db *db,
 					    struct account *acct)
 {
 	struct db_stmt *stmt;
-	struct onchain_fee **results;
 
 	stmt = db_prepare_v2(db, SQL("SELECT"
 				     "  of.account_id"
@@ -1023,23 +1092,40 @@ struct onchain_fee **account_get_chain_fees(const tal_t *ctx, struct db *db,
 				     ", of.update_count"));
 
 	db_bind_u64(stmt, acct->db_id);
-	db_query_prepared(stmt);
+	return find_onchain_fees(ctx, take(stmt));
+}
 
-	results = tal_arr(ctx, struct onchain_fee *, 0);
-	while (db_step(stmt)) {
-		struct onchain_fee *of = stmt2onchain_fee(results, stmt);
-		tal_arr_expand(&results, of);
-	}
-	tal_free(stmt);
+struct onchain_fee **get_chain_fees_by_txid(const tal_t *ctx, struct db *db,
+					    struct bitcoin_txid *txid)
+{
+	struct db_stmt *stmt;
 
-	return results;
+	stmt = db_prepare_v2(db, SQL("SELECT"
+				     "  of.account_id"
+				     ", a.name"
+				     ", of.txid"
+				     ", of.credit"
+				     ", of.debit"
+				     ", of.currency"
+				     ", of.timestamp"
+				     ", of.update_count"
+				     " FROM onchain_fees of"
+				     " LEFT OUTER JOIN accounts a"
+				     " ON a.id = of.account_id"
+				     " WHERE of.txid = ?"
+				     " ORDER BY "
+				     "  of.timestamp"
+				     ", of.txid"
+				     ", of.update_count"));
+
+	db_bind_txid(stmt, txid);
+	return find_onchain_fees(ctx, take(stmt));
 }
 
 struct onchain_fee **list_chain_fees_timebox(const tal_t *ctx, struct db *db,
 					     u64 start_time, u64 end_time)
 {
 	struct db_stmt *stmt;
-	struct onchain_fee **results;
 
 	stmt = db_prepare_v2(db, SQL("SELECT"
 				     "  of.account_id"
@@ -1063,16 +1149,7 @@ struct onchain_fee **list_chain_fees_timebox(const tal_t *ctx, struct db *db,
 
 	db_bind_u64(stmt, start_time);
 	db_bind_u64(stmt, end_time);
-	db_query_prepared(stmt);
-
-	results = tal_arr(ctx, struct onchain_fee *, 0);
-	while (db_step(stmt)) {
-		struct onchain_fee *of = stmt2onchain_fee(results, stmt);
-		tal_arr_expand(&results, of);
-	}
-	tal_free(stmt);
-
-	return results;
+	return find_onchain_fees(ctx, take(stmt));
 }
 
 struct onchain_fee **list_chain_fees(const tal_t *ctx, struct db *db)
@@ -1157,7 +1234,6 @@ struct onchain_fee **account_onchain_fees(const tal_t *ctx,
 					  struct account *acct)
 {
 	struct db_stmt *stmt;
-	struct onchain_fee **results;
 
 	stmt = db_prepare_v2(db, SQL("SELECT"
 				     "  of.account_id"
@@ -1174,16 +1250,7 @@ struct onchain_fee **account_onchain_fees(const tal_t *ctx,
 				     " WHERE of.account_id = ?;"));
 
 	db_bind_u64(stmt, acct->db_id);
-	db_query_prepared(stmt);
-
-	results = tal_arr(ctx, struct onchain_fee *, 0);
-	while (db_step(stmt)) {
-		struct onchain_fee *of = stmt2onchain_fee(results, stmt);
-		tal_arr_expand(&results, of);
-	}
-	tal_free(stmt);
-
-	return results;
+	return find_onchain_fees(ctx, take(stmt));
 }
 
 struct account **list_accounts(const tal_t *ctx, struct db *db)
@@ -1263,6 +1330,9 @@ void maybe_update_account(struct db *db,
 				*acct->open_event_db_id = e->db_id;
 				break;
 			case CHANNEL_CLOSE:
+				/* Splices dont count as closes */
+				if (e->splice_close)
+					break;
 				updated = true;
 				acct->closed_event_db_id = tal(acct, u64);
 				*acct->closed_event_db_id = e->db_id;
@@ -1294,6 +1364,7 @@ void maybe_update_account(struct db *db,
 			case TO_MINER:
 			case LEASE_FEE:
 			case STEALABLE:
+			case SPLICE:
 				/* Ignored */
 				break;
 		}
@@ -1304,7 +1375,7 @@ void maybe_update_account(struct db *db,
 		acct->peer_id = tal_dup(acct, struct node_id, peer_id);
 	}
 
-	if (closed_count > 0) {
+	if (!e->splice_close && closed_count > 0) {
 		updated = true;
 		acct->closed_count = closed_count;
 	}
@@ -1399,8 +1470,8 @@ void log_channel_event(struct db *db,
 	tal_free(stmt);
 }
 
-static struct chain_event **find_chain_events_bytxid(const tal_t *ctx, struct db *db,
-						     struct bitcoin_txid *txid)
+struct chain_event **find_chain_events_bytxid(const tal_t *ctx, struct db *db,
+					      struct bitcoin_txid *txid)
 {
 	struct db_stmt *stmt;
 
@@ -1423,6 +1494,7 @@ static struct chain_event **find_chain_events_bytxid(const tal_t *ctx, struct db
 				     ", e.ignored"
 				     ", e.stealable"
 				     ", e.ev_desc"
+				     ", e.spliced"
 				     " FROM chain_events e"
 				     " LEFT OUTER JOIN accounts a"
 				     " ON a.id = e.account_id"
@@ -1564,7 +1636,7 @@ char *update_channel_onchain_fees(const tal_t *ctx,
 		if (streq("anchor", ev->tag))
 			continue;
 
-		/* Ignore stuff it's paid to
+		/* Ignore stuff which is paid to
 		 * the peer's account (external),
 		 * except for fulfilled htlcs (which originated
 		 * in our balance) */
@@ -1935,11 +2007,12 @@ finished:
 }
 
 void maybe_closeout_external_deposits(struct db *db,
-			              struct chain_event *ev)
+			              const struct bitcoin_txid *txid,
+				      u32 blockheight)
 {
 	struct db_stmt *stmt;
 
-	assert(ev->spending_txid);
+	assert(txid);
 	stmt = db_prepare_v2(db, SQL("SELECT "
 				     "  e.id"
 				     " FROM chain_events e"
@@ -1951,7 +2024,7 @@ void maybe_closeout_external_deposits(struct db *db,
 
 	/* Blockheight for unconfirmeds is zero */
 	db_bind_int(stmt, 0);
-	db_bind_txid(stmt, ev->spending_txid);
+	db_bind_txid(stmt, txid);
 	db_bind_text(stmt, EXTERNAL_ACCT);
 	db_query_prepared(stmt);
 
@@ -1964,7 +2037,7 @@ void maybe_closeout_external_deposits(struct db *db,
 						    " blockheight = ?"
 						    " WHERE id = ?"));
 
-		db_bind_int(update_stmt, ev->blockheight);
+		db_bind_int(update_stmt, blockheight);
 		db_bind_u64(update_stmt, id);
 		db_exec_prepared_v2(take(update_stmt));
 	}
@@ -1979,7 +2052,7 @@ bool log_chain_event(struct db *db,
 	struct db_stmt *stmt;
 
 	/* We're responsible for de-duping chain events! */
-	if (find_chain_event(e, db, acct,
+	if (find_chain_event(tmpctx, db, acct,
 			     &e->outpoint, e->spending_txid,
 			     e->tag))
 		return false;
@@ -2002,9 +2075,10 @@ bool log_chain_event(struct db *db,
 				     ", ignored"
 				     ", stealable"
 				     ", ev_desc"
+				     ", spliced"
 				     ")"
 				     " VALUES "
-				     "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);"));
+				     "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);"));
 
 	db_bind_u64(stmt, acct->db_id);
 	if (e->origin_acct)
@@ -2037,6 +2111,7 @@ bool log_chain_event(struct db *db,
 		db_bind_text(stmt, e->desc);
 	else
 		db_bind_null(stmt);
+	db_bind_int(stmt, e->splice_close ? 1 : 0);
 	db_exec_prepared_v2(stmt);
 	e->db_id = db_last_insert_id_v2(stmt);
 	e->acct_db_id = acct->db_id;

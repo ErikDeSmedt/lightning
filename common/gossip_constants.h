@@ -7,7 +7,7 @@
  * only onion tlv payloads. */
 #define ROUTING_MAX_HOPS 20
 
-/* BOLT-f3a9f7f4e9e7a5a2997f3129e13d94090091846a #7:
+/* BOLT #7:
  *
  * The `channel_flags` bitfield...individual bits:
  *...
@@ -36,6 +36,21 @@
  *   confirmations.
  */
 #define ANNOUNCE_MIN_DEPTH 6
+
+/* BOLT #7:
+ *
+ * `query_option_flags` is a bitfield represented as a minimally-encoded bigsize.
+ * Bits have the following meaning:
+ *
+ * | Bit Position  | Meaning                 |
+ * | ------------- | ----------------------- |
+ * | 0             | Sender wants timestamps |
+ * | 1             | Sender wants checksums  |
+ */
+enum query_option_flags {
+	QUERY_ADD_TIMESTAMPS = 0x1,
+	QUERY_ADD_CHECKSUMS = 0x2,
+};
 
 /* Gossip timing constants.  These can be overridden using --developer
  * with --dev-fast-gossip */

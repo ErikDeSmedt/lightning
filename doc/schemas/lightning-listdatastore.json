@@ -81,41 +81,6 @@
     "",
     "- -32602: invalid parameters."
   ],
-  "example_json_request": [
-    {
-      "id": "example:listdatastore#1",
-      "method": "listdatastore",
-      "params": {
-        "key": [
-          "commando"
-        ]
-      }
-    },
-    {
-      "id": "example:listdatastore#2",
-      "method": "listdatastore",
-      "params": {
-        "key": "otherkey"
-      }
-    }
-  ],
-  "example_json_response": [
-    {
-      "datastore": []
-    },
-    {
-      "datastore": [
-        {
-          "key": [
-            "otherkey"
-          ],
-          "generation": 0,
-          "hex": "6f7468657264617461",
-          "string": "otherdata"
-        }
-      ]
-    }
-  ],
   "author": [
     "Rusty Russell <<rusty@rustcorp.com.au>> is mainly responsible."
   ],
@@ -126,5 +91,52 @@
   ],
   "resources": [
     "Main web site: <https://github.com/ElementsProject/lightning>"
+  ],
+  "examples": [
+    {
+      "request": {
+        "id": "example:listdatastore#1",
+        "method": "listdatastore",
+        "params": {
+          "key": [
+            "test"
+          ]
+        }
+      },
+      "response": {
+        "datastore": [
+          {
+            "key": [
+              "test",
+              "name"
+            ],
+            "generation": 0,
+            "hex": "736176696e67206461746120746f207468652073746f7265",
+            "string": "saving data to the store"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "id": "example:listdatastore#2",
+        "method": "listdatastore",
+        "params": {
+          "key": "otherkey"
+        }
+      },
+      "response": {
+        "datastore": [
+          {
+            "key": [
+              "otherkey"
+            ],
+            "generation": 1,
+            "hex": "666f6f626172",
+            "string": "foobar"
+          }
+        ]
+      }
+    }
   ]
 }

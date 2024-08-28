@@ -100,7 +100,7 @@ def ws_connect():
 
 
 def create_app():
-    from utilities.shared import REST_CORS_ORIGINS
+    from utilities.shared import REST_CORS_ORIGINS, SWAGGER_ROOT
     global app
     app.config["SECRET_KEY"] = os.urandom(24).hex()
     authorizations = {
@@ -108,7 +108,7 @@ def create_app():
     }
     CORS(app, resources={r"/*": {"origins": REST_CORS_ORIGINS}})
     blueprint = Blueprint("api", __name__)
-    api = Api(blueprint, version="1.0", title="Core Lightning Rest", description="Core Lightning REST API Swagger", authorizations=authorizations, security=["rune"])
+    api = Api(blueprint, version="1.0", doc=SWAGGER_ROOT, title="Core Lightning Rest", description="Core Lightning REST API Swagger", authorizations=authorizations, security=["rune"])
     app.register_blueprint(blueprint)
     api.add_namespace(rpcns, path="/v1")
 
@@ -157,7 +157,8 @@ def set_application_options(plugin):
             "loglevel": "warning",
             "certfile": f"{CERTS_PATH}/client.pem",
             "keyfile": f"{CERTS_PATH}/client-key.pem",
-            "ssl_version": ssl.PROTOCOL_TLSv1_2
+            "cafile": f"{CERTS_PATH}/ca.pem",
+            "ssl": ssl.SSLContext(protocol=ssl.PROTOCOL_TLS_SERVER),
         }
     return options
 

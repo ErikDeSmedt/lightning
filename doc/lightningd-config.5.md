@@ -83,6 +83,14 @@ re-enable it.  Unless we've made a horrible mistake it's probably time
 to complain or fix to whatever is using the old API.  It can be
 specified multiple times for different features.
 
+### Whitespace Handling
+
+Because it's a common error, we automatically trim whitespace from the
+end of most configuration options. Exceptions are noted below:
+
+- `log-prefix`: Preserves whitespace at the end.
+- `alias`: Preserves whitespace at the end.
+
 ### Bitcoin control options:
 
 Bitcoin control options:
@@ -132,6 +140,12 @@ This is not valid within the per-network configuration file.
 
   The bitcoind(1) RPC port to connect to.
 
+* **bitcoin-rpcclienttimeout**=*SECONDS* [plugin `bcli`]
+
+  The bitcoind(1) RPC client timeout in seconds. Default is set to 60
+instead of 900 to match bitcoin-retry-timeout default. When set
+explicitly, the higher value of it and bitcoin-retry-timeout is used.
+
 * **bitcoin-retry-timeout**=*SECONDS* [plugin `bcli`]
 
   Number of seconds to keep trying a bitcoin-cli(1) command. If the
@@ -170,7 +184,7 @@ binary.
 
 * **log-level**=*LEVEL*\[:*SUBSYSTEM*\]\[:*PATH*\]
 
-  What log level to print out: options are io, debug, info, unusual,
+  What log level to print out: options are io, trace, debug, info, unusual,
 broken.  If *SUBSYSTEM* is supplied, this sets the logging level
 for any subsystem (or *nodeid*) containing that string. If *PATH* is supplied, it means this log-level filter is only applied to that `log-file`, which is useful for creating logs to capture a specific subsystem.  This option may be specified multiple times.
 Subsystems include:
@@ -301,6 +315,13 @@ see lightning-hsmtool(8).
   The port number for the GRPC plugin to listen for incoming
 connections; default is not to activate the plugin at all.
 
+* **grpc-msg-buffer-size**=*number* [plugin `cln-grpc`]
+
+  The size of the buffer used by the GRPC-plugin. This buffer stores
+  notifications between receiving them from lightningd and forwarding
+  them over grpc. If buffer overflow occurs some notifications will not
+  be delivered.
+
 ### Lightning node customization options
 
 * **recover**=*hsmsecret*
@@ -408,7 +429,7 @@ use the RPC call lightning-setchannel(7).
 we tell our peer that this is how long they'll have to wait if they
 perform a unilateral close.
 
-* **max-locktime-blocks**=*BLOCKS*
+* (deprecated in v23.05) **max-locktime-blocks**=*BLOCKS*
 
   The longest our funds can be delayed (ie. the longest
 **watchtime-blocks** our peer can ask for, and also the longest HTLC
@@ -664,6 +685,18 @@ authenticate to the Tor control port.
 
   Creates a whitelist of trusted content sources that can run on a webpage and helps mitigate the risk of attacks. Default CSP is `default-src 'self'; font-src 'self'; img-src 'self' data:; frame-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline';`.
 
+* **clnrest-swagger-root**=*URL*  [plugin `clnrest.py`]
+
+  Root url for Swagger UI. Default is `/`.
+
+* **wss-bind-addr**=*\[IPADDRESS\[:PORT\]\]|SOCKETPATH|HOSTNAME\[:PORT\]* [plugin `wss-proxy.py`]
+
+  Sets the WSS address.
+
+* **wss-certs**=*PATH*  [plugin `wss-proxy.py`]
+
+  Defines the path for WSS cert & key. Default path is same as RPC file path to utilize gRPC/clnrest's client certificate. If it is missing at the configured location, new identity (`client.pem` and `client-key.pem`) will be generated.
+
 ### Lightning Plugins
 
 lightningd(8) supports plugins, which offer additional configuration
@@ -722,21 +755,14 @@ Experimental options are subject to breakage between releases: they
 are made available for advanced users who want to test proposed
 features.
 
-* **experimental-onion-messages**
-
-  Specifying this enables sending, forwarding and receiving onion messages,
-which are in draft status in the [bolt][bolt] specifications (PR #759).
-This is automatically enabled by `experimental-offers`.
-
 * **experimental-offers**
 
-  Specifying this enables the `offers` and `fetchinvoice` plugins and
-corresponding functionality, which are in draft status ([bolt][bolt] #798) as [bolt12][bolt12], as well as `experimental-onion-messages`.
+  Specifying this enables `offers` functionality, which is in draft status ([bolt][bolt] #798) as [bolt12][bolt12].
 
 * **fetchinvoice-noconnect**
 
-  Specifying this prevents `fetchinvoice` and `sendinvoice` from
-trying to connect directly to the offering node as a last resort.
+  Specifying this prevents `fetchinvoice`, `sendinvoice` and replying
+to invoice request from trying to connect directly to the offering node as a last resort.
 
 * **experimental-shutdown-wrong-funding**
 

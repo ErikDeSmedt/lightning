@@ -1,7 +1,6 @@
 from fixtures import *  # noqa: F401,F403
 from fixtures import TEST_NETWORK
 from decimal import Decimal
-from ephemeral_port_reserve import reserve  # type: ignore
 from pyln.client import RpcError, Millisatoshi
 import pyln.proto.wire as wire
 from utils import (
@@ -22,6 +21,7 @@ import re
 import time
 import unittest
 import websocket
+import ssl
 
 
 def test_connect_basic(node_factory):
@@ -330,8 +330,8 @@ def test_balance(node_factory):
 @pytest.mark.openchannel('v2')
 def test_bad_opening(node_factory):
     # l1 asks for a too-long locktime
-    l1 = node_factory.get_node(options={'watchtime-blocks': 100})
-    l2 = node_factory.get_node(options={'max-locktime-blocks': 99})
+    l1 = node_factory.get_node(options={'watchtime-blocks': 2017})
+    l2 = node_factory.get_node()
     ret = l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
 
     assert ret['id'] == l2.info['id']
@@ -343,7 +343,7 @@ def test_bad_opening(node_factory):
     with pytest.raises(RpcError):
         l1.rpc.fundchannel(l2.info['id'], 10**6)
 
-    l2.daemon.wait_for_log('to_self_delay 100 larger than 99')
+    l2.daemon.wait_for_log('to_self_delay 2017 larger than 2016')
 
 
 @unittest.skipIf(TEST_NETWORK != 'regtest', "Fee computation and limits are network specific")
@@ -1079,7 +1079,7 @@ def test_funding_all(node_factory, bitcoind):
 
     # Keeps emergency reserve!
     outputs = l1.db_query('SELECT value FROM outputs WHERE status=0;')
-    if 'anchors_zero_fee_htlc_tx/even' in only_one(l1.rpc.listpeerchannels()['channels'])['channel_type']['names']:
+    if 'anchors/even' in only_one(l1.rpc.listpeerchannels()['channels'])['channel_type']['names']:
         assert outputs == [{'value': 25000}]
     else:
         assert outputs == []
@@ -1116,9 +1116,8 @@ def test_funding_all_too_much(node_factory):
 @pytest.mark.openchannel('v2')
 def test_funding_fail(node_factory, bitcoind):
     """Add some funds, fund a channel without enough funds"""
-    # Previous runs with same bitcoind can leave funds!
-    max_locktime = 5 * 6 * 24
-    l1 = node_factory.get_node(random_hsm=True, options={'max-locktime-blocks': max_locktime})
+    max_locktime = 2016
+    l1 = node_factory.get_node()
     l2 = node_factory.get_node(options={'watchtime-blocks': max_locktime + 1})
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
 
@@ -1496,7 +1495,7 @@ def test_funding_cancel_race(node_factory, bitcoind, executor):
         num = 100
 
     # Allow the other nodes to log unexpected WIRE_FUNDING_CREATED messages
-    nodes = node_factory.get_nodes(num, opts={'allow_broken_log': True})
+    nodes = node_factory.get_nodes(num, opts={})
 
     num_complete = 0
     num_cancel = 0
@@ -2423,7 +2422,7 @@ def test_update_fee(node_factory, bitcoind):
     # Make payments.
     l1.pay(l2, 200000000)
     # First payment causes fee update.
-    if 'anchors_zero_fee_htlc_tx/even' in only_one(l2.rpc.listpeerchannels()['channels'])['channel_type']['names']:
+    if 'anchors/even' in only_one(l2.rpc.listpeerchannels()['channels'])['channel_type']['names']:
         l2.daemon.wait_for_log('peer updated fee to 3755')
     else:
         l2.daemon.wait_for_log('peer updated fee to 11005')
@@ -2470,7 +2469,7 @@ def test_fee_limits(node_factory, bitcoind):
     l2.set_feerates((15000, 11000, 7500, 3750, 2000))
     l1.start()
 
-    if 'anchors_zero_fee_htlc_tx/even' in only_one(l1.rpc.listpeerchannels()['channels'])['channel_type']['names']:
+    if 'anchors/even' in only_one(l1.rpc.listpeerchannels()['channels'])['channel_type']['names']:
         fee = 1255
     else:
         fee = 258
@@ -2492,12 +2491,13 @@ def test_fee_limits(node_factory, bitcoind):
     wait_for(lambda: only_one(l2.rpc.listpeerchannels()['channels'])['feerate']['perkw'] == fee)
     assert only_one(l2.rpc.listpeerchannels()['channels'])['peer_connected'] is True
 
-    l1.rpc.close(l2.info['id'])
+    # This will fail to mutual close, since l2 won't ignore insane *close* fees!
+    assert l1.rpc.close(l2.info['id'], unilateraltimeout=5)['type'] == 'unilateral'
 
     # Make sure the resolution of this one doesn't interfere with the next!
     # Note: may succeed, may fail with insufficient fee, depending on how
     # bitcoind feels!
-    l2.daemon.wait_for_log('sendrawtx exit')
+    l1.daemon.wait_for_log('sendrawtx exit')
     bitcoind.generate_block(1)
     sync_blockheight(bitcoind, [l1, l2])
 
@@ -2531,7 +2531,6 @@ def test_fee_limits(node_factory, bitcoind):
     # 15sat/byte fee
     l1.daemon.wait_for_log('peer_out WIRE_REVOKE_AND_ACK')
 
-    # This should wait for close to complete
     l1.rpc.close(chan)
 
 
@@ -3005,7 +3004,8 @@ def test_dataloss_protection(node_factory, bitcoind):
                                allow_warning=True,
                                feerates=(7500, 7500, 7500, 7500))
     l2 = node_factory.get_node(may_reconnect=True, options={'log-level': 'io'},
-                               feerates=(7500, 7500, 7500, 7500), allow_broken_log=True)
+                               broken_log='Cannot broadcast our commitment tx: they have a future one|Unknown commitment .*, recovering our funds',
+                               feerates=(7500, 7500, 7500, 7500))
 
     lf = expected_peer_features()
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
@@ -3108,7 +3108,8 @@ def test_dataloss_protection_no_broadcast(node_factory, bitcoind):
                                allow_warning=True,
                                options={'dev-no-reconnect': None})
     l2 = node_factory.get_node(may_reconnect=True,
-                               feerates=(7500, 7500, 7500, 7500), allow_broken_log=True,
+                               feerates=(7500, 7500, 7500, 7500),
+                               broken_log='Cannot broadcast our commitment tx: they have a future one',
                                disconnect=['-WIRE_ERROR'],
                                options={'dev-no-reconnect': None})
 
@@ -3367,7 +3368,7 @@ def test_feerate_spam(node_factory, chainparams):
     l1.pay(l2, 10**9 - slack)
 
     # It will send this once (may have happened before line_graph's wait)
-    if 'anchors_zero_fee_htlc_tx/even' in only_one(l1.rpc.listpeerchannels()['channels'])['channel_type']['names']:
+    if 'anchors/even' in only_one(l1.rpc.listpeerchannels()['channels'])['channel_type']['names']:
         wait_for(lambda: l1.daemon.is_in_log('Setting REMOTE feerate to 3755'))
     else:
         wait_for(lambda: l1.daemon.is_in_log('Setting REMOTE feerate to 11005'))
@@ -3377,7 +3378,7 @@ def test_feerate_spam(node_factory, chainparams):
     l1.set_feerates((200000, 200000, 200000, 200000))
 
     # It will raise as far as it can (30551)
-    if 'anchors_zero_fee_htlc_tx/even' in only_one(l1.rpc.listpeerchannels()['channels'])['channel_type']['names']:
+    if 'anchors/even' in only_one(l1.rpc.listpeerchannels()['channels'])['channel_type']['names']:
         maxfeerate = 30551
     else:
         maxfeerate = 48000
@@ -3428,14 +3429,21 @@ def test_feerate_stress(node_factory, executor):
             assert not l1.daemon.is_in_log('Bad.*signature', start=prev_log)
             prev_log = len(l1.daemon.logs)
 
-    # Make sure it's reconnected, and wait for last payment.
-    wait_for(lambda: l1.rpc.getpeer(l2.info['id'])['connected'])
+    # Wait for last payment
     # We can get TEMPORARY_CHANNEL_FAILURE due to disconnect, too.
-    with pytest.raises(RpcError, match='WIRE_INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS|WIRE_TEMPORARY_CHANNEL_FAILURE'):
-        l1.rpc.waitsendpay("{:064x}".format(l1done - 1), timeout=TIMEOUT)
-    with pytest.raises(RpcError, match='WIRE_INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS|WIRE_TEMPORARY_CHANNEL_FAILURE'):
-        l2.rpc.waitsendpay("{:064x}".format(l2done - 1), timeout=TIMEOUT)
+    if l1done != 0:
+        with pytest.raises(RpcError, match='WIRE_INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS|WIRE_TEMPORARY_CHANNEL_FAILURE'):
+            l1.rpc.waitsendpay("{:064x}".format(l1done - 1), timeout=TIMEOUT)
+    if l2done != 0:
+        with pytest.raises(RpcError, match='WIRE_INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS|WIRE_TEMPORARY_CHANNEL_FAILURE'):
+            l2.rpc.waitsendpay("{:064x}".format(l2done - 1), timeout=TIMEOUT)
+
+    # Make sure it's reconnected, then try adjusting feerates
+    wait_for(lambda: l1.rpc.getpeer(l2.info['id'])['connected'] and l2.rpc.getpeer(l1.info['id'])['connected'])
+
     l1.rpc.call('dev-feerate', [l2.info['id'], rate - 5])
+    time.sleep(1)
+
     assert not l1.daemon.is_in_log('Bad.*signature')
     assert not l2.daemon.is_in_log('Bad.*signature')
 
@@ -3580,7 +3588,7 @@ def test_channel_features(node_factory, bitcoind, anchors):
     chan = only_one(l1.rpc.listpeerchannels()['channels'])
     assert 'option_static_remotekey' in chan['features']
     if anchors:
-        assert 'option_anchors_zero_fee_htlc_tx' in chan['features']
+        assert 'option_anchors' in chan['features']
 
     # l2 should agree.
     assert only_one(l2.rpc.listpeerchannels()['channels'])['features'] == chan['features']
@@ -3593,7 +3601,7 @@ def test_channel_features(node_factory, bitcoind, anchors):
     chan = only_one(l1.rpc.listpeerchannels()['channels'])
     assert 'option_static_remotekey' in chan['features']
     if anchors:
-        assert 'option_anchors_zero_fee_htlc_tx' in chan['features']
+        assert 'option_anchors' in chan['features']
 
     # l2 should agree.
     assert only_one(l2.rpc.listpeerchannels()['channels'])['features'] == chan['features']
@@ -3763,7 +3771,7 @@ def test_upgrade_statickey_onchaind(node_factory, executor, bitcoind):
                                               # This forces us to allow sending non-static-remotekey!
                                               'dev-any-channel-type': None,
                                               # We try to cheat!
-                                              'allow_broken_log': True},
+                                              'broken_log': r"onchaind-chan#[0-9]*: Could not find resolution for output .*: did \*we\* cheat\?"},
                                              {'may_reconnect': True,
                                               # This forces us to allow non-static-remotekey!
                                               'dev-any-channel-type': None,
@@ -4097,8 +4105,8 @@ def test_old_feerate(node_factory):
 
 
 def test_websocket(node_factory):
-    ws_port = reserve()
-    port = reserve()
+    ws_port = node_factory.get_unused_port()
+    port = node_factory.get_unused_port()
     l1, l2 = node_factory.line_graph(2,
                                      opts=[{'addr': ':' + str(port),
                                             'bind-addr': 'ws:127.0.0.1: ' + str(ws_port),
@@ -4519,3 +4527,131 @@ def test_last_stable_connection(node_factory):
 
     assert only_one(l1.rpc.listpeerchannels()['channels'])['last_stable_connection'] > recon_time + STABLE_TIME
     assert only_one(l2.rpc.listpeerchannels()['channels'])['last_stable_connection'] > recon_time + STABLE_TIME
+
+
+def test_wss_proxy(node_factory):
+    wss_port = node_factory.get_unused_port()
+    ws_port = node_factory.get_unused_port()
+    port = node_factory.get_unused_port()
+    wss_proxy_certs = node_factory.directory + '/wss-proxy-certs'
+    l1 = node_factory.get_node(options={'addr': ':' + str(port),
+                                        'bind-addr': 'ws:127.0.0.1:' + str(ws_port),
+                                        'wss-bind-addr': '127.0.0.1:' + str(wss_port),
+                                        'wss-certs': wss_proxy_certs,
+                                        'dev-allow-localhost': None})
+
+    # Some depend on ipv4 vs ipv6 behaviour...
+    for b in l1.rpc.getinfo()['binding']:
+        if b['type'] == 'ipv4':
+            assert b == {'type': 'ipv4', 'address': '0.0.0.0', 'port': port}
+        elif b['type'] == 'ipv6':
+            assert b == {'type': 'ipv6', 'address': '::', 'port': port}
+        else:
+            assert b == {'type': 'websocket',
+                         'address': '127.0.0.1',
+                         'subtype': 'ipv4',
+                         'port': ws_port}
+
+    # Adapter to turn web secure socket into a stream "connection"
+    class BindWebSecureSocket(object):
+        def __init__(self, hostname, port):
+            certfile = f'{wss_proxy_certs}/client.pem'
+            keyfile = f'{wss_proxy_certs}/client-key.pem'
+            self.ws = websocket.WebSocket(sslopt={"cert_reqs": ssl.CERT_NONE, "ssl_version": ssl.PROTOCOL_TLS_CLIENT, "certfile": certfile, "keyfile": keyfile})
+            self.ws.connect("wss://" + hostname + ":" + str(port))
+            self.recvbuf = bytes()
+
+        def send(self, data):
+            self.ws.send(data, websocket.ABNF.OPCODE_BINARY)
+
+        def recv(self, maxlen):
+            while len(self.recvbuf) < maxlen:
+                self.recvbuf += self.ws.recv()
+
+            ret = self.recvbuf[:maxlen]
+            self.recvbuf = self.recvbuf[maxlen:]
+            return ret
+
+    wss = BindWebSecureSocket('localhost', wss_port)
+
+    lconn = wire.LightningConnection(wss,
+                                     wire.PublicKey(bytes.fromhex(l1.info['id'])),
+                                     wire.PrivateKey(bytes([1] * 32)),
+                                     is_initiator=True)
+
+    # This might happen really early!
+    l1.daemon.logsearch_start = 0
+    l1.daemon.wait_for_log(r'Websocket Secure Server Started')
+
+    # Perform handshake.
+    lconn.shake()
+
+    # Expect to receive init msg.
+    msg = lconn.read_message()
+    assert int.from_bytes(msg[0:2], 'big') == 16
+
+    # Echo same message back.
+    lconn.send_message(msg)
+
+    # Now try sending a ping, ask for 50 bytes
+    msg = bytes((0, 18, 0, 50, 0, 0))
+    lconn.send_message(msg)
+
+    # Could actually reply with some gossip msg!
+    while True:
+        msg = lconn.read_message()
+        if int.from_bytes(msg[0:2], 'big') == 19:
+            break
+
+
+def test_connect_transient(node_factory):
+    l1, l2, l3, l4 = node_factory.get_nodes(4, opts={'may_reconnect': True})
+
+    # This is not transient, because they have a channel
+    node_factory.join_nodes([l1, l2])
+
+    # Make sure it reconnects once it has a channel.
+    l1.rpc.disconnect(l2.info['id'], force=True)
+    l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+
+    # This has no channel, and thus is a transient.
+    l1.rpc.connect(l3.info['id'], 'localhost', l3.port)
+
+    l1.rpc.dev_connectd_exhaust_fds()
+
+    # Connecting to l4 will discard connection to l3!
+    l1.rpc.connect(l4.info['id'], 'localhost', l4.port)
+    assert l1.rpc.listpeers(l3.info['id'])['peers'] == []
+    assert l1.daemon.is_in_log(fr"due to stress, randomly closing peer {l3.info['id']} \(score 0\)")
+
+
+def test_connect_transient_pending(node_factory, bitcoind, executor):
+    """Test that we kick out in-connection transient connections"""
+    l1, l2, l3, l4 = node_factory.get_nodes(4, opts=[{},
+                                                     {'dev-handshake-no-reply': None},
+                                                     {'dev-handshake-no-reply': None},
+                                                     {}])
+
+    # This will block...
+    fut1 = executor.submit(l1.rpc.connect, l2.info['id'], 'localhost', l2.port)
+    fut2 = executor.submit(l1.rpc.connect, l3.info['id'], 'localhost', l3.port)
+
+    assert not l1.daemon.is_in_log("due to stress, closing transient connect attempt")
+
+    # Wait until those connects in progress.
+    l2.daemon.wait_for_log("Connect IN")
+    l3.daemon.wait_for_log("Connect IN")
+
+    # Now force exhaustion.
+    l1.rpc.dev_connectd_exhaust_fds()
+
+    # This one will kick out one of the others.
+    l1.rpc.connect(l4.info['id'], 'localhost', l4.port)
+    line = l1.daemon.wait_for_log("due to stress, closing transient connect attempt")
+    peerid = re.search(r'due to stress, closing transient connect attempt to (.*)', line).groups()[0]
+
+    with pytest.raises(RpcError, match="Terminated due to too many connections"):
+        if peerid == l2.info['id']:
+            fut1.result(TIMEOUT)
+        else:
+            fut2.result(TIMEOUT)

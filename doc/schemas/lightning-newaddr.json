@@ -49,30 +49,6 @@
   "errors": [
     "If an unrecognized address type is requested an error message will be returned."
   ],
-  "example_json_request": [
-    {
-      "id": "example:newaddr#1",
-      "method": "newaddr",
-      "params": {
-        "addresstype": null
-      }
-    },
-    {
-      "id": "example:newaddr#2",
-      "method": "newaddr",
-      "params": {
-        "addresstype": "bech32"
-      }
-    }
-  ],
-  "example_json_response": [
-    {
-      "bech32": "bcrt1qq8adjz4u6enf0cjey9j8yt0y490tact93fzgsf"
-    },
-    {
-      "bech32": "bcrt1qq8adjz4u6enf0cjey9j8yt0y490tact93fzgsf"
-    }
-  ],
   "author": [
     "Felix <<fixone@gmail.com>> is mainly responsible."
   ],
@@ -84,5 +60,29 @@
   ],
   "resources": [
     "Main web site: <https://github.com/ElementsProject/lightning>"
+  ],
+  "examples": [
+    {
+      "request": {
+        "id": "example:newaddr#1",
+        "method": "newaddr",
+        "params": {}
+      },
+      "response": {
+        "bech32": "bcrt1qcqqvkswps3e6ck3jmqf86f9tcaeke5z04d3tv4"
+      }
+    },
+    {
+      "request": {
+        "id": "example:newaddr#2",
+        "method": "newaddr",
+        "params": {
+          "addresstype": "p2tr"
+        }
+      },
+      "response": {
+        "p2tr": "bcrt1phtprcvhz842sxe8qw0yryvc0g6n6dw2puweklcpnfye273kjpfhs0d6d2e"
+      }
+    }
   ]
 }

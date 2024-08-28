@@ -16,6 +16,7 @@ COMMON_SRC_NOGEN :=				\
 	common/bolt11.c				\
 	common/bolt11_json.c			\
 	common/bolt12.c				\
+	common/bolt12_id.c			\
 	common/bolt12_merkle.c			\
 	common/channel_config.c			\
 	common/channel_id.c			\
@@ -52,9 +53,10 @@ COMMON_SRC_NOGEN :=				\
 	common/interactivetx.c			\
 	common/initial_channel.c		\
 	common/initial_commit_tx.c		\
-	common/invoice_path_id.c		\
 	common/iso4217.c			\
+	common/json_blinded_path.c		\
 	common/json_channel_type.c		\
+	common/json_command.c			\
 	common/json_filter.c			\
 	common/json_param.c			\
 	common/json_parse.c			\
@@ -69,6 +71,7 @@ COMMON_SRC_NOGEN :=				\
 	common/onion_decode.c			\
 	common/onion_encode.c			\
 	common/onionreply.c			\
+	common/onion_message.c			\
 	common/onion_message_parse.c		\
 	common/peer_billboard.c			\
 	common/peer_failed.c			\
@@ -77,6 +80,7 @@ COMMON_SRC_NOGEN :=				\
 	common/per_peer_state.c			\
 	common/permute_tx.c			\
 	common/ping.c				\
+	common/plugin.c				\
 	common/psbt_internal.c			\
 	common/psbt_keypath.c			\
 	common/psbt_open.c			\
@@ -84,6 +88,7 @@ COMMON_SRC_NOGEN :=				\
 	common/random_select.c			\
 	common/read_peer_msg.c			\
 	common/route.c				\
+	common/sciddir_or_pubkey.c		\
 	common/setup.c				\
 	common/shutdown_scriptpubkey.c		\
 	common/sphinx.c				\
@@ -112,7 +117,6 @@ COMMON_HEADERS_NOGEN := $(COMMON_SRC_NOGEN:.c=.h)	\
 	common/gossip_constants.h			\
 	common/hsm_version.h				\
 	common/htlc.h					\
-	common/json_command.h				\
 	common/jsonrpc_errors.h				\
 	common/overflows.h
 

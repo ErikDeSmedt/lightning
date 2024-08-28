@@ -3,7 +3,6 @@ from decimal import Decimal
 from fixtures import *  # noqa: F401,F403
 from fixtures import TEST_NETWORK
 from pyln.client import RpcError, Millisatoshi
-from shutil import copyfile
 from utils import (
     only_one, wait_for, sync_blockheight,
     VALGRIND, check_coin_moves, TailableProc, scriptpubkey_addr,
@@ -1625,17 +1624,11 @@ def test_p2tr_deposit_withdrawal(node_factory, bitcoind):
 def test_upgradewallet(node_factory, bitcoind):
     # Make sure bitcoind doesn't think it's going backwards
     bitcoind.generate_block(104)
-    l1 = node_factory.get_node(start=False)
+    l1 = node_factory.get_node()
 
     # Write the data/p2sh_wallet_hsm_secret to the hsm_path,
     # so node can spend funds at p2sh_wrapped_addr
     p2sh_wrapped_addr = '2N2V4ee2vMkiXe5FSkRqFjQhiS9hKqNytv3'
-    hsm_path_dest = os.path.join(l1.daemon.lightning_dir, TEST_NETWORK, "hsm_secret")
-    hsm_path_origin = os.path.join('tests/data', 'p2sh_wallet_hsm_secret')
-    copyfile(hsm_path_origin, hsm_path_dest)
-
-    l1.start()
-    assert l1.daemon.is_in_log('Server started with public key 0266e4598d1d3c415f572a8488830b60f7e744ed9235eb0b1ba93283b315c03518')
 
     # No funds in wallet, upgrading does nothing
     upgrade = l1.rpc.upgradewallet()
@@ -1679,7 +1672,9 @@ def test_upgradewallet(node_factory, bitcoind):
 
 def test_hsmtool_makerune(node_factory):
     """Test we can make a valid rune before the node really exists"""
-    l1 = node_factory.get_node(start=False)
+    l1 = node_factory.get_node(start=False, options={
+        'allow-deprecated-apis': True,
+    })
 
     # get_node() creates a secret, but in usual case we generate one.
     hsm_path = os.path.join(l1.daemon.lightning_dir, TEST_NETWORK, "hsm_secret")

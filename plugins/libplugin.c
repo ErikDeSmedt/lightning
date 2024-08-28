@@ -9,9 +9,11 @@
 #include <common/daemon.h>
 #include <common/deprecation.h>
 #include <common/json_filter.h>
+#include <common/json_param.h>
 #include <common/json_parse_simple.h>
 #include <common/json_stream.h>
 #include <common/memleak.h>
+#include <common/plugin.h>
 #include <common/route.h>
 #include <errno.h>
 #include <plugins/libplugin.h>
@@ -38,6 +40,28 @@ struct jstream {
 	struct json_stream *js;
 };
 
+/* Create an array of these, one for each --option you support. */
+struct plugin_option {
+	const char *name;
+	const char *type;
+	const char *description;
+	/* Handle an option.  If dynamic, check_only may be set to check
+	 * for validity (but must not make any changes!) */
+	char *(*handle)(struct plugin *plugin, const char *str, bool check_only,
+			void *arg);
+	/* Print an option (used to show the default value, if returns true) */
+	bool (*jsonfmt)(struct plugin *plugin, struct json_stream *js, const char *fieldname,
+			void *arg);
+	/* Arg for handle and jsonfmt */
+	void *arg;
+	/* If true, this option requires --developer to be enabled */
+	bool dev_only;
+	/* If it's deprecated from a particular release (or NULL) */
+	const char *depr_start, *depr_end;
+	/* If true, allow setting after plugin has initialized */
+	bool dynamic;
+};
+
 struct plugin {
 	/* lightningd interaction */
 	struct io_conn *stdin_conn;
@@ -54,6 +78,9 @@ struct plugin {
 
 	/* to append to all our command ids */
 	const char *id;
+
+	/* Data for the plugin user */
+	void *data;
 
 	/* options to i-promise-to-fix-broken-api-user */
 	const char **beglist;
@@ -301,6 +328,7 @@ struct out_req *
 jsonrpc_request_start_(struct plugin *plugin, struct command *cmd,
 		       const char *method,
 		       const char *id_prefix,
+		       const char *filter,
 		       struct command_result *(*cb)(struct command *command,
 						    const char *buf,
 						    const jsmntok_t *result,
@@ -331,6 +359,12 @@ jsonrpc_request_start_(struct plugin *plugin, struct command *cmd,
 	json_add_string(out->js, "jsonrpc", "2.0");
 	json_add_id(out->js, out->id);
 	json_add_string(out->js, "method", method);
+	if (filter) {
+		/* This is raw JSON, so paste, don't escape! */
+		size_t len = strlen(filter);
+		char *p = json_out_member_direct(out->js->jout, "filter", len);
+		memcpy(p, filter, len);
+	}
 	if (out->errcb)
 		json_object_start(out->js, "params");
 
@@ -595,10 +629,31 @@ bool command_dev_apis(const struct command *cmd)
 	return cmd->plugin->developer;
 }
 
-/* FIXME: would be good to support this! */
 bool command_check_only(const struct command *cmd)
 {
-	return false;
+	return cmd->check;
+}
+
+void command_log(struct command *cmd, enum log_level level,
+		 const char *fmt, ...)
+{
+	const char *msg;
+	va_list ap;
+
+	va_start(ap, fmt);
+	msg = tal_vfmt(cmd, fmt, ap);
+	plugin_log(cmd->plugin, level, "JSON COMMAND %s: %s",
+		   cmd->methodname, msg);
+	va_end(ap);
+}
+
+struct command_result *command_check_done(struct command *cmd)
+{
+	assert(command_check_only(cmd));
+
+	return command_success(cmd,
+			       json_out_obj(cmd, "command_to_check",
+					    cmd->methodname));
 }
 
 void command_set_usage(struct command *cmd, const char *usage TAKES)
@@ -1022,6 +1077,8 @@ handle_getmanifest(struct command *getmanifest_cmd,
 		json_add_string(params, "description", p->opts[i].description);
 		json_add_deprecated(params, "deprecated", p->opts[i].depr_start, p->opts[i].depr_end);
 		json_add_bool(params, "dynamic", p->opts[i].dynamic);
+		if (p->opts[i].jsonfmt)
+			p->opts[i].jsonfmt(p, params, "default", p->opts[i].arg);
 		json_object_end(params);
 	}
 	json_array_end(params);
@@ -1034,10 +1091,6 @@ handle_getmanifest(struct command *getmanifest_cmd,
 		json_add_string(params, "name", p->commands[i].name);
 		json_add_string(params, "usage",
 				strmap_get(&p->usagemap, p->commands[i].name));
-		json_add_string(params, "description", p->commands[i].description);
-		if (p->commands[i].long_description)
-			json_add_string(params, "long_description",
-					p->commands[i].long_description);
 		json_add_deprecated(params, "deprecated",
 				    p->commands[i].depr_start, p->commands[i].depr_end);
 		json_object_end(params);
@@ -1093,6 +1146,7 @@ handle_getmanifest(struct command *getmanifest_cmd,
 
 	json_add_bool(params, "dynamic", p->restartability == PLUGIN_RESTARTABLE);
 	json_add_bool(params, "nonnumericids", true);
+	json_add_bool(params, "cancheck", true);
 
 	json_array_start(params, "notifications");
 	for (size_t i = 0; p->notif_topics && i < p->num_notif_topics; i++) {
@@ -1332,7 +1386,7 @@ static struct command_result *handle_init(struct command *cmd,
 		if (!popt)
 			plugin_err(p, "lightningd specified unknown option '%s'?", name);
 
-		problem = popt->handle(p, json_strdup(tmpctx, buf, t+1), popt->arg);
+		problem = popt->handle(p, json_strdup(tmpctx, buf, t+1), false, popt->arg);
 		if (problem)
 			plugin_err(p, "option '%s': %s", popt->name, problem);
 	}
@@ -1356,83 +1410,123 @@ static struct command_result *handle_init(struct command *cmd,
 	return command_success(cmd, json_out_obj(cmd, NULL, NULL));
 }
 
-char *u64_option(struct plugin *plugin, const char *arg, u64 *i)
+char *u64_option(struct plugin *plugin, const char *arg, bool check_only, u64 *i)
 {
 	char *endp;
+	u64 v;
 
 	/* This is how the manpage says to do it.  Yech. */
 	errno = 0;
-	*i = strtol(arg, &endp, 0);
+	v = strtoul(arg, &endp, 0);
 	if (*endp || !arg[0])
 		return tal_fmt(tmpctx, "'%s' is not a number", arg);
 	if (errno)
 		return tal_fmt(tmpctx, "'%s' is out of range", arg);
+	if (!check_only)
+		*i = v;
 	return NULL;
 }
 
-char *u32_option(struct plugin *plugin, const char *arg, u32 *i)
+char *u32_option(struct plugin *plugin, const char *arg, bool check_only, u32 *i)
 {
-	char *endp;
 	u64 n;
+	char *problem = u64_option(plugin, arg, false, &n);
 
-	errno = 0;
-	n = strtoul(arg, &endp, 0);
-	if (*endp || !arg[0])
-		return tal_fmt(tmpctx, "'%s' is not a number", arg);
-	if (errno)
-		return tal_fmt(tmpctx, "'%s' is out of range", arg);
+	if (problem)
+		return problem;
 
-	*i = n;
-	if (*i != n)
+	if ((u32)n != n)
 		return tal_fmt(tmpctx, "'%s' is too large (overflow)", arg);
 
+	if (!check_only)
+		*i = n;
 	return NULL;
 }
 
-char *u16_option(struct plugin *plugin, const char *arg, u16 *i)
+char *u16_option(struct plugin *plugin, const char *arg, bool check_only, u16 *i)
 {
-	char *endp;
 	u64 n;
+	char *problem = u64_option(plugin, arg, false, &n);
 
-	errno = 0;
-	n = strtoul(arg, &endp, 0);
-	if (*endp || !arg[0])
-		return tal_fmt(tmpctx, "'%s' is not a number", arg);
-	if (errno)
-		return tal_fmt(tmpctx, "'%s' is out of range", arg);
+	if (problem)
+		return problem;
 
-	*i = n;
-	if (*i != n)
+	if ((u16)n != n)
 		return tal_fmt(tmpctx, "'%s' is too large (overflow)", arg);
 
+	if (!check_only)
+		*i = n;
 	return NULL;
 }
 
-char *bool_option(struct plugin *plugin, const char *arg, bool *i)
+char *bool_option(struct plugin *plugin, const char *arg, bool check_only, bool *i)
 {
 	if (!streq(arg, "true") && !streq(arg, "false"))
 		return tal_fmt(tmpctx, "'%s' is not a bool, must be \"true\" or \"false\"", arg);
 
-	*i = streq(arg, "true");
+	if (!check_only)
+		*i = streq(arg, "true");
 	return NULL;
 }
 
-char *flag_option(struct plugin *plugin, const char *arg, bool *i)
+char *flag_option(struct plugin *plugin, const char *arg, bool check_only, bool *i)
 {
 	/* We only get called if the flag was provided, so *i should be false
 	 * by default */
-	assert(*i == false);
+	assert(check_only || *i == false);
 	if (!streq(arg, "true"))
 		return tal_fmt(tmpctx, "Invalid argument '%s' passed to a flag", arg);
 
-	*i = true;
+	if (!check_only)
+		*i = true;
 	return NULL;
 }
 
-char *charp_option(struct plugin *plugin, const char *arg, char **p)
+char *charp_option(struct plugin *plugin, const char *arg, bool check_only, char **p)
 {
-	*p = tal_strdup(NULL, arg);
+	if (!check_only)
+		*p = tal_strdup(NULL, arg);
 	return NULL;
+}
+
+bool u64_jsonfmt(struct plugin *plugin, struct json_stream *js, const char *fieldname, u64 *i)
+{
+	json_add_u64(js, fieldname, *i);
+	return true;
+}
+
+bool u32_jsonfmt(struct plugin *plugin, struct json_stream *js, const char *fieldname, u32 *i)
+{
+	json_add_u32(js, fieldname, *i);
+	return true;
+}
+
+bool u16_jsonfmt(struct plugin *plugin, struct json_stream *js, const char *fieldname, u16 *i)
+{
+	json_add_u32(js, fieldname, *i);
+	return true;
+}
+
+bool bool_jsonfmt(struct plugin *plugin, struct json_stream *js, const char *fieldname, bool *i)
+{
+	json_add_bool(js, fieldname, *i);
+	return true;
+}
+
+bool charp_jsonfmt(struct plugin *plugin, struct json_stream *js, const char *fieldname, char **p)
+{
+	if (!*p)
+		return false;
+	json_add_string(js, fieldname, *p);
+	return true;
+}
+
+bool flag_jsonfmt(struct plugin *plugin, struct json_stream *js, const char *fieldname, bool *i)
+{
+	/* Don't print if the default (false) */
+	if (!*i)
+		return false;
+	return bool_jsonfmt(plugin, js, fieldname, i);
 }
 
 static void setup_command_usage(struct plugin *p)
@@ -1676,6 +1770,14 @@ bool command_deprecated_ok_flag(const struct command *cmd)
 	return cmd->plugin->deprecated_ok;
 }
 
+static struct command_result *param_tok(struct command *cmd, const char *name,
+					const char *buffer, const jsmntok_t * tok,
+					const jsmntok_t **out)
+{
+	*out = tok;
+	return NULL;
+}
+
 static void ld_command_handle(struct plugin *plugin,
 			      const jsmntok_t *toks)
 {
@@ -1740,7 +1842,8 @@ static void ld_command_handle(struct plugin *plugin,
 		for (size_t i = 0; i < plugin->num_notif_subs; i++) {
 			if (streq(cmd->methodname,
 				  plugin->notif_subs[i].name)
-			    || streq(plugin->notif_subs[i].name, "*")) {
+			    || is_asterix_notification(cmd->methodname,
+						       plugin->notif_subs[i].name)) {
 				plugin->notif_subs[i].handle(cmd,
 							     plugin->buffer,
 							     paramstok);
@@ -1773,6 +1876,34 @@ static void ld_command_handle(struct plugin *plugin,
 			return;
 	}
 
+	/* Is this actually a check command? */
+	cmd->check = streq(cmd->methodname, "check");
+	if (cmd->check) {
+		const jsmntok_t *method;
+		jsmntok_t *mod_params;
+
+		/* We're going to mangle it, so make a copy */
+		mod_params = json_tok_copy(cmd, paramstok);
+		if (!param_check(cmd, plugin->buffer, mod_params,
+				 p_req("command_to_check", param_tok, &method),
+				 p_opt_any(),
+				 NULL)) {
+			plugin_err(plugin,
+				   "lightningd check without command_to_check: %.*s",
+				   json_tok_full_len(toks),
+				   json_tok_full(plugin->buffer, toks));
+		}
+		tal_free(cmd->methodname);
+		cmd->methodname = json_strdup(cmd, plugin->buffer, method);
+
+		/* Point method to the name, not the value */
+		if (mod_params->type == JSMN_OBJECT)
+			method--;
+
+		json_tok_remove(&mod_params, mod_params, method, 1);
+		paramstok = mod_params;
+	}
+
 	for (size_t i = 0; i < plugin->num_commands; i++) {
 		if (streq(cmd->methodname, plugin->commands[i].name)) {
 			plugin->commands[i].handle(cmd,
@@ -1791,6 +1922,8 @@ static void ld_command_handle(struct plugin *plugin,
 		const char *config, *val, *problem;
 		struct plugin_option *popt;
 		struct command_result *ret;
+		bool check_only;
+
 		config = json_strdup(tmpctx, plugin->buffer,
 				     json_get_member(plugin->buffer, paramstok, "config"));
 		popt = find_opt(plugin, config);
@@ -1804,18 +1937,26 @@ static void ld_command_handle(struct plugin *plugin,
 				   "lightningd setconfig non-dynamic option '%s'?",
 				   config);
 		}
+
+		check_only = command_check_only(cmd);
+		plugin_log(plugin, LOG_DBG, "setconfig %s check_only=%i", config, check_only);
+
 		valtok = json_get_member(plugin->buffer, paramstok, "val");
 		if (valtok)
 			val = json_strdup(tmpctx, plugin->buffer, valtok);
 		else
 			val = "true";
 
-		problem = popt->handle(plugin, val, popt->arg);
+		problem = popt->handle(plugin, val, check_only, popt->arg);
 		if (problem)
 			ret = command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 					   "%s", problem);
-		else
-			ret = command_finished(cmd, jsonrpc_stream_success(cmd));
+		else {
+			if (check_only)
+				ret = command_check_done(cmd);
+			else
+				ret = command_finished(cmd, jsonrpc_stream_success(cmd));
+		}
 		assert(ret == &complete);
 		return;
 	}
@@ -2024,7 +2165,8 @@ static struct plugin *new_plugin(const tal_t *ctx,
 		o.name = optname;
 		o.type = va_arg(ap, const char *);
 		o.description = va_arg(ap, const char *);
-		o.handle = va_arg(ap, char *(*)(struct plugin *, const char *str, void *arg));
+		o.handle = va_arg(ap, char *(*)(struct plugin *, const char *str, bool check_only, void *arg));
+		o.jsonfmt = va_arg(ap, bool (*)(struct plugin *, struct json_stream *, const char *, void *arg));
 		o.arg = va_arg(ap, void *);
 		o.dev_only = va_arg(ap, int); /* bool gets promoted! */
 		o.depr_start = va_arg(ap, const char *);
@@ -2040,6 +2182,7 @@ static struct plugin *new_plugin(const tal_t *ctx,
 void plugin_main(char *argv[],
 		 const char *(*init)(struct plugin *p,
 				     const char *buf, const jsmntok_t *),
+		 void *data,
 		 const enum plugin_restartability restartability,
 		 bool init_rpc,
 		 struct feature_set *features STEALS,
@@ -2069,6 +2212,7 @@ void plugin_main(char *argv[],
 			    init, restartability, init_rpc, features, commands,
 			    num_commands, notif_subs, num_notif_subs, hook_subs,
 			    num_hook_subs, notif_topics, num_notif_topics, ap);
+	plugin_set_data(plugin, data);
 	va_end(ap);
 	setup_command_usage(plugin);
 
@@ -2113,11 +2257,6 @@ static struct listpeers_channel *json_to_listpeers_channel(const tal_t *ctx,
 
 	chan = tal(ctx, struct listpeers_channel);
 
-	json_to_node_id(buffer, idtok, &chan->id);
-	json_to_bool(buffer, conntok, &chan->connected);
-	json_to_bool(buffer, privtok, &chan->private);
-	chan->state = json_strdup(chan, buffer, statetok);
-	json_to_txid(buffer, ftxidtok, &chan->funding_txid);
 	if (scidtok != NULL) {
 		assert(dirtok != NULL);
 		chan->scid = tal(chan, struct short_channel_id);
@@ -2153,6 +2292,12 @@ static struct listpeers_channel *json_to_listpeers_channel(const tal_t *ctx,
 	 * It's not a real channel (yet), so ignore it! */
 	if (!chan->scid && !chan->alias[LOCAL])
 		return tal_free(chan);
+
+	json_to_node_id(buffer, idtok, &chan->id);
+	json_to_bool(buffer, conntok, &chan->connected);
+	json_to_bool(buffer, privtok, &chan->private);
+	chan->state = json_strdup(chan, buffer, statetok);
+	json_to_txid(buffer, ftxidtok, &chan->funding_txid);
 
 	json_to_int(buffer, dirtok, &chan->direction);
 	json_to_msat(buffer, tmsattok, &chan->total_msat);
@@ -2273,4 +2418,16 @@ notification_handled(struct command *cmd)
 bool plugin_developer_mode(const struct plugin *plugin)
 {
 	return plugin->developer;
+}
+
+void plugin_set_data(struct plugin *plugin, void *data TAKES)
+{
+	if (taken(data))
+		tal_steal(plugin, data);
+	plugin->data = data;
+}
+
+void *plugin_get_data_(struct plugin *plugin)
+{
+	return plugin->data;
 }

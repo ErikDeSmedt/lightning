@@ -39,8 +39,9 @@ void gossmod_add_localchan(struct gossmap_localmods *mods UNNEEDED,
 			   const struct node_id *self UNNEEDED,
 			   const struct node_id *peer UNNEEDED,
 			   const struct short_channel_id_dir *scidd UNNEEDED,
-			   struct amount_msat min UNNEEDED,
-			   struct amount_msat max UNNEEDED,
+			   struct amount_msat htlcmin UNNEEDED,
+			   struct amount_msat htlcmax UNNEEDED,
+			   struct amount_msat spendable UNNEEDED,
 			   struct amount_msat fee_base UNNEEDED,
 			   u32 fee_proportional UNNEEDED,
 			   u32 cltv_delta UNNEEDED,
@@ -59,8 +60,9 @@ struct gossmap_localmods *gossmods_from_listpeerchannels_(const tal_t *ctx UNNEE
 								     const struct node_id *self_ UNNEEDED,
 								     const struct node_id *peer UNNEEDED,
 								     const struct short_channel_id_dir *scidd UNNEEDED,
-								     struct amount_msat min UNNEEDED,
-								     struct amount_msat max UNNEEDED,
+								     struct amount_msat htlcmin UNNEEDED,
+								     struct amount_msat htlcmax UNNEEDED,
+								     struct amount_msat spendable UNNEEDED,
 								     struct amount_msat fee_base UNNEEDED,
 								     u32 fee_proportional UNNEEDED,
 								     u32 cltv_delta UNNEEDED,
@@ -76,6 +78,10 @@ void json_add_amount_msat(struct json_stream *result UNNEEDED,
 			  struct amount_msat msat)
 
 { fprintf(stderr, "json_add_amount_msat called!\n"); abort(); }
+/* Generated stub for json_add_bool */
+void json_add_bool(struct json_stream *result UNNEEDED, const char *fieldname UNNEEDED,
+		   bool value UNNEEDED)
+{ fprintf(stderr, "json_add_bool called!\n"); abort(); }
 /* Generated stub for json_add_hex_talarr */
 void json_add_hex_talarr(struct json_stream *result UNNEEDED,
 			 const char *fieldname UNNEEDED,
@@ -111,6 +117,11 @@ void json_add_short_channel_id(struct json_stream *response UNNEEDED,
 			       const char *fieldname UNNEEDED,
 			       struct short_channel_id id UNNEEDED)
 { fprintf(stderr, "json_add_short_channel_id called!\n"); abort(); }
+/* Generated stub for json_add_short_channel_id_dir */
+void json_add_short_channel_id_dir(struct json_stream *response UNNEEDED,
+				   const char *fieldname UNNEEDED,
+				   struct short_channel_id_dir idd UNNEEDED)
+{ fprintf(stderr, "json_add_short_channel_id_dir called!\n"); abort(); }
 /* Generated stub for json_add_string */
 void json_add_string(struct json_stream *js UNNEEDED,
 		     const char *fieldname UNNEEDED,
@@ -150,9 +161,19 @@ void json_object_end(struct json_stream *js UNNEEDED)
 /* Generated stub for json_object_start */
 void json_object_start(struct json_stream *ks UNNEEDED, const char *fieldname UNNEEDED)
 { fprintf(stderr, "json_object_start called!\n"); abort(); }
+/* Generated stub for json_scan */
+const char *json_scan(const tal_t *ctx UNNEEDED,
+		      const char *buffer UNNEEDED,
+		      const jsmntok_t *tok UNNEEDED,
+		      const char *guide UNNEEDED,
+		      ...)
+{ fprintf(stderr, "json_scan called!\n"); abort(); }
 /* Generated stub for json_strdup */
 char *json_strdup(const tal_t *ctx UNNEEDED, const char *buffer UNNEEDED, const jsmntok_t *tok UNNEEDED)
 { fprintf(stderr, "json_strdup called!\n"); abort(); }
+/* Generated stub for json_to_bool */
+bool json_to_bool(const char *buffer UNNEEDED, const jsmntok_t *tok UNNEEDED, bool *b UNNEEDED)
+{ fprintf(stderr, "json_to_bool called!\n"); abort(); }
 /* Generated stub for json_to_createonion_response */
 struct createonion_response *json_to_createonion_response(const tal_t *ctx UNNEEDED,
 							  const char *buffer UNNEEDED,
@@ -216,6 +237,7 @@ struct out_req *jsonrpc_request_start_(struct plugin *plugin UNNEEDED,
 				       struct command *cmd UNNEEDED,
 				       const char *method UNNEEDED,
 				       const char *id_prefix UNNEEDED,
+				       const char *filter UNNEEDED,
 				       struct command_result *(*cb)(struct command *command UNNEEDED,
 								    const char *buf UNNEEDED,
 								    const jsmntok_t *result UNNEEDED,
@@ -251,6 +273,12 @@ void plugin_notification_end(struct plugin *plugin UNNEEDED,
 struct json_stream *plugin_notification_start(struct plugin *plugins UNNEEDED,
 					      const char *method UNNEEDED)
 { fprintf(stderr, "plugin_notification_start called!\n"); abort(); }
+/* Generated stub for plugin_notify_message */
+void plugin_notify_message(struct command *cmd UNNEEDED,
+			   enum log_level level UNNEEDED,
+			   const char *fmt UNNEEDED, ...)
+
+{ fprintf(stderr, "plugin_notify_message called!\n"); abort(); }
 /* Generated stub for random_select */
 bool random_select(double weight UNNEEDED, double *tot_weight UNNEEDED)
 { fprintf(stderr, "random_select called!\n"); abort(); }

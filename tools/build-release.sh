@@ -7,7 +7,7 @@ if [ "$1" = "--inside-docker" ]; then
     VER="$2"
     PLTFM="$3"
     git clone /src /build
-    cd /build
+    cd /build || exit
     poetry export --without-hashes > /tmp/requirements.txt
     python3 -m pip install -r /tmp/requirements.txt
     ./configure
@@ -20,7 +20,6 @@ fi
 
 FORCE_UNCLEAN=false
 VERIFY_RELEASE=false
-DOCKER_PUSH=false
 
 ALL_TARGETS="bin-Fedora-28-amd64 bin-Ubuntu docker sign"
 # ALL_TARGETS="bin-Fedora-28-amd64 bin-Ubuntu tarball deb docker sign"
@@ -39,9 +38,6 @@ for arg; do
     --verify)
         VERIFY_RELEASE=true
         ;;
-    --push)
-        DOCKER_PUSH=true
-        ;;
     --help)
         echo "Usage: [--force-version=<ver>] [--force-unclean] [--force-mtime=YYYY-MM-DD] [--verify] [TARGETS]"
         echo Known targets: "$ALL_TARGETS"
@@ -49,8 +45,8 @@ for arg; do
 	    echo "Example: tools/build-release.sh --force-version=v23.05 --force-unclean --force-mtime=2023-05-01 bin-Fedora-28-amd64 bin-Ubuntu sign"
 	    echo "Example: tools/build-release.sh --verify"
 	    echo "Example: tools/build-release.sh --force-version=v23.05 --force-unclean --force-mtime=2023-05-01 --verify"
-        echo "Example: tools/build-release.sh --push docker"
-        echo "Example: tools/build-release.sh --force-version=v23.05 --force-unclean --force-mtime=2023-05-01 --push docker"
+        echo "Example: tools/build-release.sh docker"
+        echo "Example: tools/build-release.sh --force-version=v23.05 --force-unclean --force-mtime=2023-05-01 docker"
         exit 0
         ;;
     -*)
@@ -152,13 +148,13 @@ for target in $TARGETS; do
         echo "Building Fedora Image"
         DOCKERFILE=contrib/docker/Dockerfile.builder.fedora
         TAG=fedora
-        docker build -f $DOCKERFILE -t $TAG .
+        docker build -f $DOCKERFILE -t $TAG --load .
         docker run --rm=true -v "$(pwd)":/src:ro -v "$RELEASEDIR":/release $TAG /src/tools/build-release.sh --inside-docker "$VERSION" "$platform"
         docker run --rm=true -w /build $TAG rm -rf /"$VERSION-$platform" /build
         echo "Fedora Image Built"
         ;;
     Ubuntu)
-		for d in focal jammy; do
+		for d in focal jammy noble; do
             # Capitalize the first letter of distro
             D=$(echo "$d" | awk '{print toupper(substr($0,1,1))substr($0,2)}')
 			echo "Building Ubuntu $D Image"
@@ -175,70 +171,27 @@ done
 if [ -z "${TARGETS##* docker *}" ]; then
     echo "Building Docker Images"
     DOCKER_USER="elementsproject"
-    PLATFORMS="amd64 arm64v8"
-    for d in $PLATFORMS; do
-        TMPDIR="$(mktemp -d /tmp/lightningd-docker-"$d".XXXXXX)"
-        SRCDIR="$(pwd)"
-        echo "Bundling $d image in ${TMPDIR}"
-        git clone --recursive . "${TMPDIR}"
-        (
-        cd "${TMPDIR}"
-        if ! $FORCE_UNCLEAN; then
-            git checkout "v${BARE_VERSION}"
-        fi
-        cp "${SRCDIR}/Dockerfile" "${TMPDIR}/"
-        case "$d" in
-            "arm32v7")
-                TARBALL_ARCH="arm-linux-gnueabihf"
-                PLATFORM="linux/arm/v7"
-                ;;
-            "arm64v8")
-                TARBALL_ARCH="aarch64-linux-gnu"
-                PLATFORM="linux/arm64"
-                ;;
-            "amd64")
-                TARBALL_ARCH="x86_64-linux-gnu"
-                PLATFORM="linux/amd64"
-                ;;
-        esac
-        if $DOCKER_PUSH; then
-            docker buildx build --push --platform $PLATFORM --build-arg TARBALL_ARCH=$TARBALL_ARCH -t "$DOCKER_USER"/lightningd:"$VERSION"-"$d" -f Dockerfile "${TMPDIR}"
-            echo "Docker Image for $PLATFORM Built and Uploaded on Dockerhub."
-        else
-            docker buildx build --load --platform $PLATFORM --build-arg TARBALL_ARCH=$TARBALL_ARCH -t "$DOCKER_USER"/lightningd:"$VERSION"-"$d" -f Dockerfile "${TMPDIR}"
-            echo "Docker Image for $PLATFORM Built. Ready to Upload on Dockerhub."
-        fi
-        )
-        rm -rf "${TMPDIR}"
-    done
-    echo "Creating a multi-platform image tagged as $VERSION"
-    docker manifest create --amend "$DOCKER_USER"/lightningd:"$VERSION" "$DOCKER_USER"/lightningd:"$VERSION"-amd64 "$DOCKER_USER"/lightningd:"$VERSION"-arm64v8
-    docker manifest annotate "$DOCKER_USER"/lightningd:"$VERSION" "$DOCKER_USER"/lightningd:"$VERSION"-amd64 --os linux --arch amd64
-    docker manifest annotate "$DOCKER_USER"/lightningd:"$VERSION" "$DOCKER_USER"/lightningd:"$VERSION"-arm64v8 --os linux --arch arm64 --variant v8
-    # FIXME: Throws ERROR: failed to solve: debian:bullseye-slim: no match for platform in manifest
-    # docker buildx create --use
-    # docker buildx build --push --platform linux/amd64,linux/arm64v8 -t "$DOCKER_USER/lightningd:"$VERSION"-$d" .
-    echo "Creating a multi-platform image tagged as latest"
-    # Remove the old image
-    docker rmi "$DOCKER_USER"/lightningd:latest
-    # Remove the old manifest
-    docker manifest rm "$DOCKER_USER"/lightningd:latest
-    docker manifest create "$DOCKER_USER"/lightningd:latest "$DOCKER_USER"/lightningd:"$VERSION"-amd64 "$DOCKER_USER"/lightningd:"$VERSION"-arm64v8
-    docker manifest annotate "$DOCKER_USER"/lightningd:latest "$DOCKER_USER"/lightningd:"$VERSION"-amd64 --os linux --arch amd64
-    docker manifest annotate "$DOCKER_USER"/lightningd:latest "$DOCKER_USER"/lightningd:"$VERSION"-arm64v8 --os linux --arch arm64 --variant v8
-    if $DOCKER_PUSH; then
-        docker manifest push "$DOCKER_USER"/lightningd:"$VERSION"
-        echo "Pushed a multi-platform image tagged as $VERSION"
-        docker manifest push "$DOCKER_USER"/lightningd:latest
-        echo "Pushed a multi-platform image tagged as latest"
+    echo "Creating multi-platform images tagged as $VERSION and latest"
+    # --load does not work with multiarch. Only --push works.
+    # ERROR: docker exporter does not currently support exporting manifest lists
+    DOCKER_OPTS="--push --platform linux/amd64,linux/arm64,linux/arm/v7"
+    DOCKER_OPTS="$DOCKER_OPTS -t $DOCKER_USER/lightningd:$VERSION"
+    DOCKER_OPTS="$DOCKER_OPTS -t $DOCKER_USER/lightningd:latest"
+    DOCKER_OPTS="$DOCKER_OPTS --cache-to=type=local,dest=/tmp/docker-cache --cache-from=type=local,src=/tmp/docker-cache"    
+    echo "Docker Options: $DOCKER_OPTS"
+    if sudo docker buildx ls | grep -q 'cln-builder'; then
+        sudo docker buildx use cln-builder
     else
-        echo "Docker Images Built. Ready to Upload on Dockerhub."
+        sudo docker buildx create --name=cln-builder --use
     fi
+    # shellcheck disable=SC2086
+    sudo docker buildx build $DOCKER_OPTS .
+    echo "Pushed multi-platform images tagged as $VERSION and latest"
 fi
 
 if [ -z "${TARGETS##* sign *}" ]; then
     echo "Signing Release"
-    cd release/
+    cd release/ || exit
     sha256sum clightning-"$VERSION"* > SHA256SUMS
     gpg -sb --armor -o SHA256SUMS.asc"$(gpgconf --list-options gpg | awk -F: '$1 == "default-key" {print $10}' | tr -d '"')" SHA256SUMS
     cd ..
@@ -257,7 +210,7 @@ if [ "$VERIFY_RELEASE" = "true" ]; then
         exit 1
     fi
     sumfile="$(pwd)/${sumfile}"
-    cd release/
+    cd release/ || exit
     # Check that the release captains sum matches. Ignore missing entries as we
     # do not have a repro build for Fedora. Strictly this is not necessary here
     # as we compare our checksums with the release captains checksums later, but

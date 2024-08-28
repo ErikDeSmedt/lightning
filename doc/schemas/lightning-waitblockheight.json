@@ -48,36 +48,37 @@
     "",
     "- 2000: Timed out."
   ],
-  "example_json_request": [
-    {
-      "id": "example:waitblockheight#1",
-      "method": "waitblockheight",
-      "params": {
-        "blockheight": 99,
-        "timeout": null
-      }
-    },
-    {
-      "id": "example:waitblockheight#2",
-      "method": "waitblockheight",
-      "params": {
-        "blockheight": 103,
-        "timeout": 600
-      }
-    }
-  ],
-  "example_json_response": [
-    {
-      "blockheight": 99
-    },
-    {
-      "blockheight": 103
-    }
-  ],
   "author": [
     "ZmnSCPxj <<ZmnSCPxj@protonmail.com>> is mainly responsible."
   ],
   "resources": [
     "Main web site: <https://github.com/ElementsProject/lightning>"
+  ],
+  "examples": [
+    {
+      "request": {
+        "id": "example:waitblockheight#1",
+        "method": "waitblockheight",
+        "params": {
+          "blockheight": 129,
+          "timeout": 600
+        }
+      },
+      "response": {
+        "blockheight": 130
+      }
+    },
+    {
+      "request": {
+        "id": "example:waitblockheight#2",
+        "method": "waitblockheight",
+        "params": {
+          "blockheight": 131
+        }
+      },
+      "response": {
+        "blockheight": 131
+      }
+    }
   ]
 }

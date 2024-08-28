@@ -62,52 +62,6 @@
       }
     }
   },
-  "example_json_request": [
-    {
-      "id": "example:datastoreusage#1",
-      "method": "datastoreusage",
-      "params": {
-        "key": null
-      }
-    },
-    {
-      "id": "example:datastoreusage#2",
-      "method": "datastoreusage",
-      "params": {
-        "key": "a"
-      }
-    },
-    {
-      "id": "example:datastoreusage#3",
-      "method": "datastoreusage",
-      "params": {
-        "key": [
-          "a",
-          "thisissomelongkeythattriestostore46bytesofdata"
-        ]
-      }
-    }
-  ],
-  "example_json_response": [
-    {
-      "datastoreusage": {
-        "key": "[]",
-        "total_bytes": 0
-      }
-    },
-    {
-      "datastoreusage": {
-        "key": "[a]",
-        "total_bytes": 32
-      }
-    },
-    {
-      "datastoreusage": {
-        "key": "[a,thisissomelongkeythattriestostore46bytesofdata]",
-        "total_bytes": 77
-      }
-    }
-  ],
   "author": [
     "Peter Neuroth <<pet.v.ne@gmail.com>> is mainly responsible."
   ],
@@ -118,5 +72,53 @@
   ],
   "resources": [
     "Main web site: <https://github.com/ElementsProject/lightning>"
+  ],
+  "examples": [
+    {
+      "request": {
+        "id": "example:datastoreusage#1",
+        "method": "datastoreusage",
+        "params": {}
+      },
+      "response": {
+        "datastoreusage": {
+          "key": "[]",
+          "total_bytes": 55
+        }
+      }
+    },
+    {
+      "request": {
+        "id": "example:datastoreusage#2",
+        "method": "datastoreusage",
+        "params": {
+          "key": [
+            "test",
+            "name"
+          ]
+        }
+      },
+      "response": {
+        "datastoreusage": {
+          "key": "[test,name]",
+          "total_bytes": 33
+        }
+      }
+    },
+    {
+      "request": {
+        "id": "example:datastoreusage#3",
+        "method": "datastoreusage",
+        "params": {
+          "key": "otherkey"
+        }
+      },
+      "response": {
+        "datastoreusage": {
+          "key": "[otherkey]",
+          "total_bytes": 14
+        }
+      }
+    }
   ]
 }

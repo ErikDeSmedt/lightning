@@ -1,6 +1,7 @@
 /* Caller does fromwire_onion_message(), this does the rest. */
 #include "config.h"
 #include <assert.h>
+#include <ccan/tal/str/str.h>
 #include <common/blindedpath.h>
 #include <common/ecdh.h>
 #include <common/onion_message_parse.h>
@@ -39,7 +40,7 @@ static bool decrypt_final_onionmsg(const tal_t *ctx,
 static bool decrypt_forwarding_onionmsg(const struct pubkey *blinding,
 					const struct secret *ss,
 					const u8 *enctlv,
-					struct pubkey *next_node,
+					struct sciddir_or_pubkey *next_node,
 					struct pubkey *next_blinding)
 {
 	struct tlv_encrypted_data_tlv *encmsg;
@@ -48,7 +49,7 @@ static bool decrypt_forwarding_onionmsg(const struct pubkey *blinding,
 	if (!encmsg)
 		return false;
 
-	/* BOLT-onion-message #4:
+	/* BOLT #4:
 	 *  - if it is not the final node according to the onion encryption:
 	 *...
 	 *    - if the `encrypted_data_tlv` contains `path_id`:
@@ -57,29 +58,41 @@ static bool decrypt_forwarding_onionmsg(const struct pubkey *blinding,
 	if (encmsg->path_id)
 		return false;
 
-	/* BOLT-onion-message #4:
-	 * - SHOULD forward the message using `onion_message` to the next peer
-	 *   indicated by `next_node_id`.
+	/* BOLT-offers #4:
+	 * - if it is not the final node according to the onion encryption:
+	 *...
+	 *    - if `next_node_id` is present:
+	 *      - the *next peer* is the peer with that node id.
+	 *    - otherwise, if `short_channel_id` is present and corresponds to an announced short_channel_id or a local alias for a channel:
+	 *      - the *next peer* is the peer at the other end of that channel.
+	 *    - otherwise:
+	 *      - MUST ignore the message.
 	 */
-	if (!encmsg->next_node_id)
+	if (encmsg->next_node_id)
+		sciddir_or_pubkey_from_pubkey(next_node, encmsg->next_node_id);
+	else if (encmsg->short_channel_id) {
+		/* This is actually scid, not sciddir, but the type is convenient! */
+		struct short_channel_id_dir scidd;
+		scidd.scid = *encmsg->short_channel_id;
+		scidd.dir = 0;
+		sciddir_or_pubkey_from_scidd(next_node, &scidd);
+	} else
 		return false;
 
-	*next_node = *encmsg->next_node_id;
 	blindedpath_next_blinding(encmsg, blinding, ss, next_blinding);
 	return true;
 }
 
 /* Returns false on failure */
-bool onion_message_parse(const tal_t *ctx,
-			 const u8 *onion_message_packet,
-			 const struct pubkey *blinding,
-			 const struct node_id *peer,
-			 const struct pubkey *me,
-			 u8 **next_onion_msg,
-			 struct pubkey *next_node_id,
-			 struct tlv_onionmsg_tlv **final_om,
-			 struct pubkey *final_alias,
-			 struct secret **final_path_id)
+const char *onion_message_parse(const tal_t *ctx,
+				const u8 *onion_message_packet,
+				const struct pubkey *blinding,
+				const struct pubkey *me,
+				u8 **next_onion_msg,
+				struct sciddir_or_pubkey *next_node,
+				struct tlv_onionmsg_tlv **final_om,
+				struct pubkey *final_alias,
+				struct secret **final_path_id)
 {
 	enum onion_wire badreason;
 	struct onionpacket *op;
@@ -96,25 +109,21 @@ bool onion_message_parse(const tal_t *ctx,
 			       tal_bytelen(onion_message_packet),
 			       &badreason);
 	if (!op) {
-		status_peer_debug(peer, "onion_message_parse: can't parse onionpacket: %s",
-				  onion_wire_name(badreason));
-		return false;
+		return tal_fmt(ctx, "onion_message_parse: can't parse onionpacket: %s",
+			       onion_wire_name(badreason));
 	}
 
 	ephemeral = op->ephemeralkey;
 	if (!unblind_onion(blinding, ecdh, &ephemeral, &ss)) {
-		status_peer_debug(peer, "onion_message_parse: can't unblind onionpacket");
-		return false;
+		return tal_fmt(ctx, "onion_message_parse: can't unblind onionpacket");
 	}
 
 	/* Now get onion shared secret and parse it. */
 	ecdh(&ephemeral, &onion_ss);
-	rs = process_onionpacket(tmpctx, op, &onion_ss, NULL, 0, false);
+	rs = process_onionpacket(tmpctx, op, &onion_ss, NULL, 0);
 	if (!rs) {
-		status_peer_debug(peer,
-				  "onion_message_parse: can't process onionpacket ss=%s",
-				  fmt_secret(tmpctx, &onion_ss));
-		return false;
+		return tal_fmt(ctx, "onion_message_parse: can't process onionpacket ss=%s",
+			       fmt_secret(tmpctx, &onion_ss));
 	}
 
 	/* The raw payload is prepended with length in the modern onion. */
@@ -122,21 +131,18 @@ bool onion_message_parse(const tal_t *ctx,
 	max = tal_bytelen(rs->raw_payload);
 	maxlen = fromwire_bigsize(&cursor, &max);
 	if (!cursor) {
-		status_peer_debug(peer, "onion_message_parse: Invalid hop payload %s",
-				  tal_hex(tmpctx, rs->raw_payload));
-		return false;
+		return tal_fmt(ctx, "onion_message_parse: Invalid hop payload %s",
+			       tal_hex(tmpctx, rs->raw_payload));
 	}
 	if (maxlen > max) {
-		status_peer_debug(peer, "onion_message_parse: overlong hop payload %s",
-				  tal_hex(tmpctx, rs->raw_payload));
-		return false;
+		return tal_fmt(ctx, "onion_message_parse: overlong hop payload %s",
+			       tal_hex(tmpctx, rs->raw_payload));
 	}
 
 	om = fromwire_tlv_onionmsg_tlv(tmpctx, &cursor, &maxlen);
 	if (!om) {
-		status_peer_debug(peer, "onion_message_parse: invalid onionmsg_tlv %s",
-				  tal_hex(tmpctx, rs->raw_payload));
-		return false;
+		return tal_fmt(ctx, "onion_message_parse: invalid onionmsg_tlv %s",
+			       tal_hex(tmpctx, rs->raw_payload));
 	}
 	if (rs->nextcase == ONION_END) {
 		*next_onion_msg = NULL;
@@ -149,35 +155,30 @@ bool onion_message_parse(const tal_t *ctx,
 						   om->encrypted_recipient_data, me,
 						   final_alias,
 						   final_path_id)) {
-			status_peer_debug(peer,
+			return tal_fmt(ctx,
 					  "onion_message_parse: failed to decrypt encrypted_recipient_data"
 					  " %s", tal_hex(tmpctx, om->encrypted_recipient_data));
-			return false;
 		}
 	} else {
 		struct pubkey next_blinding;
 
 		*final_om = NULL;
 
-		/* BOLT-onion-message #4:
+		/* BOLT #4:
 		 * - if it is not the final node according to the onion encryption:
 		 *   - if the `onionmsg_tlv` contains other tlv fields than `encrypted_recipient_data`:
 		 *     - MUST ignore the message.
 		 */
 		if (tal_count(om->fields) != 1) {
-			status_peer_debug(peer,
-					  "onion_message_parse: "
-					  "disallowed tlv field");
-			return false;
+			return tal_fmt(ctx, "onion_message_parse: disallowed tlv field");
 		}
 
 		/* This fails as expected if no enctlv. */
-		if (!decrypt_forwarding_onionmsg(blinding, &ss, om->encrypted_recipient_data, next_node_id,
+		if (!decrypt_forwarding_onionmsg(blinding, &ss, om->encrypted_recipient_data, next_node,
 						 &next_blinding)) {
-			status_peer_debug(peer,
-					  "onion_message_parse: invalid encrypted_recipient_data %s",
-					  tal_hex(tmpctx, om->encrypted_recipient_data));
-			return false;
+			return tal_fmt(ctx,
+				       "onion_message_parse: invalid encrypted_recipient_data %s",
+				       tal_hex(tmpctx, om->encrypted_recipient_data));
 		}
 		*next_onion_msg = towire_onion_message(ctx,
 						       &next_blinding,
@@ -186,5 +187,5 @@ bool onion_message_parse(const tal_t *ctx,
 
 	/* Exactly one is set */
 	assert(!*next_onion_msg + !*final_om == 1);
-	return true;
+	return NULL;
 }

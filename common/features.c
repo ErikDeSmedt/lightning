@@ -31,9 +31,6 @@ static const struct feature_style feature_styles[] = {
 	{ OPT_DATA_LOSS_PROTECT,
 	  .copy_style = { [INIT_FEATURE] = FEATURE_REPRESENT,
 			  [NODE_ANNOUNCE_FEATURE] = FEATURE_REPRESENT } },
-	{ OPT_INITIAL_ROUTING_SYNC,
-	  .copy_style = { [INIT_FEATURE] = FEATURE_REPRESENT_AS_OPTIONAL,
-			  [NODE_ANNOUNCE_FEATURE] = FEATURE_DONT_REPRESENT } },
 	{ OPT_UPFRONT_SHUTDOWN_SCRIPT,
 	  .copy_style = { [INIT_FEATURE] = FEATURE_REPRESENT,
 			  [NODE_ANNOUNCE_FEATURE] = FEATURE_REPRESENT } },
@@ -77,10 +74,6 @@ static const struct feature_style feature_styles[] = {
 	  .copy_style = { [INIT_FEATURE] = FEATURE_REPRESENT,
 			  [NODE_ANNOUNCE_FEATURE] = FEATURE_REPRESENT,
 			  [CHANNEL_FEATURE] = FEATURE_DONT_REPRESENT} },
-	{ OPT_ANCHOR_OUTPUTS,
-	  .copy_style = { [INIT_FEATURE] = FEATURE_REPRESENT,
-			  [NODE_ANNOUNCE_FEATURE] = FEATURE_REPRESENT,
-			  [CHANNEL_FEATURE] = FEATURE_DONT_REPRESENT } },
 	{ OPT_ANCHORS_ZERO_FEE_HTLC_TX,
 	  .copy_style = { [INIT_FEATURE] = FEATURE_REPRESENT,
 			  [NODE_ANNOUNCE_FEATURE] = FEATURE_REPRESENT,
@@ -88,7 +81,7 @@ static const struct feature_style feature_styles[] = {
 	{ OPT_DUAL_FUND,
 	  .copy_style = { [INIT_FEATURE] = FEATURE_REPRESENT,
 			  [NODE_ANNOUNCE_FEATURE] = FEATURE_REPRESENT,
-			  [BOLT11_FEATURE] = FEATURE_REPRESENT,
+			  [BOLT11_FEATURE] = FEATURE_DONT_REPRESENT,
 			  [CHANNEL_FEATURE] = FEATURE_DONT_REPRESENT} },
 	/* FIXME: Currently not explicitly signalled, but we do
 	 * support it for zeroconf */
@@ -161,33 +154,9 @@ static const struct dependency feature_deps[] = {
 	/* BOLT #9:
 	 * Name                | Description  | Context  | Dependencies  |
 	 *...
-	 * `gossip_queries_ex` | ...          | ...      | `gossip_queries` |
-	 *...
-	 * `payment_secret`    | ...          | ...      | `var_onion_optin` |
-	 *...
 	 * `basic_mpp`         | ...          | ...      | `payment_secret` |
 	 */
-	{ OPT_GOSSIP_QUERIES_EX, OPT_GOSSIP_QUERIES },
-	{ OPT_PAYMENT_SECRET, OPT_VAR_ONION },
 	{ OPT_BASIC_MPP, OPT_PAYMENT_SECRET },
-	/* BOLT #9:
-	 * Name                | Description  | Context  | Dependencies  |
-	 *...
-	 * `option_anchor_outputs` | ...      | ...      | `option_static_remotekey`
-	 */
-	{ OPT_ANCHOR_OUTPUTS, OPT_STATIC_REMOTEKEY },
-	/* BOLT #9:
-	 * Name                | Description  | Context  | Dependencies  |
-	 *...
-	 * `option_anchors_zero_fee_htlc_tx` | ...      | ...      | `option_static_remotekey`
-	 */
-	{ OPT_ANCHORS_ZERO_FEE_HTLC_TX, OPT_STATIC_REMOTEKEY },
-	/* BOLT #9:
-	 * Name                | Description  | Context  | Dependencies  |
-	 * ...
-	 * `option_route_blinding` | ...      | ...      | `var_onion_optin`
-	 */
-	{ OPT_ROUTE_BLINDING, OPT_VAR_ONION },
 };
 
 static void trim_features(u8 **features)
@@ -432,12 +401,6 @@ int features_unsupported(const struct feature_set *our_features,
 			 const u8 *their_features,
 			 enum feature_place p)
 {
-	/* BIT 2 would logically be "compulsory initial_routing_sync", but
-	 * that does not exist, so we special case it. */
-	if (feature_is_set(their_features,
-			   COMPULSORY_FEATURE(OPT_INITIAL_ROUTING_SYNC)))
-		return COMPULSORY_FEATURE(OPT_INITIAL_ROUTING_SYNC);
-
 	return all_supported_features(our_features, their_features, p);
 }
 
@@ -455,7 +418,7 @@ const char *feature_name(const tal_t *ctx, size_t f)
 		"option_basic_mpp",
 		"option_support_large_channel",
 		"option_anchor_outputs", 	/* 20/21 */
-		"option_anchors_zero_fee_htlc_tx",
+		"option_anchors",
 		"option_route_blinding", /* https://github.com/lightning/bolts/pull/765 */
 		"option_shutdown_anysegwit",
 		"option_dual_fund",

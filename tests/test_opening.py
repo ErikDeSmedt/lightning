@@ -362,13 +362,12 @@ def test_v2_rbf_single(node_factory, bitcoind, chainparams):
     info_1 = only_one(l1.rpc.listpeerchannels(l2.info['id'])['channels'])
     assert info_1['initial_feerate'] == info_1['last_feerate']
     rate = int(info_1['last_feerate'][:-5])
-    assert int(info_1['next_feerate'][:-5]) == rate * 65 // 64
+    assert int(info_1['next_feerate'][:-5]) == rate * 25 // 24
 
     # Initiate an RBF
     startweight = 42 + 172  # base weight, funding output
     initpsbt = l1.rpc.utxopsbt(chan_amount, next_feerate, startweight,
                                prev_utxos, reservedok=True,
-                               min_witness_weight=110,
                                excess_as_change=True)
 
     # Do the bump
@@ -383,29 +382,26 @@ def test_v2_rbf_single(node_factory, bitcoind, chainparams):
     assert info_1['next_feerate'] == info_2['last_feerate']
 
     rate = int(info_2['last_feerate'][:-5])
-    assert int(info_2['next_feerate'][:-5]) == rate * 65 // 64
+    assert int(info_2['next_feerate'][:-5]) == rate * 25 // 24
 
     # Sign our inputs, and continue
     signed_psbt = l1.rpc.signpsbt(update['psbt'])['signed_psbt']
 
-    # Fails because we didn't put enough feerate in.
-    with pytest.raises(RpcError, match=r'insufficient fee'):
-        l1.rpc.openchannel_signed(chan_id, signed_psbt)
+    l1.rpc.openchannel_signed(chan_id, signed_psbt)
 
     # Do it again, with a higher feerate
     info_2 = only_one(l1.rpc.listpeerchannels(l2.info['id'])['channels'])
     assert info_1['initial_feerate'] == info_2['initial_feerate']
     assert info_1['next_feerate'] == info_2['last_feerate']
     rate = int(info_2['last_feerate'][:-5])
-    assert int(info_2['next_feerate'][:-5]) == rate * 65 // 64
+    assert int(info_2['next_feerate'][:-5]) == rate * 25 // 24
 
     # We 4x the feerate to beat the min-relay fee
-    next_rate = '{}perkw'.format(rate * 65 // 64 * 4)
+    next_rate = '{}perkw'.format(rate * 25 // 24 * 4)
     # Gotta unreserve the psbt and re-reserve with higher feerate
     l1.rpc.unreserveinputs(initpsbt['psbt'])
     initpsbt = l1.rpc.utxopsbt(chan_amount, next_rate, startweight,
                                prev_utxos, reservedok=True,
-                               min_witness_weight=110,
                                excess_as_change=True)
     # Do the bump+sign
     bump = l1.rpc.openchannel_bump(chan_id, chan_amount, initpsbt['psbt'],
@@ -472,7 +468,6 @@ def test_v2_rbf_abort_retry(node_factory, bitcoind, chainparams):
     startweight = 42 + 172  # base weight, funding output
     initpsbt = l1.rpc.utxopsbt(chan_amount, next_rate, startweight,
                                prev_utxos, reservedok=True,
-                               min_witness_weight=110,
                                excess_as_change=True)
 
     # Do the bump
@@ -498,7 +493,6 @@ def test_v2_rbf_abort_retry(node_factory, bitcoind, chainparams):
     l1.rpc.unreserveinputs(initpsbt['psbt'])
     initpsbt = l1.rpc.utxopsbt(chan_amount, next_rate, startweight,
                                prev_utxos, reservedok=True,
-                               min_witness_weight=110,
                                excess_as_change=True)
     # Do the bump+sign
     bump = l1.rpc.openchannel_bump(chan_id, chan_amount, initpsbt['psbt'],
@@ -555,7 +549,6 @@ def test_v2_rbf_abort_channel_opens(node_factory, bitcoind, chainparams):
     startweight = 42 + 172  # base weight, funding output
     initpsbt = l1.rpc.utxopsbt(chan_amount, next_rate, startweight,
                                prev_utxos, reservedok=True,
-                               min_witness_weight=110,
                                excess_as_change=True)
 
     # Do the bump
@@ -625,7 +618,6 @@ def test_v2_rbf_liquidity_ad(node_factory, bitcoind, chainparams):
     startweight = 42 + 172  # base weight, funding output
     initpsbt = l1.rpc.utxopsbt(amount, next_feerate, startweight,
                                prev_utxos, reservedok=True,
-                               min_witness_weight=110,
                                excess_as_change=True)['psbt']
 
     # reconnect after restart
@@ -707,7 +699,6 @@ def test_v2_rbf_multi(node_factory, bitcoind, chainparams):
     startweight = 42 + 172  # base weight, funding output
     initpsbt = l1.rpc.utxopsbt(chan_amount, next_feerate, startweight,
                                prev_utxos, reservedok=True,
-                               min_witness_weight=110,
                                excess_as_change=True)
 
     # Do the bump
@@ -741,7 +732,6 @@ def test_v2_rbf_multi(node_factory, bitcoind, chainparams):
     startweight = 42 + 172  # base weight, funding output
     initpsbt = l1.rpc.utxopsbt(chan_amount * 2, next_feerate, startweight,
                                prev_utxos, reservedok=True,
-                               min_witness_weight=110,
                                excess_as_change=True)
 
     # Do the bump
@@ -795,7 +785,6 @@ def test_rbf_reconnect_init(node_factory, bitcoind, chainparams):
     startweight = 42 + 172  # base weight, funding output
     initpsbt = l1.rpc.utxopsbt(chan_amount, next_feerate, startweight,
                                prev_utxos, reservedok=True,
-                               min_witness_weight=110,
                                excess_as_change=True)
 
     # Do the bump!?
@@ -844,7 +833,6 @@ def test_rbf_reconnect_ack(node_factory, bitcoind, chainparams):
     startweight = 42 + 172  # base weight, funding output
     initpsbt = l1.rpc.utxopsbt(chan_amount, next_feerate, startweight,
                                prev_utxos, reservedok=True,
-                               min_witness_weight=110,
                                excess_as_change=True)
 
     # Do the bump!?
@@ -878,7 +866,7 @@ def test_rbf_reconnect_tx_construct(node_factory, bitcoind, chainparams):
                                            'dev-no-reconnect': None},
                                           {'may_reconnect': True,
                                            'dev-no-reconnect': None,
-                                           'allow_broken_log': True}])
+                                           'broken_log': 'dualopend daemon died before signed PSBT returned'}])
 
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
     amount = 2**24
@@ -906,7 +894,6 @@ def test_rbf_reconnect_tx_construct(node_factory, bitcoind, chainparams):
     startweight = 42 + 172  # base weight, funding output
     initpsbt = l1.rpc.utxopsbt(chan_amount, next_feerate, startweight,
                                prev_utxos, reservedok=True,
-                               min_witness_weight=110,
                                excess_as_change=True)
 
     # Run through TX_ADD wires
@@ -1000,7 +987,7 @@ def test_rbf_reconnect_tx_sigs(node_factory, bitcoind, chainparams):
                                            'may_reconnect': True,
                                            # "dualopend daemon died before signed PSBT returned"
                                            # happens occassionally
-                                           'allow_broken_log': True}])
+                                           'broken_log': 'dualopend daemon died before signed PSBT returned'}])
 
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
     amount = 2**24
@@ -1029,7 +1016,6 @@ def test_rbf_reconnect_tx_sigs(node_factory, bitcoind, chainparams):
     startweight = 42 + 172  # base weight, funding output
     initpsbt = l1.rpc.utxopsbt(chan_amount, next_feerate, startweight,
                                prev_utxos, reservedok=True,
-                               min_witness_weight=110,
                                excess_as_change=True)
 
     bump = l1.rpc.openchannel_bump(chan_id, chan_amount, initpsbt['psbt'],
@@ -1072,8 +1058,7 @@ def test_rbf_to_chain_before_commit(node_factory, bitcoind, chainparams):
                                            'may_reconnect': True,
                                            'dev-no-reconnect': None},
                                           {'may_reconnect': True,
-                                           'dev-no-reconnect': None,
-                                           'allow_broken_log': True}])
+                                           'dev-no-reconnect': None}])
 
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
     amount = 2**24
@@ -1101,7 +1086,6 @@ def test_rbf_to_chain_before_commit(node_factory, bitcoind, chainparams):
     startweight = 42 + 172  # base weight, funding output
     initpsbt = l1.rpc.utxopsbt(chan_amount, next_feerate, startweight,
                                prev_utxos, reservedok=True,
-                               min_witness_weight=110,
                                excess_as_change=True)
 
     # Peers try RBF, break on initial COMMITMENT_SIGNED
@@ -1152,7 +1136,6 @@ def test_rbf_no_overlap(node_factory, bitcoind, chainparams):
     # one we started with)
     startweight = 42 + 172  # base weight, funding output
     initpsbt = l1.rpc.fundpsbt(chan_amount, next_feerate, startweight,
-                               min_witness_weight=110,
                                excess_as_change=True)
 
     # Do the bump
@@ -1196,7 +1179,6 @@ def test_rbf_fails_to_broadcast(node_factory, bitcoind, chainparams):
         next_feerate = '{}perkw'.format(rate * 2)
         initpsbt = l1.rpc.utxopsbt(chan_amount, next_feerate, startweight,
                                    prev_utxos, reservedok=True,
-                                   min_witness_weight=110,
                                    excess_as_change=True)
 
         l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
@@ -1286,7 +1268,6 @@ def test_rbf_broadcast_close_inflights(node_factory, bitcoind, chainparams):
         next_feerate = find_next_feerate(l1, l2)
         initpsbt = l1.rpc.utxopsbt(chan_amount, next_feerate, startweight,
                                    prev_utxos, reservedok=True,
-                                   min_witness_weight=110,
                                    excess_as_change=True)
 
         l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
@@ -1339,7 +1320,7 @@ def test_rbf_non_last_mined(node_factory, bitcoind, chainparams):
     res = l1.rpc.fundchannel(l2.info['id'], chan_amount, feerate='7500perkw')
     chan_id = res['channel_id']
     vins = bitcoind.rpc.decoderawtransaction(res['tx'])['vin']
-    assert(only_one(vins))
+    assert only_one(vins)
     prev_utxos = ["{}:{}".format(vins[0]['txid'], vins[0]['vout'])]
 
     # Check that we're waiting for lockin
@@ -1354,7 +1335,6 @@ def test_rbf_non_last_mined(node_factory, bitcoind, chainparams):
         next_feerate = '{}perkw'.format(rate * 2)
         initpsbt = l1.rpc.utxopsbt(chan_amount, next_feerate, startweight,
                                    prev_utxos, reservedok=True,
-                                   min_witness_weight=110,
                                    excess_as_change=True)
 
         l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
@@ -1378,7 +1358,12 @@ def test_rbf_non_last_mined(node_factory, bitcoind, chainparams):
 
     # Make a 3rd inflight that won't make it into the mempool
     signed_psbt = run_retry()
+    last = len(l1.daemon.logs)
     l1.rpc.openchannel_signed(chan_id, signed_psbt)
+
+    wait_for(lambda: l1.daemon.is_in_log("plugin-bcli: sendrawtx exit 0", start=last))
+    import time
+    time.sleep(.05)
 
     l1.daemon.rpcproxy.mock_rpc('sendrawtransaction', None)
     l2.daemon.rpcproxy.mock_rpc('sendrawtransaction', None)
@@ -1631,8 +1616,8 @@ def test_zeroconf_open(bitcoind, node_factory):
     """
     plugin_path = Path(__file__).parent / "plugins" / "zeroconf-selective.py"
 
-    # Without l0->l1, l2 doesn't add a routehint since l1 looks like a deadend
-    l0, l1, l2 = node_factory.get_nodes(3, opts=[
+    # Without l1->l2, l3 doesn't add a routehint since l2 looks like a deadend
+    l1, l2, l3 = node_factory.get_nodes(3, opts=[
         {},
         {},
         {
@@ -1641,62 +1626,62 @@ def test_zeroconf_open(bitcoind, node_factory):
         },
     ])
 
-    node_factory.join_nodes([l0, l1], wait_for_announce=True)
+    node_factory.join_nodes([l1, l2], wait_for_announce=True)
 
     # Try to open a mindepth=0 channel
-    l1.fundwallet(10**6)
+    l2.fundwallet(10**6)
 
-    l1.connect(l2)
-    assert (int(l1.rpc.listpeers()['peers'][0]['features'], 16) >> 50) & 0x02 != 0
+    l2.connect(l3)
+    assert (int(l2.rpc.listpeers()['peers'][0]['features'], 16) >> 50) & 0x02 != 0
 
-    # Now start the negotiation, l1 should have negotiated zeroconf,
-    # and use their own mindepth=6, while l2 uses mindepth=2 from the
+    # Now start the negotiation, l2 should have negotiated zeroconf,
+    # and use their own mindepth=6, while l3 uses mindepth=2 from the
     # plugin
-    ret = l1.rpc.fundchannel(l2.info['id'], 'all', mindepth=0)
+    ret = l2.rpc.fundchannel(l3.info['id'], 'all', mindepth=0)
     if TEST_NETWORK == 'regtest':
-        channel_type = {'bits': [12, 22, 50], 'names': ['static_remotekey/even', 'anchors_zero_fee_htlc_tx/even', 'zeroconf/even']}
+        channel_type = {'bits': [12, 22, 50], 'names': ['static_remotekey/even', 'anchors/even', 'zeroconf/even']}
     else:
         channel_type = {'bits': [12, 50], 'names': ['static_remotekey/even', 'zeroconf/even']}
     assert ret['channel_type'] == channel_type
-    assert only_one(l1.rpc.listpeerchannels(l2.info['id'])['channels'])['channel_type'] == channel_type
+    assert only_one(l2.rpc.listpeerchannels(l3.info['id'])['channels'])['channel_type'] == channel_type
 
-    assert l1.db.query('SELECT minimum_depth FROM channels WHERE minimum_depth != 1') == [{'minimum_depth': 0}]
-    assert l2.db.query('SELECT minimum_depth FROM channels') == [{'minimum_depth': 0}]
+    assert l2.db.query('SELECT minimum_depth FROM channels WHERE minimum_depth != 1') == [{'minimum_depth': 0}]
+    assert l3.db.query('SELECT minimum_depth FROM channels') == [{'minimum_depth': 0}]
 
-    l1.daemon.wait_for_logs([
-        r'peer_in WIRE_CHANNEL_READY',
-        r'Peer told us that they\'ll use alias=[0-9x]+ for this channel',
-    ])
     l2.daemon.wait_for_logs([
         r'peer_in WIRE_CHANNEL_READY',
         r'Peer told us that they\'ll use alias=[0-9x]+ for this channel',
     ])
+    l3.daemon.wait_for_logs([
+        r'peer_in WIRE_CHANNEL_READY',
+        r'Peer told us that they\'ll use alias=[0-9x]+ for this channel',
+    ])
 
-    wait_for(lambda: [c['state'] for c in l1.rpc.listpeerchannels()['channels']] == ['CHANNELD_NORMAL'] * 2)
-    wait_for(lambda: only_one(l2.rpc.listpeerchannels()['channels'])['state'] == 'CHANNELD_NORMAL')
-    wait_for(lambda: l2.rpc.listincoming()['incoming'] != [])
+    wait_for(lambda: [c['state'] for c in l2.rpc.listpeerchannels()['channels']] == ['CHANNELD_NORMAL'] * 2)
+    wait_for(lambda: only_one(l3.rpc.listpeerchannels()['channels'])['state'] == 'CHANNELD_NORMAL')
+    wait_for(lambda: l3.rpc.listincoming()['incoming'] != [])
 
-    # Make sure l2 sees l0->l1
-    wait_for(lambda: l2.rpc.listchannels() != {'channels': []})
+    # Make sure l3 sees l1->l2
+    wait_for(lambda: l3.rpc.listchannels() != {'channels': []})
 
-    inv = l2.rpc.invoice(10**8, 'lbl', 'desc')['bolt11']
-    details = l1.rpc.decodepay(inv)
+    inv = l3.rpc.invoice(10**8, 'lbl', 'desc')['bolt11']
+    details = l2.rpc.decodepay(inv)
     pprint(details)
     assert('routes' in details and len(details['routes']) == 1)
     hop = details['routes'][0][0]  # First (and only) hop of hint 0
-    l1alias = only_one(l1.rpc.listpeerchannels(l2.info['id'])['channels'])['alias']['local']
-    assert(hop['pubkey'] == l1.info['id'])  # l1 is the entrypoint
-    assert(hop['short_channel_id'] == l1alias)  # Alias has to make sense to entrypoint
-    l1.rpc.pay(inv)
+    l2alias = only_one(l2.rpc.listpeerchannels(l3.info['id'])['channels'])['alias']['local']
+    assert(hop['pubkey'] == l2.info['id'])  # l2 is the entrypoint
+    assert(hop['short_channel_id'] == l2alias)  # Alias has to make sense to entrypoint
+    l2.rpc.pay(inv)
 
     # Ensure lightningd knows about the balance change before
     # attempting the other way around.
-    l2.daemon.wait_for_log(r'Balance [0-9]+msat -> [0-9]+msat')
+    l3.daemon.wait_for_log(r'Balance [0-9]+msat -> [0-9]+msat')
 
     # Inverse payments should work too
-    pprint(l2.rpc.listpeers())
-    inv = l1.rpc.invoice(10**5, 'lbl', 'desc')['bolt11']
-    l2.rpc.pay(inv)
+    pprint(l3.rpc.listpeers())
+    inv = l2.rpc.invoice(10**5, 'lbl', 'desc')['bolt11']
+    l3.rpc.pay(inv)
 
 
 def test_zeroconf_public(bitcoind, node_factory, chainparams):
@@ -2406,7 +2391,6 @@ def test_openchannel_no_unconfirmed_inputs_accepter(node_factory, bitcoind):
     startweight = 42 + 172  # base weight, funding output
     next_feerate = find_next_feerate(l1, l2)
     psbt = l1.rpc.fundpsbt(amount, next_feerate, startweight,
-                           min_witness_weight=110,
                            excess_as_change=True)['psbt']
 
     # Attempt bump, fail. L2 should remember required-confirmed-inputs
@@ -2583,14 +2567,11 @@ def test_fundchannel_utxo_too_small(bitcoind, node_factory):
 def test_opening_explicit_channel_type(node_factory, bitcoind):
     plugin_path = Path(__file__).parent / "plugins" / "zeroconf-selective.py"
     l1, l2, l3, l4 = node_factory.get_nodes(4,
-                                            opts=[{'experimental-dual-fund': None,
-                                                   'experimental-anchors': None},
-                                                  {'experimental-anchors': None,
-                                                   'plugin': str(plugin_path),
+                                            opts=[{'experimental-dual-fund': None},
+                                                  {'plugin': str(plugin_path),
                                                    'zeroconf-allow': '0266e4598d1d3c415f572a8488830b60f7e744ed9235eb0b1ba93283b315c03518'},
-                                                  {'experimental-dual-fund': None,
-                                                   'experimental-anchors': None},
-                                                  {'experimental-anchors': None}])
+                                                  {'experimental-dual-fund': None},
+                                                  {}])
 
     l1.fundwallet(FUNDAMOUNT)
     l1.connect(l2)

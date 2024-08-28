@@ -158,20 +158,20 @@ static void listforwardings_add_forwardings(struct json_stream *response,
 					    u64 liststart,
 					    const u32 *listlimit)
 {
-	const struct forwarding *forwardings;
+	struct db_stmt *stmt;
 
-	forwardings = wallet_forwarded_payments_get(tmpctx, wallet, status, chan_in, chan_out, listindex, liststart, listlimit);
+	stmt = forwarding_first(wallet, status, chan_in, chan_out, listindex, liststart, listlimit);
 
 	json_array_start(response, "forwards");
-	for (size_t i=0; i<tal_count(forwardings); i++) {
-		const struct forwarding *cur = &forwardings[i];
+	while (stmt) {
+		const struct forwarding *cur = forwarding_details(tmpctx, wallet, stmt);
 		json_object_start(response, NULL);
 		json_add_forwarding_fields(response, cur, NULL);
 		json_object_end(response);
+		tal_free(cur);
+		stmt = forwarding_next(wallet, stmt);
 	}
 	json_array_end(response);
-
-	tal_free(forwardings);
 }
 
 static struct command_result *param_forward_status(struct command *cmd,
@@ -236,9 +236,7 @@ static struct command_result *json_listforwards(struct command *cmd,
 
 static const struct json_command listforwards_command = {
 	"listforwards",
-	"channels",
 	json_listforwards,
-	"List all forwarded payments and their information optionally filtering by [status], [in_channel] and [out_channel]"
 };
 AUTODATA(json_command, &listforwards_command);
 
@@ -301,8 +299,6 @@ static struct command_result *json_delforward(struct command *cmd,
 
 static const struct json_command delforward_command = {
 	"delforward",
-	"channels",
 	json_delforward,
-	"Delete a forwarded payment by [in_channel], [in_htlc_id] and [status]"
 };
 AUTODATA(json_command, &delforward_command);

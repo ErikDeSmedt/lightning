@@ -215,7 +215,7 @@ static struct command_result *json_paystatus(struct command *cmd,
 			json_add_invstring(ret, p->invstring);
 		json_add_amount_msat(ret, "amount_msat", p->our_amount);
 
-		json_add_node_id(ret, "destination", p->destination);
+		json_add_node_id(ret, "destination", p->pay_destination);
 
 		/* TODO(cdecker) Add label in once we track labels. */
 		/* TODO(cdecker) Add routehint_modifications in once we track
@@ -315,9 +315,8 @@ static size_t pay_mpp_hash(const struct pay_sort_key *key)
 
 static bool pay_mpp_eq(const struct pay_mpp *pm, const struct pay_sort_key *key)
 {
-	return memcmp(pm->sortkey.payment_hash, key->payment_hash,
-		      sizeof(struct sha256)) == 0 &&
-		      pm->sortkey.groupid == key->groupid;
+	return sha256_eq(pm->sortkey.payment_hash, key->payment_hash)
+		&& pm->sortkey.groupid == key->groupid;
 }
 
 HTABLE_DEFINE_TYPE(struct pay_mpp, pay_mpp_key, pay_mpp_hash, pay_mpp_eq,
@@ -575,10 +574,19 @@ static const char *init(struct plugin *p,
 	rpc_scan(p, "getinfo", take(json_out_obj(NULL, NULL, NULL)),
 		 "{id:%}", JSON_SCAN(json_to_node_id, &my_id));
 
+	/* BOLT #4:
+	 * ## `max_htlc_cltv` Selection
+	 *
+	 * This ... value is defined as 2016 blocks, based on historical value
+	 * deployed by Lightning implementations.
+	 */
+	/* FIXME: Typo in spec for CLTV in descripton!  But it breaks our spelling check, so we omit it above */
+	maxdelay_default = 2016;
+	/* max-locktime-blocks deprecated in v24.05, but still grab it! */
 	rpc_scan(p, "listconfigs",
 		 take(json_out_obj(NULL, NULL, NULL)),
 		 "{configs:"
-		 "{max-locktime-blocks:{value_int:%},"
+		 "{max-locktime-blocks?:{value_int:%},"
 		 "experimental-offers:{set:%}}}",
 		 JSON_SCAN(json_to_number, &maxdelay_default),
 		 JSON_SCAN(json_to_bool, &exp_offers));
@@ -619,7 +627,7 @@ static void on_payment_success(struct payment *payment)
 		p->cmd = NULL;
 
 		ret = jsonrpc_stream_success(cmd);
-		json_add_node_id(ret, "destination", p->destination);
+		json_add_node_id(ret, "destination", p->pay_destination);
 		json_add_sha256(ret, "payment_hash", p->payment_hash);
 		json_add_timeabs(ret, "created_at", p->start_time);
 		json_add_num(ret, "parts", result.attempts);
@@ -745,7 +753,7 @@ static void on_payment_failure(struct payment *payment)
 			json_add_hex_talarr(ret, "raw_message",
 					    result.failure->raw_message);
 			json_add_num(ret, "created_at", p->start_time.ts.tv_sec);
-			json_add_node_id(ret, "destination", p->destination);
+			json_add_node_id(ret, "destination", p->pay_destination);
 			json_add_sha256(ret, "payment_hash", p->payment_hash);
 			// OK
 			if (result.leafstates & PAYMENT_STEP_SUCCESS) {
@@ -943,7 +951,7 @@ payment_listsendpays_previous(struct command *cmd, const char *buf,
 		json_add_string(ret, "status", "complete");
 		json_add_amount_msat(ret, "amount_msat", msat);
 		json_add_amount_msat(ret, "amount_sent_msat", sent);
-		json_add_node_id(ret, "destination", p->destination);
+		json_add_node_id(ret, "destination", p->pay_destination);
 		json_add_sha256(ret, "payment_hash", p->payment_hash);
 		json_add_u32(ret, "created_at", created_at);
 		json_add_num(ret, "parts", parts);
@@ -962,7 +970,7 @@ payment_listsendpays_previous(struct command *cmd, const char *buf,
 	p->on_payment_failure = on_payment_failure;
 
 	/* Bypass everything if we're doing (synchronous) self-pay */
-	if (node_id_eq(&my_id, p->destination))
+	if (node_id_eq(&my_id, p->pay_destination))
 		return selfpay(cmd, p);
 
 	payment_start(p);
@@ -970,7 +978,6 @@ payment_listsendpays_previous(struct command *cmd, const char *buf,
 }
 
 struct payment_modifier *paymod_mods[] = {
-	&check_preapproveinvoice_pay_mod,
 	/* NOTE: The order in which these four paymods are executed is
 	 * significant!
 	 * local_channel_hints *must* execute first before route_exclusions
@@ -999,7 +1006,6 @@ struct payment_modifier *paymod_mods[] = {
 	 */
 	&routehints_pay_mod,
 	&payee_incoming_limit_pay_mod,
-	&waitblockheight_pay_mod,
 	&retry_pay_mod,
 	&adaptive_splitter_pay_mod,
 	NULL,
@@ -1010,6 +1016,196 @@ static void destroy_payment(struct payment *p)
 	list_del(&p->list);
 }
 
+static struct command_result *
+start_payment(struct command *cmd, struct payment *p)
+{
+	struct out_req *req;
+
+	list_add_tail(&payments, &p->list);
+	tal_add_destructor(p, destroy_payment);
+	/* We're keeping this around now */
+	tal_steal(cmd->plugin, p);
+
+	req = jsonrpc_request_start(cmd->plugin, cmd, "listsendpays",
+				    payment_listsendpays_previous,
+				    payment_listsendpays_previous, p);
+
+	json_add_sha256(req->js, "payment_hash", p->payment_hash);
+	return send_outreq(cmd->plugin, req);
+}
+
+static bool scidtok_eq(const char *buf,
+		       const jsmntok_t *scidtok,
+		       struct short_channel_id scid)
+{
+	struct short_channel_id scid_from_tok;
+	if (!scidtok)
+		return false;
+
+	if (!json_to_short_channel_id(buf, scidtok, &scid_from_tok))
+		return false;
+
+	return short_channel_id_eq(scid, scid_from_tok);
+}
+
+/* We are the entry point, so the next hop could actually be an scid alias,
+ * so we can't just use gossmap. */
+static struct command_result *listpeerchannels_done(struct command *cmd,
+						    const char *buf,
+						    const jsmntok_t *result,
+						    struct payment *p)
+{
+	const jsmntok_t *arr, *t;
+	size_t i;
+
+	assert(!p->blindedpath->first_node_id.is_pubkey);
+	arr = json_get_member(buf, result, "channels");
+	json_for_each_arr(i, t, arr) {
+		const jsmntok_t *alias, *local_alias, *scid;
+		struct pubkey id;
+
+		alias = json_get_member(buf, t, "alias");
+		if (alias)
+			local_alias = json_get_member(buf, alias, "local");
+		else
+			local_alias = NULL;
+
+		scid = json_get_member(buf, t, "short_channel_id");
+		if (!scidtok_eq(buf, scid, p->blindedpath->first_node_id.scidd.scid)
+		    && !scidtok_eq(buf, local_alias, p->blindedpath->first_node_id.scidd.scid)) {
+			continue;
+		}
+
+		if (!json_to_pubkey(buf, json_get_member(buf, t, "peer_id"), &id))
+			plugin_err(cmd->plugin, "listpeerchannels no peer_id: %.*s",
+				   json_tok_full_len(result),
+				   json_tok_full(buf, result));
+
+		plugin_log(cmd->plugin, LOG_DBG,
+			   "Mapped decrypted next hop from %s -> %s",
+			   fmt_short_channel_id(tmpctx, p->blindedpath->first_node_id.scidd.scid),
+			   fmt_pubkey(tmpctx, &id));
+		sciddir_or_pubkey_from_pubkey(&p->blindedpath->first_node_id, &id);
+		/* Fix up our destination */
+		node_id_from_pubkey(p->route_destination, &p->blindedpath->first_node_id.pubkey);
+		return start_payment(cmd, p);
+	}
+
+	return command_fail(cmd, PAY_UNPARSEABLE_ONION,
+			    "Invalid next short_channel_id %s for second hop of onion",
+			    fmt_short_channel_id(tmpctx,
+						 p->blindedpath->first_node_id.scidd.scid));
+}
+
+static struct command_result *
+decrypt_done(struct command *cmd,
+	     const char *buf,
+	     const jsmntok_t *result,
+	     struct payment *p)
+{
+	const char *err;
+	u8 *encdata;
+	struct pubkey next_blinding;
+	struct tlv_encrypted_data_tlv *enctlv;
+	const u8 *cursor;
+	size_t maxlen;
+
+	err = json_scan(tmpctx, buf, result,
+			"{decryptencrypteddata:{decrypted:%"
+			",next_blinding:%}}",
+			JSON_SCAN_TAL(tmpctx, json_tok_bin_from_hex, &encdata),
+			JSON_SCAN(json_to_pubkey, &next_blinding));
+	if (err) {
+		return command_fail(cmd, LIGHTNINGD,
+				    "Bad decryptencrypteddata response? %.*s: %s",
+				    json_tok_full_len(result),
+				    json_tok_full(buf, result),
+				    err);
+	}
+
+	cursor = encdata;
+	maxlen = tal_bytelen(encdata);
+	enctlv = fromwire_tlv_encrypted_data_tlv(tmpctx, &cursor, &maxlen);
+	if (!enctlv) {
+		return command_fail(cmd, PAY_UNPARSEABLE_ONION,
+				    "Invalid TLV for blinded path: %s",
+				    tal_hex(tmpctx, encdata));
+	}
+
+	/* Was this a self-pay?  Simply remove blinded path. */
+	if (tal_count(p->blindedpath->path) == 1) {
+		p->blindedpath = tal_free(p->blindedpath);
+		tal_free(p->pay_destination);
+		p->pay_destination = tal_dup(p, struct node_id, p->route_destination);
+		/* self-pay will want secret from inside TLV */
+		if (tal_bytelen(enctlv->path_id) == sizeof(*p->payment_secret)) {
+			p->payment_secret = tal(p, struct secret);
+			memcpy(p->payment_secret, enctlv->path_id, sizeof(struct secret));
+		}
+		return start_payment(cmd, p);
+	}
+
+	/* Promote second hop to first hop */
+	if (enctlv->next_blinding_override)
+		p->blindedpath->blinding = *enctlv->next_blinding_override;
+	else
+		p->blindedpath->blinding = next_blinding;
+
+	/* Remove now-decrypted part of path */
+	tal_free(p->blindedpath->path[0]);
+	tal_arr_remove(&p->blindedpath->path, 0);
+
+	if (enctlv->next_node_id) {
+		sciddir_or_pubkey_from_pubkey(&p->blindedpath->first_node_id,
+					      enctlv->next_node_id);
+
+		/* Fix up our destination */
+		node_id_from_pubkey(p->route_destination, &p->blindedpath->first_node_id.pubkey);
+		return start_payment(cmd, p);
+	} else if (enctlv->short_channel_id) {
+		/* We need to resolve this: stash in first_node_id for now. */
+		struct out_req *req;
+
+		p->blindedpath->first_node_id.is_pubkey = false;
+		p->blindedpath->first_node_id.scidd.scid = *enctlv->short_channel_id;
+
+		req = jsonrpc_request_with_filter_start(cmd->plugin, cmd, "listpeerchannels",
+							"{\"channels\":[{\"peer_id\":true,\"short_channel_id\":true,\"alias\":{\"local\":true}}]}",
+							listpeerchannels_done, forward_error, p);
+		return send_outreq(cmd->plugin, req);
+	} else {
+		return command_fail(cmd, PAY_UNPARSEABLE_ONION,
+				    "Invalid TLV for blinded path (no next!): %s",
+				    tal_hex(tmpctx, encdata));
+	}
+}
+
+static struct command_result *
+preapproveinvoice_succeed(struct command *cmd,
+			  const char *buf,
+			  const jsmntok_t *result,
+			  struct payment *p)
+{
+	/* Now we can conclude `check` command */
+	if (command_check_only(cmd)) {
+		return command_check_done(cmd);
+	}
+
+	/* Blinded path which starts at us needs decryption. */
+	if (p->blindedpath && node_id_eq(p->route_destination, &my_id)) {
+		struct out_req *req;
+
+		req = jsonrpc_request_start(cmd->plugin, cmd, "decryptencrypteddata",
+					    decrypt_done, forward_error, p);
+
+		json_add_hex_talarr(req->js, "encrypted_data",
+				    p->blindedpath->path[0]->encrypted_recipient_data);
+		json_add_pubkey(req->js, "blinding", &p->blindedpath->blinding);
+		return send_outreq(cmd->plugin, req);
+	}
+
+	return start_payment(cmd, p);
+}
 static struct command_result *json_pay(struct command *cmd,
 				       const char *buf,
 				       const jsmntok_t *params)
@@ -1036,7 +1232,7 @@ static struct command_result *json_pay(struct command *cmd,
 	/* If any of the modifiers need to add params to the JSON-RPC call we
 	 * would add them to the `param()` call below, and have them be
 	 * initialized directly that way. */
-	if (!param(cmd, buf, params,
+	if (!param_check(cmd, buf, params,
 		   /* FIXME: parameter should be invstring now */
 		   p_req("bolt11", param_invstring, &b11str),
 		   p_opt("amount_msat", param_msat, &msat),
@@ -1065,6 +1261,8 @@ static struct command_result *json_pay(struct command *cmd,
 	p->blindedpath = NULL;
 	p->blindedpay = NULL;
 
+	paymod_log(p, LOG_INFORM, "Paying invoice bolt11=%s", b11str);
+
 	if (!bolt12_has_prefix(b11str)) {
 		b11 =
 		    bolt11_decode(tmpctx, b11str, plugin_feature_set(cmd->plugin),
@@ -1076,7 +1274,8 @@ static struct command_result *json_pay(struct command *cmd,
 		invmsat = b11->msat;
 		invexpiry = b11->timestamp + b11->expiry;
 
-		p->destination = tal_dup(p, struct node_id, &b11->receiver_id);
+		p->pay_destination = tal_dup(p, struct node_id, &b11->receiver_id);
+		p->route_destination = p->pay_destination;
 		p->payment_hash = tal_dup(p, struct sha256, &b11->payment_hash);
 		p->payment_secret =
 			tal_dup_or_null(p, struct secret, b11->payment_secret);
@@ -1126,8 +1325,8 @@ static struct command_result *json_pay(struct command *cmd,
 		invmsat = tal(cmd, struct amount_msat);
 		*invmsat = amount_msat(*b12->invoice_amount);
 
-		p->destination = tal(p, struct node_id);
-		node_id_from_pubkey(p->destination, b12->invoice_node_id);
+		p->pay_destination = tal(p, struct node_id);
+		node_id_from_pubkey(p->pay_destination, b12->invoice_node_id);
 		p->payment_hash = tal_dup(p, struct sha256,
 					  b12->invoice_payment_hash);
 		if (b12->invreq_recurrence_counter && !label)
@@ -1142,6 +1341,10 @@ static struct command_result *json_pay(struct command *cmd,
 		if (tal_count(b12->invoice_paths) == 0)
 			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 					    "invoice missing invoice_paths");
+
+		if (tal_count(b12->invoice_paths[0]->path) < 1)
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "empty invoice_path[0]");
 
 		/* BOLT-offers #12:
 		 * - MUST reject the invoice if `invoice_blindedpay` does not
@@ -1158,10 +1361,18 @@ static struct command_result *json_pay(struct command *cmd,
 		/* FIXME: do MPP across these!  We choose first one. */
 		p->blindedpath = tal_steal(p, b12->invoice_paths[0]);
 		p->blindedpay = tal_steal(p, b12->invoice_blindedpay[0]);
+
+		if (!gossmap_scidd_pubkey(get_raw_gossmap(p), &p->blindedpath->first_node_id)) {
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "First hop of blinding scid %s unknown",
+					    fmt_short_channel_id_dir(tmpctx,
+								     &p->blindedpath->first_node_id.scidd));
+		}
 		p->min_final_cltv_expiry = p->blindedpay->cltv_expiry_delta;
 
-		/* Set destination to introduction point */
-		node_id_from_pubkey(p->destination, &p->blindedpath->first_node_id);
+		/* Set route destination to introduction point */
+		p->route_destination = tal(p, struct node_id);
+		node_id_from_pubkey(p->route_destination, &p->blindedpath->first_node_id.pubkey);
 		p->payment_metadata = NULL;
 		p->routes = NULL;
 		/* BOLT-offers #12:
@@ -1179,6 +1390,9 @@ static struct command_result *json_pay(struct command *cmd,
 		else
 			invexpiry = *b12->invoice_created_at + BOLT12_DEFAULT_REL_EXPIRY;
 		p->local_invreq_id = tal_steal(p, local_invreq_id);
+
+		/* No payment secrets in bolt 12 (we use path_secret) */
+		p->payment_secret = NULL;
 	}
 
 	if (time_now().ts.tv_sec > invexpiry)
@@ -1205,7 +1419,7 @@ static struct command_result *json_pay(struct command *cmd,
 					    "partial_msat must be less or equal to total amount %s",
 					    fmt_amount_msat(tmpctx, p->final_amount));
 		}
-		if (node_id_eq(&my_id, p->destination)) {
+		if (node_id_eq(&my_id, p->pay_destination)) {
 			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 					    "partial_msat not supported (yet?) for self-pay");
 		}
@@ -1217,11 +1431,9 @@ static struct command_result *json_pay(struct command *cmd,
 
 	/* We replace real final values if we're using a blinded path */
 	if (p->blindedpath) {
-		p->blindedfinalcltv = p->min_final_cltv_expiry;
 		p->blindedouramount = p->our_amount;
 		p->blindedfinalamount = p->final_amount;
 
-		p->min_final_cltv_expiry += p->blindedpay->cltv_expiry_delta;
 		if (!amount_msat_add_fee(&p->final_amount,
 					 p->blindedpay->fee_base_msat,
 					 p->blindedpay->fee_proportional_millionths)
@@ -1279,38 +1491,32 @@ static struct command_result *json_pay(struct command *cmd,
 	tal_free(dev_use_shadow);
 
 	p->label = tal_steal(p, label);
-	list_add_tail(&payments, &p->list);
-	tal_add_destructor(p, destroy_payment);
-	/* We're keeping this around now */
-	tal_steal(cmd->plugin, p);
 
-	req = jsonrpc_request_start(cmd->plugin, cmd, "listsendpays",
-				    payment_listsendpays_previous,
-				    payment_listsendpays_previous, p);
-
-	json_add_sha256(req->js, "payment_hash", p->payment_hash);
+	/* Now preapprove, then start payment. */
+	if (command_check_only(cmd)) {
+		req = jsonrpc_request_start(p->plugin, cmd, "check",
+					    &preapproveinvoice_succeed,
+					    &forward_error, p);
+		json_add_string(req->js, "command_to_check", "preapproveinvoice");
+	} else {
+		req = jsonrpc_request_start(p->plugin, cmd, "preapproveinvoice",
+					    &preapproveinvoice_succeed,
+					    &forward_error, p);
+	}
+	json_add_string(req->js, "bolt11", p->invstring);
 	return send_outreq(cmd->plugin, req);
 }
 
 static const struct plugin_command commands[] = {
 	{
 		"paystatus",
-		"payment",
-		"Detail status of attempts to pay {bolt11}, or all",
-		"Covers both old payments and current ones.",
 		json_paystatus
 	}, {
 		"listpays",
-		"payment",
-		"List result of payment {bolt11} or {payment_hash}, or all",
-		"Covers old payments (failed and succeeded) and current ones.",
 		json_listpays
 	},
 	{
 		"pay",
-		"payment",
-		"Send payment specified by {bolt11}",
-		"Attempt to pay the {bolt11} invoice.",
 		json_pay
 	},
 };
@@ -1318,17 +1524,18 @@ static const struct plugin_command commands[] = {
 static const char *notification_topics[] = {
 	"pay_success",
 	"pay_failure",
+	"channel_hint_update",
 };
 
 int main(int argc, char *argv[])
 {
 	setup_locale();
-	plugin_main(argv, init, PLUGIN_RESTARTABLE, true, NULL, commands,
+	plugin_main(argv, init, NULL, PLUGIN_RESTARTABLE, true, NULL, commands,
 		    ARRAY_SIZE(commands), NULL, 0, NULL, 0,
 		    notification_topics, ARRAY_SIZE(notification_topics),
 		    plugin_option("disable-mpp", "flag",
 				  "Disable multi-part payments.",
-				  flag_option, &disablempp),
+				  flag_option, flag_jsonfmt, &disablempp),
 		    NULL);
 	io_poll_override(libplugin_pay_poll);
 }

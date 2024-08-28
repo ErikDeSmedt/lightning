@@ -7,6 +7,7 @@
 #include <ccan/str/hex/hex.h>
 #include <ccan/tal/str/str.h>
 #include <common/blindedpath.h>
+#include <common/bolt12_id.h>
 #include <common/bolt12_merkle.h>
 #include <common/dijkstra.h>
 #include <common/gossmap.h>
@@ -14,16 +15,17 @@
 #include <common/json_param.h>
 #include <common/json_stream.h>
 #include <common/memleak.h>
+#include <common/onion_message.h>
 #include <common/overflows.h>
 #include <common/route.h>
 #include <errno.h>
+#include <plugins/establish_onion_path.h>
+#include <plugins/fetchinvoice.h>
 #include <plugins/libplugin.h>
+#include <plugins/offers.h>
 #include <secp256k1_schnorrsig.h>
 #include <sodium.h>
 
-static struct gossmap *global_gossmap;
-static struct pubkey local_id;
-static bool disable_connect = false;
 static LIST_HEAD(sent_list);
 
 struct sent {
@@ -35,8 +37,20 @@ struct sent {
 	struct command *cmd;
 	/* The offer we are trying to get an invoice/payment for. */
 	struct tlv_offer *offer;
-	/* Path to use (including self) */
-	struct pubkey *path;
+
+	/* Blinded paths they told us to use (if any) */
+	struct blinded_path **their_paths;
+	/* Direct destination (used iff no their_paths) */
+	struct pubkey *direct_dest;
+	/* Key we expect to sign the invoice: the offer_issuer_id if
+	 * present, otherwise the end blinded path we sent to. */
+	struct pubkey *issuer_key;
+
+	/* When creating blinded return path, use scid not pubkey for intro node. */
+	struct short_channel_id_dir *dev_path_use_scidd;
+
+	/* Force reply path, for testing. */
+	struct pubkey *dev_reply_path;
 
 	/* The invreq we sent, OR the invoice we sent */
 	struct tlv_invoice_request *invreq;
@@ -126,23 +140,28 @@ static struct command_result *handle_error(struct command *cmd,
 
 /* BOLT-offers #12:
  * - if the invoice is a response to an `invoice_request`:
- *   - MUST reject the invoice if all fields less than type 160 do not
- *     exactly match the `invoice_request`.
+ *    - MUST reject the invoice if all fields in ranges 0 to 159 and 1000000000 to 2999999999 (inclusive) do not exactly match the `invoice_request`.
  */
 static bool invoice_matches_request(struct command *cmd,
 				    const u8 *invbin,
 				    const struct tlv_invoice_request *invreq)
 {
-	size_t len1, len2;
+	size_t ir_len1, ir_len2, ir_start1, ir_start2;
+	size_t inv_len1, inv_len2, inv_start1, inv_start2;
 	u8 *wire;
 
 	/* We linearize then strip signature.  This is dumb! */
 	wire = tal_arr(tmpctx, u8, 0);
 	towire_tlv_invoice_request(&wire, invreq);
-	len1 = tlv_span(wire, 0, 159, NULL);
+	ir_len1 = tlv_span(wire, 0, 159, &ir_start1);
+	ir_len2 = tlv_span(wire, 1000000000, 2999999999, &ir_start2);
 
-	len2 = tlv_span(invbin, 0, 159, NULL);
-	return memeq(wire, len1, invbin, len2);
+	inv_len1 = tlv_span(invbin, 0, 159, &inv_start1);
+	inv_len2 = tlv_span(invbin, 1000000000, 2999999999, &inv_start2);
+	return memeq(wire + ir_start1, ir_len1,
+		     invbin + inv_start1, inv_len1)
+		&& memeq(wire + ir_start2, ir_len2,
+			 invbin + inv_start2, inv_len2);
 }
 
 static struct command_result *handle_invreq_response(struct command *cmd,
@@ -192,8 +211,9 @@ static struct command_result *handle_invreq_response(struct command *cmd,
 
 	/* BOLT-offers #12:
 	 * - if the invoice is a response to an `invoice_request`:
-	 *   - MUST reject the invoice if all fields less than type 160 do not
-	 *     exactly match the `invoice_request`.
+	 * - MUST reject the invoice if all fields in ranges 0 to 159 and
+         *   1000000000 to 2999999999 (inclusive) do not exactly match the
+         *   `invoice_request`.
 	 */
 	if (!invoice_matches_request(cmd, invbin, sent->invreq)) {
 		badfield = "invoice_request match";
@@ -201,10 +221,37 @@ static struct command_result *handle_invreq_response(struct command *cmd,
 	}
 
 	/* BOLT-offers #12:
-	 *     - if `offer_node_id` is present (invoice_request for an offer):
-	 * 	  - MUST reject the invoice if `invoice_node_id` is not equal to `offer_node_id`.
+	 * A reader of an invoice:
+	 *   - MUST reject the invoice if `invoice_amount` is not present.
+	 *   - MUST reject the invoice if `invoice_created_at` is not present.
+	 *   - MUST reject the invoice if `invoice_payment_hash` is not present.
+	 *   - MUST reject the invoice if `invoice_node_id` is not present.
 	 */
-	if (!inv->invoice_node_id || !pubkey_eq(inv->offer_node_id, inv->invoice_node_id)) {
+	if (!inv->invoice_amount) {
+		badfield = "invoice_amount";
+		goto badinv;
+	}
+	if (!inv->invoice_created_at) {
+		badfield = "invoice_amount";
+		goto badinv;
+	}
+	if (!inv->invoice_payment_hash) {
+		badfield = "invoice_payment_hash";
+		goto badinv;
+	}
+	if (!inv->invoice_node_id) {
+		badfield = "invoice_node_id";
+		goto badinv;
+	}
+	/* BOLT-offers #12:
+	 * - if `offer_issuer_id` is present (invoice_request for an offer):
+	 *   - MUST reject the invoice if `invoice_node_id` is not equal to `offer_issuer_id`
+	 * - otherwise, if `offer_paths` is present (invoice_request for an offer without id):
+	 *   - MUST reject the invoice if `invoice_node_id` is not equal to the final
+	 *    `blinded_node_id` it sent the `invoice_request` to.
+	 */
+	/* Either way, we save the expected id in issuer_key */
+	if (!pubkey_eq(inv->invoice_node_id, sent->issuer_key)) {
 		badfield = "invoice_node_id";
 		goto badinv;
 	}
@@ -219,15 +266,6 @@ static struct command_result *handle_invreq_response(struct command *cmd,
 	if (!inv->signature
 	    || !check_schnorr_sig(&sighash, &inv->invoice_node_id->pubkey, inv->signature)) {
 		badfield = "signature";
-		goto badinv;
-	}
-
-	/* BOLT-offers #12:
-	 * A reader of an invoice:
-	 *   - MUST reject the invoice if `invoice_amount` is not present.
-	 */
-	if (!inv->invoice_amount) {
-		badfield = "invoice_amount";
 		goto badinv;
 	}
 
@@ -327,31 +365,21 @@ badinv:
 	return command_hook_success(cmd);
 }
 
-static struct command_result *recv_modern_onion_message(struct command *cmd,
-							const char *buf,
-							const jsmntok_t *params)
+struct command_result *handle_invoice_onion_message(struct command *cmd,
+						    const char *buf,
+						    const jsmntok_t *om,
+						    const struct secret *pathsecret)
 {
-	const jsmntok_t *om, *secrettok;
 	struct sent *sent;
-	struct secret pathsecret;
 	struct command_result *err;
 
-	om = json_get_member(buf, params, "onion_message");
+	sent = find_sent_by_secret(pathsecret);
+	if (!sent)
+		return NULL;
 
-	secrettok = json_get_member(buf, om, "pathsecret");
-	json_to_secret(buf, secrettok, &pathsecret);
-	sent = find_sent_by_secret(&pathsecret);
-	if (!sent) {
-		plugin_log(cmd->plugin, LOG_DBG,
-			   "No match for modern onion %.*s",
-			   json_tok_full_len(om),
-			   json_tok_full(buf, om));
-		return command_hook_success(cmd);
-	}
-
-	plugin_log(cmd->plugin, LOG_DBG, "Received modern onion message: %.*s",
-		   json_tok_full_len(params),
-		   json_tok_full(buf, params));
+	plugin_log(cmd->plugin, LOG_DBG, "Received onion message reply for invoice_request: %.*s",
+		   json_tok_full_len(om),
+		   json_tok_full(buf, om));
 
 	err = handle_error(cmd, sent, buf, om);
 	if (err)
@@ -360,7 +388,7 @@ static struct command_result *recv_modern_onion_message(struct command *cmd,
 	if (sent->invreq)
 		return handle_invreq_response(cmd, sent, buf, om);
 
-	return command_hook_success(cmd);
+	return NULL;
 }
 
 static void destroy_sent(struct sent *sent)
@@ -384,35 +412,7 @@ static struct command_result *sendonionmsg_done(struct command *cmd,
 	tal_steal(cmd, plugin_timer(cmd->plugin,
 				    time_from_sec(sent->wait_timeout),
 				    timeout_sent_invreq, sent));
-	sent->cmd = cmd;
-	list_add_tail(&sent_list, &sent->list);
-	tal_add_destructor(sent, destroy_sent);
 	return command_still_pending(cmd);
-}
-
-static void init_gossmap(struct plugin *plugin)
-{
-	size_t num_cupdates_rejected;
-	global_gossmap
-		= notleak_with_children(gossmap_load(NULL,
-						     GOSSIP_STORE_FILENAME,
-						     &num_cupdates_rejected));
-	if (!global_gossmap)
-		plugin_err(plugin, "Could not load gossmap %s: %s",
-			   GOSSIP_STORE_FILENAME, strerror(errno));
-	if (num_cupdates_rejected)
-		plugin_log(plugin, LOG_DBG,
-			   "gossmap ignored %zu channel updates",
-			   num_cupdates_rejected);
-}
-
-static struct gossmap *get_gossmap(struct plugin *plugin)
-{
-	if (!global_gossmap)
-		init_gossmap(plugin);
-	else
-		gossmap_refresh(global_gossmap, NULL);
-	return global_gossmap;
 }
 
 static struct command_result *param_offer(struct command *cmd,
@@ -434,231 +434,187 @@ static struct command_result *param_offer(struct command *cmd,
 	return NULL;
 }
 
-static bool can_carry_onionmsg(const struct gossmap *map,
-			       const struct gossmap_chan *c,
-			       int dir,
-			       struct amount_msat amount UNUSED,
-			       void *arg UNUSED)
+static struct blinded_path *make_reply_path(const tal_t *ctx,
+					    struct plugin *plugin,
+					    const struct sent *sent,
+					    const struct pubkey *path,
+					    struct secret *reply_secret)
 {
-	const struct gossmap_node *n;
-	/* Don't use it if either side says it's disabled */
-	if (!c->half[dir].enabled || !c->half[!dir].enabled)
-		return false;
+	struct pubkey *ids;
 
-	/* Check features of recipient */
-	n = gossmap_nth_node(map, c, !dir);
-	return gossmap_node_get_feature(map, n, OPT_ONION_MESSAGES) != -1;
-}
+	assert(tal_count(path) > 0);
 
-static struct pubkey *path_to_node(const tal_t *ctx,
-				   struct plugin *plugin,
-				   const char *buf,
-				   const jsmntok_t *listpeerchannels,
-				   const struct pubkey *node_id)
-{
-	struct route_hop *r;
-	const struct dijkstra *dij;
-	const struct gossmap_node *src;
-	const struct gossmap_node *dst;
-	struct node_id dstid, local_nodeid;
-	struct pubkey *nodes;
-	struct gossmap *gossmap;
-	struct gossmap_localmods *mods;
+	randombytes_buf(reply_secret, sizeof(struct secret));
 
-	node_id_from_pubkey(&local_nodeid, &local_id);
-	node_id_from_pubkey(&dstid, node_id);
+	if (sent->dev_reply_path) {
+		ids = sent->dev_reply_path;
+	} else if (tal_count(path) == 1) {
+		/* Talking to ourselves?  Reverse is the same */
+		ids = tal_dup_talarr(tmpctx, struct pubkey, path);
+	} else {
+		size_t nhops = tal_count(path), start;
+		struct node_id second_last;
 
-	mods = gossmods_from_listpeerchannels(tmpctx, &local_nodeid,
-					      buf, listpeerchannels, false,
-					      gossmod_add_localchan, NULL);
+		/* Usually we have path A->B->C and we make
+		 * reply B->A.  But if B is not public,
+		 * we need to use the full thing.
+		 *
+		 * This happens when we connect directly to the
+		 * head of a blinded path, but we're not a public
+		 * node.
+		 */
+		node_id_from_pubkey(&second_last, &path[nhops-2]);
+		if (!gossmap_find_node(get_gossmap(plugin), &second_last))
+			start = nhops - 1;
+		else
+			start = nhops - 2;
 
-	gossmap = get_gossmap(plugin);
-	gossmap_apply_localmods(gossmap, mods);
-	dst = gossmap_find_node(gossmap, &dstid);
-	if (!dst)
-		goto fail;
-
-	/* If we don't exist in gossip, routing can't happen. */
-	src = gossmap_find_node(gossmap, &local_nodeid);
-	if (!src)
-		goto fail;
-
-	dij = dijkstra(tmpctx, gossmap, dst, AMOUNT_MSAT(0), 0,
-		       can_carry_onionmsg, route_score_shorter, NULL);
-
-	r = route_from_dijkstra(tmpctx, gossmap, dij, src, AMOUNT_MSAT(0), 0);
-	if (!r)
-		goto fail;
-
-	nodes = tal_arr(ctx, struct pubkey, tal_count(r) + 1);
-	nodes[0] = local_id;
-	for (size_t i = 0; i < tal_count(r); i++) {
-		if (!pubkey_from_node_id(&nodes[i+1], &r[i].node_id)) {
-			plugin_err(plugin, "Could not convert nodeid %s",
-				   fmt_node_id(tmpctx, &r[i].node_id));
-		}
+		/* FIXME: Could create an independent reply path, not just
+		 * reverse existing. */
+		ids = tal_arr(tmpctx, struct pubkey, start + 1);
+		for (int i = start; i >= 0; i--)
+			ids[start - i] = path[i];
 	}
 
-	gossmap_remove_localmods(gossmap, mods);
-	return nodes;
+	plugin_log(plugin, LOG_DBG, "Reply path:");
+	for (size_t i = 0; i < tal_count(ids); i++)
+		plugin_log(plugin, LOG_DBG, "...%s", fmt_pubkey(tmpctx, &ids[i]));
 
-fail:
-	gossmap_remove_localmods(gossmap, mods);
-	return NULL;
+	/* Reply path */
+	return incoming_message_blinded_path(ctx, ids, NULL, reply_secret);
 }
 
-/* Marshal arguments for sending onion messages */
-struct sending {
+/* Container while we're establishing paths */
+struct establishing_paths {
+	/* Index into sent->their_paths, if that's not NULL */
+	int which_blinded_path;
 	struct sent *sent;
-	struct tlv_onionmsg_tlv *payload;
+	struct tlv_onionmsg_tlv *final_tlv;
 	struct command_result *(*done)(struct command *cmd,
 				       const char *buf UNUSED,
 				       const jsmntok_t *result UNUSED,
 				       struct sent *sent);
 };
 
-static struct command_result *
-send_modern_message(struct command *cmd,
-		    struct blinded_path *reply_path,
-		    struct sending *sending)
+static const struct blinded_path *current_their_path(const struct establishing_paths *epaths)
 {
-	struct sent *sent = sending->sent;
-	struct privkey blinding_iter;
-	struct pubkey fwd_blinding, *node_alias;
-	size_t nhops = tal_count(sent->path);
-	struct tlv_onionmsg_tlv **payloads;
-	struct out_req *req;
-	struct tlv_encrypted_data_tlv *tlv;
-
-	/* Now create enctlvs for *forward* path. */
-	randombytes_buf(&blinding_iter, sizeof(blinding_iter));
-	if (!pubkey_from_privkey(&blinding_iter, &fwd_blinding))
-		return command_fail(cmd, LIGHTNINGD,
-				    "Could not convert blinding %s to pubkey!",
-				    fmt_privkey(tmpctx, &blinding_iter));
-
-	/* We overallocate: this node (0) doesn't have payload or alias */
-	payloads = tal_arr(cmd, struct tlv_onionmsg_tlv *, nhops);
-	node_alias = tal_arr(cmd, struct pubkey, nhops);
-
-	for (size_t i = 1; i < nhops - 1; i++) {
-		payloads[i] = tlv_onionmsg_tlv_new(payloads);
-
-		tlv = tlv_encrypted_data_tlv_new(tmpctx);
-		tlv->next_node_id = &sent->path[i+1];
-		/* FIXME: Pad? */
-
-		payloads[i]->encrypted_recipient_data
-			= encrypt_tlv_encrypted_data(payloads[i],
-						     &blinding_iter,
-						     &sent->path[i],
-						     tlv,
-						     &blinding_iter,
-						     &node_alias[i]);
-	}
-	/* Final payload contains the actual data. */
-	payloads[nhops-1] = sending->payload;
-
-	/* We don't include enctlv in final, but it gives us final alias */
-	tlv = tlv_encrypted_data_tlv_new(tmpctx);
-	if (!encrypt_tlv_encrypted_data(tmpctx,
-					&blinding_iter,
-					&sent->path[nhops-1],
-					tlv,
-					NULL,
-					&node_alias[nhops-1])) {
-		/* Should not happen! */
-		return command_fail(cmd, LIGHTNINGD,
-				    "Could create final enctlv");
-	}
-
-	payloads[nhops-1]->reply_path = reply_path;
-
-	req = jsonrpc_request_start(cmd->plugin, cmd, "sendonionmessage",
-				    sending->done,
-				    forward_error,
-				    sending->sent);
-	json_add_pubkey(req->js, "first_id", &sent->path[1]);
-	json_add_pubkey(req->js, "blinding", &fwd_blinding);
-	json_array_start(req->js, "hops");
-	for (size_t i = 1; i < nhops; i++) {
-		u8 *tlvbin;
-		json_object_start(req->js, NULL);
-		json_add_pubkey(req->js, "id", &node_alias[i]);
-		tlvbin = tal_arr(tmpctx, u8, 0);
-		towire_tlv_onionmsg_tlv(&tlvbin, payloads[i]);
-		json_add_hex_talarr(req->js, "tlv", tlvbin);
-		json_object_end(req->js);
-	}
-	json_array_end(req->js);
-	return send_outreq(cmd->plugin, req);
+	if (epaths->sent->direct_dest)
+		return NULL;
+	assert(epaths->which_blinded_path < tal_count(epaths->sent->their_paths));
+	return epaths->sent->their_paths[epaths->which_blinded_path];
 }
 
-/* Lightningd gives us reply path, since we don't know secret to put
- * in final so it will recognize it. */
-static struct command_result *use_reply_path(struct command *cmd,
-					     const char *buf,
-					     const jsmntok_t *result,
-					     struct sending *sending)
+static struct command_result *establish_path_done(struct command *cmd,
+						  const struct pubkey *path,
+						  struct establishing_paths *epaths)
 {
-	struct blinded_path *rpath;
-
-	rpath = json_to_blinded_path(cmd, buf,
-				     json_get_member(buf, result, "blindedpath"));
-	if (!rpath)
-		plugin_err(cmd->plugin,
-			   "could not parse reply path %.*s?",
-			   json_tok_full_len(result),
-			   json_tok_full(buf, result));
-
-	return send_modern_message(cmd, rpath, sending);
-}
-
-static struct command_result *make_reply_path(struct command *cmd,
-					      struct sending *sending)
-{
-	struct out_req *req;
-	size_t nhops = tal_count(sending->sent->path);
-
-	/* FIXME: Maybe we should allow this? */
-	if (tal_count(sending->sent->path) == 1)
-		return command_fail(cmd, PAY_ROUTE_NOT_FOUND,
-				    "Refusing to talk to ourselves");
+	struct onion_message *omsg;
+	struct sent *sent = epaths->sent;
+	struct tlv_onionmsg_tlv *final_tlv = epaths->final_tlv;
 
 	/* Create transient secret so we can validate reply! */
-	sending->sent->reply_secret = tal(sending->sent, struct secret);
-	randombytes_buf(sending->sent->reply_secret, sizeof(struct secret));
+	sent->reply_secret = tal(sent, struct secret);
 
-	req = jsonrpc_request_start(cmd->plugin, cmd, "blindedpath",
-				    use_reply_path,
-				    forward_error,
-				    sending);
+	assert(tal_count(path) > 0);
 
-	/* FIXME: Could create an independent reply path, not just
-	 * reverse existing. */
-	json_array_start(req->js, "ids");
-	for (int i = nhops - 2; i >= 0; i--)
-		json_add_pubkey(req->js, NULL, &sending->sent->path[i]);
-	json_array_end(req->js);
-	json_add_secret(req->js, "pathsecret", sending->sent->reply_secret);
-	return send_outreq(cmd->plugin, req);
+	/* Add reply path to final_tlv (it already contains invoice_request/invoice) */
+	final_tlv->reply_path = make_reply_path(final_tlv, cmd->plugin, sent, path, sent->reply_secret);
+
+	/* Replace first hop with scidd if they said to */
+	if (sent->dev_path_use_scidd)
+		sciddir_or_pubkey_from_scidd(&final_tlv->reply_path->first_node_id,
+					     sent->dev_path_use_scidd);
+
+	/* Put in list so we recognize reply onion message.  Note: because
+	 * onion message notification comes from a different fd than the one
+	 * we send this command to, it can actually be processed *before* we
+	 * call done() */
+	sent->cmd = cmd;
+	list_add_tail(&sent_list, &sent->list);
+	tal_add_destructor(sent, destroy_sent);
+
+	omsg = outgoing_onion_message(tmpctx, path, NULL, current_their_path(epaths), final_tlv);
+	return inject_onionmessage(cmd, omsg, epaths->done, forward_error, sent);
+}
+
+/* Mutual recursion */
+static struct command_result *try_establish(struct command *cmd,
+					    struct establishing_paths *epaths);
+
+static struct command_result *establish_path_fail(struct command *cmd,
+						  const char *why,
+						  struct establishing_paths *epaths)
+{
+	const struct blinded_path *bpath = current_their_path(epaths);
+
+	/* No blinded paths?  We fail to establish connection directly */
+	if (epaths->sent->direct_dest) {
+		return command_fail(cmd, OFFER_ROUTE_NOT_FOUND,
+				    "Failed: could not route or connect directly to %s: %s",
+				    fmt_pubkey(tmpctx, epaths->sent->direct_dest), why);
+	}
+
+	plugin_log(cmd->plugin, LOG_DBG, "establish path to %s failed: %s",
+		   fmt_sciddir_or_pubkey(tmpctx, &bpath->first_node_id), why);
+	if (epaths->which_blinded_path == tal_count(epaths->sent->their_paths) - 1) {
+		return command_fail(cmd, OFFER_ROUTE_NOT_FOUND,
+				    "Failed: could not route or connect directly to blinded path at %s: %s",
+				    fmt_sciddir_or_pubkey(tmpctx, &bpath->first_node_id),
+				    why);
+	}
+
+	/* Try the next one */
+	epaths->which_blinded_path++;
+	return try_establish(cmd, epaths);
+}
+
+static struct command_result *try_establish(struct command *cmd,
+					    struct establishing_paths *epaths)
+{
+	struct pubkey target;
+
+	if (epaths->sent->direct_dest) {
+		target = *epaths->sent->direct_dest;
+	} else {
+		const struct blinded_path *bpath = current_their_path(epaths);
+		struct sciddir_or_pubkey first = bpath->first_node_id;
+		if (!gossmap_scidd_pubkey(get_gossmap(cmd->plugin), &first))
+			return establish_path_fail(cmd, "Cannot resolve scidd", epaths);
+		target = first.pubkey;
+		/* BOLT-offers #12:
+		 *     - if `offer_issuer_id` is present (invoice_request for an offer):
+		 *       - MUST reject the invoice if `invoice_node_id` is not equal to `offer_issuer_id`
+		 *     - otherwise, if `offer_paths` is present (invoice_request for an offer without id):
+		 *       - MUST reject the invoice if `invoice_node_id` is not equal to the final `blinded_node_id` it sent the `invoice_request` to.
+		 */
+		if (epaths->sent->offer && !epaths->sent->offer->offer_issuer_id)
+			epaths->sent->issuer_key = &bpath->path[tal_count(bpath->path)-1]->blinded_node_id;
+	}
+
+	return establish_onion_path(cmd, get_gossmap(cmd->plugin), &id, &target,
+				    disable_connect,
+				    establish_path_done,
+				    establish_path_fail,
+				    epaths);
 }
 
 static struct command_result *send_message(struct command *cmd,
 					   struct sent *sent,
-					   struct tlv_onionmsg_tlv *payload STEALS,
+					   struct tlv_onionmsg_tlv *final_tlv STEALS,
 					   struct command_result *(*done)
 					   (struct command *cmd,
 					    const char *buf UNUSED,
 					    const jsmntok_t *result UNUSED,
 					    struct sent *sent))
 {
-	struct sending *sending = tal(cmd, struct sending);
-	sending->sent = sent;
-	sending->payload = tal_steal(sending, payload);
-	sending->done = done;
+	struct establishing_paths *epaths = tal(sent, struct establishing_paths);
 
-	return make_reply_path(cmd, sending);
+	epaths->which_blinded_path = 0;
+	epaths->sent = sent;
+	epaths->final_tlv = tal_steal(epaths, final_tlv);
+	epaths->done = done;
+
+	return try_establish(cmd, epaths);
 }
 
 /* We've received neither a reply nor a payment; return failure. */
@@ -687,114 +643,14 @@ static struct command_result *prepare_inv_timeout(struct command *cmd,
 	return sendonionmsg_done(cmd, buf, result, sent);
 }
 
-/* We've connected (if we tried), so send the invreq. */
-static struct command_result *
-sendinvreq_after_connect(struct command *cmd,
-			 const char *buf UNUSED,
-			 const jsmntok_t *result UNUSED,
-			 struct sent *sent)
-{
-	struct tlv_onionmsg_tlv *payload = tlv_onionmsg_tlv_new(sent);
-
-	payload->invoice_request = tal_arr(payload, u8, 0);
-	towire_tlv_invoice_request(&payload->invoice_request, sent->invreq);
-
-	return send_message(cmd, sent, payload, sendonionmsg_done);
-}
-
-struct connect_attempt {
-	struct node_id node_id;
-	struct command_result *(*cb)(struct command *command,
-				     const char *buf,
-				     const jsmntok_t *result,
-				     struct sent *sent);
-	struct sent *sent;
-};
-
-static struct command_result *connected(struct command *command,
-					const char *buf,
-					const jsmntok_t *result,
-					struct connect_attempt *ca)
-{
-	return ca->cb(command, buf, result, ca->sent);
-}
-
-static struct command_result *connect_failed(struct command *command,
-					     const char *buf,
-					     const jsmntok_t *result,
-					     struct connect_attempt *ca)
-{
-	return command_done_err(command, OFFER_ROUTE_NOT_FOUND,
-				"Failed: could not route, could not connect",
-				NULL);
-}
-
-/* We can't find a route, so we're going to try to connect, then just blast it
- * to them. */
-static struct command_result *
-connect_direct(struct command *cmd,
-	       const struct pubkey *dst,
-	       struct command_result *(*cb)(struct command *command,
-					    const char *buf,
-					    const jsmntok_t *result,
-					    struct sent *sent),
-	       struct sent *sent)
-{
-	struct out_req *req;
-	struct connect_attempt *ca = tal(cmd, struct connect_attempt);
-
-	ca->cb = cb;
-	ca->sent = sent;
-	node_id_from_pubkey(&ca->node_id, dst);
-
-	/* Make a direct path -> dst. */
-	sent->path = tal_arr(sent, struct pubkey, 2);
-	sent->path[0] = local_id;
-	if (!pubkey_from_node_id(&sent->path[1], &ca->node_id)) {
-		/* Should not happen! */
-		return command_done_err(cmd, LIGHTNINGD,
-					"Failed: could not convert to pubkey?",
-					NULL);
-	}
-
-	if (disable_connect) {
-		/* FIXME: This means we will fail if parity is wrong! */
-		plugin_notify_message(cmd, LOG_UNUSUAL,
-				      "Cannot find route, but"
-				      " fetchplugin-noconnect set:"
-				      " trying direct anyway to %s",
-				      fmt_pubkey(tmpctx, dst));
-		return cb(cmd, NULL, NULL, sent);
-	}
-
-	req = jsonrpc_request_start(cmd->plugin, cmd, "connect", connected,
-				    connect_failed, ca);
-	json_add_node_id(req->js, "id", &ca->node_id);
-	return send_outreq(cmd->plugin, req);
-}
-
-static struct command_result *fetchinvoice_listpeerchannels_done(struct command *cmd,
-								 const char *buf,
-								 const jsmntok_t *result,
-								 struct sent *sent)
-{
-	sent->path = path_to_node(sent, cmd->plugin, buf, result,
-				  sent->invreq->offer_node_id);
-	if (!sent->path)
-		return connect_direct(cmd, sent->invreq->offer_node_id,
-				      sendinvreq_after_connect, sent);
-
-	return sendinvreq_after_connect(cmd, NULL, NULL, sent);
-}
-
 static struct command_result *invreq_done(struct command *cmd,
 					  const char *buf,
 					  const jsmntok_t *result,
 					  struct sent *sent)
 {
+	struct tlv_onionmsg_tlv *payload;
 	const jsmntok_t *t;
 	char *fail;
-	struct out_req *req;
 
 	/* Get invoice request */
 	t = json_get_member(buf, result, "bolt12");
@@ -887,17 +743,70 @@ static struct command_result *invreq_done(struct command *cmd,
 		}
 	}
 
-	req = jsonrpc_request_start(cmd->plugin, cmd, "listpeerchannels",
-				    fetchinvoice_listpeerchannels_done,
-				    &forward_error,
-				    sent);
-	return send_outreq(cmd->plugin, req);
+	payload = tlv_onionmsg_tlv_new(sent);
+	payload->invoice_request = tal_arr(payload, u8, 0);
+	towire_tlv_invoice_request(&payload->invoice_request, sent->invreq);
+
+	return send_message(cmd, sent, payload, sendonionmsg_done);
+}
+
+static struct command_result *param_dev_scidd(struct command *cmd, const char *name,
+					      const char *buffer, const jsmntok_t *tok,
+					      struct short_channel_id_dir **scidd)
+{
+	if (!plugin_developer_mode(cmd->plugin))
+		return command_fail_badparam(cmd, name, buffer, tok,
+					     "not available outside --developer mode");
+
+	*scidd = tal(cmd, struct short_channel_id_dir);
+	if (short_channel_id_dir_from_str(buffer + tok->start, tok->end - tok->start, *scidd))
+		return NULL;
+
+	return command_fail_badparam(cmd, name, buffer, tok,
+				     "should be a short_channel_id of form NxNxN/dir");
+}
+
+static struct command_result *param_dev_reply_path(struct command *cmd, const char *name,
+						   const char *buffer, const jsmntok_t *tok,
+						   struct pubkey **path)
+{
+	size_t i;
+	const jsmntok_t *t;
+
+	if (!plugin_developer_mode(cmd->plugin))
+		return command_fail_badparam(cmd, name, buffer, tok,
+					     "not available outside --developer mode");
+
+	if (tok->type != JSMN_ARRAY)
+		return command_fail_badparam(cmd, name, buffer, tok, "Must be array");
+
+	*path = tal_arr(cmd, struct pubkey, tok->size);
+
+	json_for_each_arr(i, t, tok) {
+		if (!json_to_pubkey(buffer, t, &(*path)[i]))
+			return command_fail_badparam(cmd, name, buffer, t, "invalid pubkey");
+	}
+	return NULL;
+}
+
+static bool payer_key(const u8 *public_tweak, size_t public_tweak_len,
+		      struct pubkey *key)
+{
+	struct sha256 tweakhash;
+
+	bolt12_alias_tweak(&nodealias_base, public_tweak, public_tweak_len,
+			   &tweakhash);
+
+	*key = id;
+	return secp256k1_ec_pubkey_tweak_add(secp256k1_ctx,
+					     &key->pubkey,
+					     tweakhash.u.u8) == 1;
 }
 
 /* Fetches an invoice for this offer, and makes sure it corresponds. */
-static struct command_result *json_fetchinvoice(struct command *cmd,
-						const char *buffer,
-						const jsmntok_t *params)
+struct command_result *json_fetchinvoice(struct command *cmd,
+					 const char *buffer,
+					 const jsmntok_t *params)
 {
 	struct amount_msat *msat;
 	const char *rec_label, *payer_note;
@@ -917,10 +826,23 @@ static struct command_result *json_fetchinvoice(struct command *cmd,
 		   p_opt("recurrence_label", param_string, &rec_label),
 		   p_opt_def("timeout", param_number, &timeout, 60),
 		   p_opt("payer_note", param_string, &payer_note),
+		   p_opt("dev_path_use_scidd", param_dev_scidd, &sent->dev_path_use_scidd),
+		   p_opt("dev_reply_path", param_dev_reply_path, &sent->dev_reply_path),
 		   NULL))
 		return command_param_failed();
 
+	if (!offers_enabled)
+		return command_fail(cmd, LIGHTNINGD,
+				    "experimental-offers not enabled");
+
 	sent->wait_timeout = *timeout;
+	sent->their_paths = sent->offer->offer_paths;
+	if (sent->their_paths)
+		sent->direct_dest = NULL;
+	else
+		sent->direct_dest = sent->offer->offer_issuer_id;
+	/* This is NULL if offer_issuer_id is missing, and set by try_establish */
+	sent->issuer_key = sent->offer->offer_issuer_id;
 
 	/* BOLT-offers #12:
 	 * - SHOULD not respond to an offer if the current time is after
@@ -993,6 +915,9 @@ static struct command_result *json_fetchinvoice(struct command *cmd,
 	 * - if the offer contained `recurrence`:
 	 */
 	if (invreq->offer_recurrence) {
+		struct sha256 offer_id, tweak;
+		u8 *tweak_input;
+
 		/* BOLT-offers-recurrence #12:
 		 *    - for the initial request:
 		 *...
@@ -1032,6 +957,29 @@ static struct command_result *json_fetchinvoice(struct command *cmd,
 		if (!rec_label)
 			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 					    "needs recurrence_label");
+
+		/* BOLT-offers #12:
+		 * - MUST set `invreq_metadata` to an unpredictable series of
+		 *   bytes.
+		 */
+		/* Derive metadata (and thus temp key) from offer data and label
+		 * as payer_id must be same for all recurring payments. */
+
+		/* Use "offer_id || label" as tweak input */
+		invreq_offer_id(invreq, &offer_id);
+		tweak_input = tal_arr(tmpctx, u8,
+				      sizeof(offer_id) + strlen(rec_label));
+		memcpy(tweak_input, &offer_id, sizeof(offer_id));
+		memcpy(tweak_input + sizeof(offer_id),
+		       rec_label,
+		       strlen(rec_label));
+
+		bolt12_alias_tweak(&nodealias_base,
+				   tweak_input,
+				   tal_bytelen(tweak_input),
+				   &tweak);
+		invreq->invreq_metadata
+			= (u8 *)tal_dup(invreq, struct sha256, &tweak);
 	} else {
 		/* BOLT-offers-recurrence #12:
 		 * - otherwise:
@@ -1044,6 +992,24 @@ static struct command_result *json_fetchinvoice(struct command *cmd,
 		if (invreq->invreq_recurrence_start)
 			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 					    "unnecessary recurrence_start");
+
+		/* BOLT-offers #12:
+		 * - MUST set `invreq_metadata` to an unpredictable series of
+		 *   bytes.
+		 */
+		invreq->invreq_metadata = tal_arr(invreq, u8, 16);
+		randombytes_buf(invreq->invreq_metadata,
+				tal_bytelen(invreq->invreq_metadata));
+	}
+
+	/* We derive transient payer_id from invreq_metadata */
+	invreq->invreq_payer_id = tal(invreq, struct pubkey);
+	if (!payer_key(invreq->invreq_metadata,
+		       tal_bytelen(invreq->invreq_metadata),
+		       invreq->invreq_payer_id)) {
+		/* Doesn't happen! */
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "Invalid tweak for payer_id");
 	}
 
 	/* BOLT-offers #12:
@@ -1092,9 +1058,9 @@ static struct command_result *json_fetchinvoice(struct command *cmd,
  * it's actually hit the db!  But using waitinvoice is also suboptimal
  * because we don't have libplugin infra to cancel a pending req (and I
  * want to rewrite our wait* API anyway) */
-static struct command_result *invoice_payment(struct command *cmd,
-					      const char *buf,
-					      const jsmntok_t *params)
+struct command_result *invoice_payment(struct command *cmd,
+				       const char *buf,
+				       const jsmntok_t *params)
 {
 	struct sent *i;
 	const jsmntok_t *ptok, *preimagetok, *msattok;
@@ -1135,43 +1101,13 @@ static struct command_result *invoice_payment(struct command *cmd,
 	return command_hook_success(cmd);
 }
 
-/* We've connected (if we tried), so send the invoice. */
-static struct command_result *
-sendinvoice_after_connect(struct command *cmd,
-			  const char *buf UNUSED,
-			  const jsmntok_t *result UNUSED,
-			  struct sent *sent)
-{
-	struct tlv_onionmsg_tlv *payload = tlv_onionmsg_tlv_new(sent);
-
-	payload->invoice = tal_arr(payload, u8, 0);
-	towire_tlv_invoice(&payload->invoice, sent->inv);
-
-	return send_message(cmd, sent, payload, prepare_inv_timeout);
-}
-
-static struct command_result *sendinvoice_listpeerchannels_done(struct command *cmd,
-								const char *buf,
-								const jsmntok_t *result,
-								struct sent *sent)
-{
-
-	sent->path = path_to_node(sent, cmd->plugin, buf, result,
-				  sent->invreq->invreq_payer_id);
-	if (!sent->path)
-		return connect_direct(cmd, sent->invreq->invreq_payer_id,
-				      sendinvoice_after_connect, sent);
-
-	return sendinvoice_after_connect(cmd, NULL, NULL, sent);
-}
-
 static struct command_result *createinvoice_done(struct command *cmd,
 						 const char *buf,
 						 const jsmntok_t *result,
 						 struct sent *sent)
 {
+	struct tlv_onionmsg_tlv *payload;
 	const jsmntok_t *invtok = json_get_member(buf, result, "bolt12");
-	struct out_req *req;
 	char *fail;
 
 	/* Replace invoice with signed one */
@@ -1194,20 +1130,21 @@ static struct command_result *createinvoice_done(struct command *cmd,
 
 	/* BOLT-offers #12:
 	 *     - if it sends an invoice in response:
-	 *       - MUST use `offer_paths` if present, otherwise MUST use
+	 *       - MUST use `invreq_paths` if present, otherwise MUST use
 	 *         `invreq_payer_id` as the node id to send to.
 	 */
-	/* FIXME! */
-	if (sent->invreq->offer_paths) {
-		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-				    "FIXME: support blinded paths!");
-	}
+	sent->their_paths = sent->invreq->invreq_paths;
+	if (sent->their_paths)
+		sent->direct_dest = NULL;
+	else
+		sent->direct_dest = sent->invreq->invreq_payer_id;
 
-	req = jsonrpc_request_start(cmd->plugin, cmd, "listpeerchannels",
-				    sendinvoice_listpeerchannels_done,
-				    &forward_error,
-				    sent);
-	return send_outreq(cmd->plugin, req);
+	payload = tlv_onionmsg_tlv_new(sent);
+
+	payload->invoice = tal_arr(payload, u8, 0);
+	towire_tlv_invoice(&payload->invoice, sent->inv);
+
+	return send_message(cmd, sent, payload, prepare_inv_timeout);
 }
 
 static struct command_result *sign_invoice(struct command *cmd,
@@ -1234,7 +1171,6 @@ static struct command_result *param_invreq(struct command *cmd,
 {
 	char *fail;
 	int badf;
-	u8 *wire;
 	struct sha256 merkle, sighash;
 
 	/* BOLT-offers #12:
@@ -1258,8 +1194,7 @@ static struct command_result *param_invreq(struct command *cmd,
 	 * The reader:
 	 *   - MUST fail the request if `invreq_payer_id` or `invreq_metadata`
 	 *     are not present.
-	 *   - MUST fail the request if any non-signature TLV fields greater or
-	 *     equal to 160.
+	 *   - MUST fail the request if any non-signature TLV fields are outside the inclusive ranges: 0 to 159 and 1000000000 to 2999999999
 	 *   - if `invreq_features` contains unknown _odd_ bits that are
 	 *     non-zero:
 	 *     - MUST ignore the bit.
@@ -1275,10 +1210,9 @@ static struct command_result *param_invreq(struct command *cmd,
 		return command_fail_badparam(cmd, name, buffer, tok,
 					     "Missing invreq_metadata");
 
-	wire = tal_arr(tmpctx, u8, 0);
-	towire_tlv_invoice_request(&wire, *invreq);
-	if (tlv_span(wire, 160, 239, NULL) != 0
-	    || tlv_span(wire, 1001, UINT64_MAX, NULL) != 0) {
+	if (any_field_outside_range((*invreq)->fields, true,
+				    0, 159,
+				    1000000000, 2999999999)) {
 		return command_fail_badparam(cmd, name, buffer, tok,
 					     "Invalid high-numbered fields");
 	}
@@ -1311,13 +1245,13 @@ static struct command_result *param_invreq(struct command *cmd,
 
 	/* Plugin handles these automatically, you shouldn't send one
 	 * manually. */
-	if ((*invreq)->offer_node_id) {
+	if ((*invreq)->offer_issuer_id || (*invreq)->offer_paths) {
 		return command_fail_badparam(cmd, name, buffer, tok,
 					     "This is based on an offer?");
 	}
 
 	/* BOLT-offers #12:
-	 *  - otherwise (no `offer_node_id`, not a response to our offer):
+	 *  - otherwise (no `offer_issuer_id` or `offer_paths`, not a response to our offer):
 	 *     - MUST fail the request if any of the following are present:
 	 *       - `offer_chains`, `offer_features` or `offer_quantity_max`.
 	 *     - MUST fail the request if `invreq_amount` is not present.
@@ -1336,7 +1270,7 @@ static struct command_result *param_invreq(struct command *cmd,
 					     "Missing invreq_amount");
 
 	/* BOLT-offers #12:
-	 *  - otherwise (no `offer_node_id`, not a response to our offer):
+	 *  - otherwise (no `offer_issuer_id` or `offer_paths`, not a response to our offer):
 	 *...
 	 *     - MAY use `offer_amount` (or `offer_currency`) for informational display to user.
 	 */
@@ -1352,9 +1286,9 @@ static struct command_result *param_invreq(struct command *cmd,
 	return NULL;
 }
 
-static struct command_result *json_sendinvoice(struct command *cmd,
-					       const char *buffer,
-					       const jsmntok_t *params)
+struct command_result *json_sendinvoice(struct command *cmd,
+					const char *buffer,
+					const jsmntok_t *params)
 {
 	struct amount_msat *msat;
 	u32 *timeout;
@@ -1371,6 +1305,15 @@ static struct command_result *json_sendinvoice(struct command *cmd,
 		   p_opt_def("timeout", param_number, &timeout, 90),
 		   NULL))
 		return command_param_failed();
+
+	if (!offers_enabled)
+		return command_fail(cmd, LIGHTNINGD,
+				    "experimental-offers not enabled");
+
+	sent->dev_path_use_scidd = NULL;
+	sent->dev_reply_path = NULL;
+	sent->their_paths = sent->invreq->offer_paths;
+	sent->direct_dest = sent->invreq->invreq_payer_id;
 
 	/* BOLT-offers #12:
 	 *   - if the invoice is in response to an `invoice_request`:
@@ -1417,14 +1360,16 @@ static struct command_result *json_sendinvoice(struct command *cmd,
 	       &sent->inv_preimage, sizeof(sent->inv_preimage));
 
 	/* BOLT-offers #12:
-	 * - if `offer_node_id` is present:
-	 *   - MUST set `invoice_node_id` to `offer_node_id`.
+	 * - if `offer_issuer_id` is present:
+	 *   - MUST set `invoice_node_id` to the `offer_issuer_id`
+	 * - otherwise, if `offer_paths` is present:
+	 *   - MUST set `invoice_node_id` to the final `blinded_node_id` on the path it received the `invoice_request`
 	 * - otherwise:
 	 *   - MUST set `invoice_node_id` to a valid public key.
 	 */
 	/* FIXME: Use transitory id! */
 	sent->inv->invoice_node_id = tal(sent->inv, struct pubkey);
-	sent->inv->invoice_node_id->pubkey = local_id.pubkey;
+	sent->inv->invoice_node_id->pubkey = id.pubkey;
 
 	/* BOLT-offers #12:
 	 * - if the expiry for accepting payment is not 7200 seconds
@@ -1469,31 +1414,14 @@ static struct command_result *param_raw_invreq(struct command *cmd,
 	return NULL;
 }
 
-static struct command_result *rawrequest_listpeerchannels_done(struct command *cmd,
-							       const char *buf,
-							       const jsmntok_t *result,
-							       struct sent *sent)
-{
-	struct pubkey node_id;
-	/* Hack to store node_id from cmd */
-	node_id = *sent->path;
-	sent->path = path_to_node(sent, cmd->plugin, buf, result, &node_id);
-	if (!sent->path) {
-		return connect_direct(cmd, &node_id,
-				      sendinvreq_after_connect, sent);
-	}
-
-	return sendinvreq_after_connect(cmd, NULL, NULL, sent);
-}
-
-static struct command_result *json_dev_rawrequest(struct command *cmd,
-						  const char *buffer,
-						  const jsmntok_t *params)
+struct command_result *json_dev_rawrequest(struct command *cmd,
+					   const char *buffer,
+					   const jsmntok_t *params)
 {
 	struct sent *sent = tal(cmd, struct sent);
 	u32 *timeout;
 	struct pubkey *node_id;
-	struct out_req *req;
+	struct tlv_onionmsg_tlv *payload;
 
 	if (!param(cmd, buffer, params,
 		   p_req("invreq", param_raw_invreq, &sent->invreq),
@@ -1506,82 +1434,15 @@ static struct command_result *json_dev_rawrequest(struct command *cmd,
 	sent->wait_timeout = *timeout;
 	sent->cmd = cmd;
 	sent->offer = NULL;
+	sent->dev_path_use_scidd = NULL;
+	sent->dev_reply_path = NULL;
+	sent->their_paths = NULL;
+	sent->direct_dest = node_id;
+	sent->issuer_key = node_id;
 
-	/* We temporarily abuse ->path to store nodeid! */
-	sent->path = node_id;
-	req = jsonrpc_request_start(cmd->plugin, cmd, "listpeerchannels",
-				    rawrequest_listpeerchannels_done,
-				    &forward_error,
-				    sent);
-	return send_outreq(cmd->plugin, req);
-}
+	payload = tlv_onionmsg_tlv_new(sent);
+	payload->invoice_request = tal_arr(payload, u8, 0);
+	towire_tlv_invoice_request(&payload->invoice_request, sent->invreq);
 
-static const struct plugin_command commands[] = {
-	{
-		"fetchinvoice",
-		"payment",
-		"Request remote node for an invoice for this {offer}, with {amount}, {quanitity}, {recurrence_counter}, {recurrence_start} and {recurrence_label} iff required.",
-		NULL,
-		json_fetchinvoice,
-	},
-	{
-		"sendinvoice",
-		"payment",
-		"Request remote node for to pay this {invreq}, with {label}, optional {amount_msat}, and {timeout} (default 90 seconds).",
-		NULL,
-		json_sendinvoice,
-	},
-	{
-		"dev-rawrequest",
-		"util",
-		"Send {invreq} to {nodeid}, wait {timeout} (60 seconds by default)",
-		NULL,
-		json_dev_rawrequest,
-		.dev_only = true,
-	},
-};
-
-static const char *init(struct plugin *p, const char *buf UNUSED,
-			const jsmntok_t *config UNUSED)
-{
-	bool exp_offers;
-
-	rpc_scan(p, "getinfo",
-		 take(json_out_obj(NULL, NULL, NULL)),
-		 "{id:%}", JSON_SCAN(json_to_pubkey, &local_id));
-
-	rpc_scan(p, "listconfigs",
-		 take(json_out_obj(NULL, "config", "experimental-offers")),
-		 "{configs:{experimental-offers:{set:%}}}",
-		 JSON_SCAN(json_to_bool, &exp_offers));
-
-	if (!exp_offers)
-		return "offers not enabled in config";
-	return NULL;
-}
-
-static const struct plugin_hook hooks[] = {
-	{
-		"onion_message_recv_secret",
-		recv_modern_onion_message
-	},
-	{
-		"invoice_payment",
-		invoice_payment,
-	},
-};
-
-int main(int argc, char *argv[])
-{
-	setup_locale();
-	plugin_main(argv, init, PLUGIN_RESTARTABLE, true, NULL,
-		    commands, ARRAY_SIZE(commands),
-		    /* No notifications */
-	            NULL, 0,
-		    hooks, ARRAY_SIZE(hooks),
-		    NULL, 0,
-		    plugin_option("fetchinvoice-noconnect", "flag",
-				  "Don't try to connect directly to fetch an invoice.",
-				  flag_option, &disable_connect),
-		    NULL);
+	return send_message(cmd, sent, payload, sendonionmsg_done);
 }

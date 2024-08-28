@@ -154,7 +154,8 @@ void jsonrpc_stop_all(struct lightningd *ld UNNEEDED)
 void jsonrpc_stop_listening(struct jsonrpc *jsonrpc UNNEEDED)
 { fprintf(stderr, "jsonrpc_stop_listening called!\n"); abort(); }
 /* Generated stub for load_channels_from_wallet */
-struct htlc_in_map *load_channels_from_wallet(struct lightningd *ld UNNEEDED)
+struct htlc_in_map *load_channels_from_wallet(struct lightningd *ld UNNEEDED,
+					      size_t *num_channels UNNEEDED)
 { fprintf(stderr, "load_channels_from_wallet called!\n"); abort(); }
 /* Generated stub for log_ */
 void log_(struct logger *logger UNNEEDED, enum log_level level UNNEEDED,
@@ -217,6 +218,9 @@ struct plugins *plugins_new(const tal_t *ctx UNNEEDED, struct log_book *log_book
 void plugins_set_builtin_plugins_dir(struct plugins *plugins UNNEEDED,
 				     const char *dir UNNEEDED)
 { fprintf(stderr, "plugins_set_builtin_plugins_dir called!\n"); abort(); }
+/* Generated stub for pubkey_from_node_id */
+bool pubkey_from_node_id(struct pubkey *key UNNEEDED, const struct node_id *id UNNEEDED)
+{ fprintf(stderr, "pubkey_from_node_id called!\n"); abort(); }
 /* Generated stub for resend_closing_transactions */
 void resend_closing_transactions(struct lightningd *ld UNNEEDED)
 { fprintf(stderr, "resend_closing_transactions called!\n"); abort(); }
@@ -233,8 +237,7 @@ void setup_color_and_alias(struct lightningd *ld UNNEEDED)
 void setup_peers(struct lightningd *ld UNNEEDED)
 { fprintf(stderr, "setup_peers called!\n"); abort(); }
 /* Generated stub for setup_topology */
-void setup_topology(struct chain_topology *topology UNNEEDED,
-		    u32 min_blockheight UNNEEDED, u32 max_blockheight UNNEEDED)
+void setup_topology(struct chain_topology *topology UNNEEDED)
 { fprintf(stderr, "setup_topology called!\n"); abort(); }
 /* Generated stub for shutdown_plugins */
 void shutdown_plugins(struct lightningd *ld UNNEEDED)
@@ -274,9 +277,6 @@ const char *version(void)
 void waitblockheight_notify_new_block(struct lightningd *ld UNNEEDED,
 				      u32 block_height UNNEEDED)
 { fprintf(stderr, "waitblockheight_notify_new_block called!\n"); abort(); }
-/* Generated stub for wallet_blocks_heights */
-void wallet_blocks_heights(struct wallet *w UNNEEDED, u32 def UNNEEDED, u32 *min UNNEEDED, u32 *max UNNEEDED)
-{ fprintf(stderr, "wallet_blocks_heights called!\n"); abort(); }
 /* Generated stub for wallet_new */
 struct wallet *wallet_new(struct lightningd *ld UNNEEDED, struct timers *timers UNNEEDED)
 { fprintf(stderr, "wallet_new called!\n"); abort(); }

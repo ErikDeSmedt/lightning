@@ -5,6 +5,16 @@ msgdata,hsmstatus_client_bad_request,description,wirestring,
 msgdata,hsmstatus_client_bad_request,len,u16,
 msgdata,hsmstatus_client_bad_request,msg,u8,len
 
+# We use this to set dev flags (before init!).  It's a TLV, so we can
+# extend easily.  Normal TLV rules apply: ignore odd fields you don't
+# understand.
+msgtype,hsmd_dev_preinit,99
+msgdata,hsmd_dev_preinit,tlvs,hsmd_dev_preinit_tlvs,
+tlvtype,hsmd_dev_preinit_tlvs,fail_preapprove,1
+tlvdata,hsmd_dev_preinit_tlvs,fail_preapprove,fail,bool,
+tlvtype,hsmd_dev_preinit_tlvs,no_preapprove_check,3
+tlvdata,hsmd_dev_preinit_tlvs,no_preapprove_check,disable,bool,
+
 #include <bitcoin/chainparams.h>
 # Start the HSM.
 msgtype,hsmd_init,11
@@ -156,6 +166,26 @@ msgdata,hsmd_preapprove_keysend,amount_msat,amount_msat,
 msgtype,hsmd_preapprove_keysend_reply,139
 msgdata,hsmd_preapprove_keysend_reply,approved,bool,
 
+# Preapprove an invoice for payment (with "check_only" option)
+msgtype,hsmd_preapprove_invoice_check,51
+msgdata,hsmd_preapprove_invoice_check,invstring,wirestring,
+msgdata,hsmd_preapprove_invoice_check,check_only,bool,
+
+# Result is true if approved, declined if false 
+msgtype,hsmd_preapprove_invoice_check_reply,151
+msgdata,hsmd_preapprove_invoice_check_reply,approved,bool,
+
+# Preapprove a keysend payment (with "check_only" option)
+msgtype,hsmd_preapprove_keysend_check,52
+msgdata,hsmd_preapprove_keysend_check,destination,node_id,
+msgdata,hsmd_preapprove_keysend_check,payment_hash,sha256,
+msgdata,hsmd_preapprove_keysend_check,amount_msat,amount_msat,
+msgdata,hsmd_preapprove_keysend_check,check_only,bool,
+
+# Result is true if approved, declined if false 
+msgtype,hsmd_preapprove_keysend_check_reply,152
+msgdata,hsmd_preapprove_keysend_check_reply,approved,bool,
+
 # Give me ECDH(node-id-secret,point)
 msgtype,hsmd_ecdh_req,1
 msgdata,hsmd_ecdh_req,point,pubkey,
@@ -294,10 +324,12 @@ msgdata,hsmd_sign_splice_tx,input_index,u32,
 msgtype,hsmd_sign_tx_reply,112
 msgdata,hsmd_sign_tx_reply,sig,bitcoin_signature,
 
-# Openingd/channeld/onchaind asks for Nth per_commitment_point, if > 2, gets N-2 secret.
+# Openingd/channeld/onchaind asks for Nth per_commitment_point
+# Prior to HSM_VERSION 6 we will return an old_commitment_secret
 msgtype,hsmd_get_per_commitment_point,18
 msgdata,hsmd_get_per_commitment_point,n,u64,
 
+# IMPORTANT - Beginning HSM_VERSION 6 we never return an old_commitment_secret
 msgtype,hsmd_get_per_commitment_point_reply,118
 msgdata,hsmd_get_per_commitment_point_reply,per_commitment_point,pubkey,
 msgdata,hsmd_get_per_commitment_point_reply,old_commitment_secret,?secret,
@@ -345,6 +377,21 @@ msgdata,hsmd_sign_bolt12,publictweak,u8,publictweaklen
 
 msgtype,hsmd_sign_bolt12_reply,125
 msgdata,hsmd_sign_bolt12_reply,sig,bip340sig,
+
+# Sign a bolt12-style merkle hash (modern)
+msgtype,hsmd_sign_bolt12_2,41
+msgdata,hsmd_sign_bolt12_2,messagename,wirestring,
+msgdata,hsmd_sign_bolt12_2,fieldname,wirestring,
+msgdata,hsmd_sign_bolt12_2,merkleroot,sha256,
+# This is for signing with an alias (temporary key), used if *publictweak* not empty.
+# derive_secret with info, then tweak privkey with SHA256(derived_secret || publictweak).
+msgdata,hsmd_sign_bolt12_2,infolen,u16,
+msgdata,hsmd_sign_bolt12_2,info,u8,infolen
+msgdata,hsmd_sign_bolt12_2,publictweaklen,u16,
+msgdata,hsmd_sign_bolt12_2,publictweak,u8,publictweaklen
+
+msgtype,hsmd_sign_bolt12_2_reply,141
+msgdata,hsmd_sign_bolt12_2_reply,sig,bip340sig,
 
 # Sign an option_will_fund offer hash
 msgtype,hsmd_sign_option_will_fund_offer,26

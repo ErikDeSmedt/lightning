@@ -81,6 +81,69 @@ pub enum ChannelStateChangeCause {
     ONCHAIN,
 }
 
+#[derive(Copy, Clone, Serialize, Deserialize, Debug)]
+#[allow(non_camel_case_types)]
+pub enum AutocleanSubsystem {
+    #[serde(rename = "succeededforwards")]
+    SUCCEEDEDFORWARDS = 0,
+    #[serde(rename = "failedforwards")]
+    FAILEDFORWARDS = 1,
+    #[serde(rename = "succeededpays")]
+    SUCCEEDEDPAYS = 2,
+    #[serde(rename = "failedpays")]
+    FAILEDPAYS = 3,
+    #[serde(rename = "paidinvoices")]
+    PAIDINVOICES = 4,
+    #[serde(rename = "expiredinvoices")]
+    EXPIREDINVOICES = 5,
+}
+
+impl TryFrom<i32> for AutocleanSubsystem {
+    type Error = crate::Error;
+
+    fn try_from(value: i32) -> std::result::Result<Self, Self::Error> {
+        match value {
+            0 => Ok(AutocleanSubsystem::SUCCEEDEDFORWARDS),
+            1 => Ok(AutocleanSubsystem::FAILEDFORWARDS),
+            2 => Ok(AutocleanSubsystem::SUCCEEDEDPAYS),
+            3 => Ok(AutocleanSubsystem::FAILEDPAYS),
+            4 => Ok(AutocleanSubsystem::PAIDINVOICES),
+            5 => Ok(AutocleanSubsystem::EXPIREDINVOICES),
+            _ => Err(anyhow!("Invalid AutocleanSubsystem {}", value)),
+        }
+    }
+}
+
+#[derive(Copy, Clone, Serialize, Deserialize, Debug)]
+#[allow(non_camel_case_types)]
+pub enum PluginSubcommand {
+    #[serde(rename = "start")]
+    START = 0,
+    #[serde(rename = "stop")]
+    STOP = 1,
+    #[serde(rename = "rescan")]
+    RESCAN = 2,
+    #[serde(rename = "startdir")]
+    STARTDIR = 3,
+    #[serde(rename = "list")]
+    LIST = 4,
+}
+
+impl TryFrom<i32> for PluginSubcommand {
+    type Error = crate::Error;
+
+    fn try_from(value: i32) -> std::result::Result<Self, Self::Error> {
+        match value {
+            0 => Ok(PluginSubcommand::START),
+            1 => Ok(PluginSubcommand::STOP),
+            2 => Ok(PluginSubcommand::RESCAN),
+            3 => Ok(PluginSubcommand::STARTDIR),
+            4 => Ok(PluginSubcommand::LIST),
+            _ => Err(anyhow!("Invalid PluginSubcommand mapping!")),
+        }
+    }
+}
+
 /// An `Amount` that can also be `any`. Useful for cases in which you
 /// want to delegate the Amount selection so someone else, e.g., an
 /// amountless invoice.
@@ -196,6 +259,9 @@ impl ShortChannelId {
     }
     pub fn outnum(&self) -> u16 {
         self.0 as u16 & 0xFFFF
+    }
+    pub fn to_u64(&self) -> u64 {
+        self.0
     }
 }
 
@@ -730,7 +796,7 @@ mod test {
         });
 
         let p: FundchannelResponse = serde_json::from_value(r).unwrap();
-	assert_eq!(p.channel_type.unwrap().bits, Some(vec![1,3,5]));
+        assert_eq!(p.channel_type.unwrap().bits, vec![1, 3, 5]);
     }
 }
 
@@ -818,20 +884,91 @@ impl Serialize for RoutehintList {
 }
 
 impl<'de> Deserialize<'de> for RoutehintList {
-    fn deserialize<D>(_deserializer: D) -> Result<Self, D::Error>
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        todo!("Required once we roundtrip, but not necessary for cln-rpc itself")
+        let hints: Vec<Routehint> = Vec::deserialize(deserializer)?;
+
+        Ok(RoutehintList { hints })
     }
 }
 
 impl<'de> Deserialize<'de> for Routehint {
-    fn deserialize<D>(_deserializer: D) -> Result<Self, D::Error>
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        todo!("Required once we roundtrip, but not necessary for cln-rpc itself")
+        let hops: Vec<Routehop> = Vec::deserialize(deserializer)?;
+
+        Ok(Routehint { hops })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DecodeRoutehop {
+    pub pubkey: PublicKey,
+    pub short_channel_id: ShortChannelId,
+    pub fee_base_msat: Amount,
+    pub fee_proportional_millionths: u32,
+    pub cltv_expiry_delta: u16,
+}
+
+#[derive(Clone, Debug)]
+pub struct DecodeRoutehint {
+    pub hops: Vec<DecodeRoutehop>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DecodeRoutehintList {
+    pub hints: Vec<DecodeRoutehint>,
+}
+
+impl Serialize for DecodeRoutehint {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut seq = serializer.serialize_seq(Some(self.hops.len()))?;
+        for e in self.hops.iter() {
+            seq.serialize_element(e)?;
+        }
+        seq.end()
+    }
+}
+
+impl Serialize for DecodeRoutehintList {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut seq = serializer.serialize_seq(Some(self.hints.len()))?;
+        for e in self.hints.iter() {
+            seq.serialize_element(e)?;
+        }
+        seq.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for DecodeRoutehintList {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let hints: Vec<DecodeRoutehint> = Vec::deserialize(deserializer)?;
+
+        Ok(DecodeRoutehintList { hints })
+    }
+}
+
+impl<'de> Deserialize<'de> for DecodeRoutehint {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let hops: Vec<DecodeRoutehop> = Vec::deserialize(deserializer)?;
+
+        Ok(DecodeRoutehint { hops })
     }
 }
 

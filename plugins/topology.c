@@ -364,6 +364,7 @@ static void gossmod_add_unknown_localchan(struct gossmap_localmods *mods,
 					  const struct short_channel_id_dir *scidd,
 					  struct amount_msat min,
 					  struct amount_msat max,
+					  struct amount_msat spendable,
 					  struct amount_msat fee_base,
 					  u32 fee_proportional,
 					  u32 cltv_delta,
@@ -375,7 +376,7 @@ static void gossmod_add_unknown_localchan(struct gossmap_localmods *mods,
 	if (gossmap_find_chan(gossmap, &scidd->scid))
 		return;
 
-	gossmod_add_localchan(mods, self, peer, scidd, min, max,
+	gossmod_add_localchan(mods, self, peer, scidd, min, max, spendable,
 			      fee_base, fee_proportional, cltv_delta, enabled,
 			      buf, chantok, gossmap);
 }
@@ -727,36 +728,18 @@ static const char *init(struct plugin *p,
 static const struct plugin_command commands[] = {
 	{
 		"getroute",
-		"channels",
-		"Primitive route command",
-		"Show route to {id} for {msatoshi}, using {riskfactor} and optional {cltv} (default 9). "
-		"If specified search from {fromid} otherwise use this node as source. "
-		"Randomize the route with up to {fuzzpercent} (ignored)). "
-		"{exclude} an array of short-channel-id/direction (e.g. [ '564334x877x1/0', '564195x1292x0/1' ]) "
-		"or node-id from consideration. "
-		"Set the {maxhops} the route can take (default 20).",
 		json_getroute,
 	},
 	{
 		"listchannels",
-		"channels",
-		"List all known channels in the network",
-		"Show channels for {short_channel_id}, {source} or {destination} "
-		"(or all known channels, if not specified)",
 		json_listchannels,
 	},
 	{
 		"listnodes",
-		"network",
-		"List all known nodes in the network",
-		"Show node {id} (or all known nods, if not specified)",
 		json_listnodes,
 	},
 	{
 		"listincoming",
-		"network",
-		"List the channels incoming from our direct peers",
-		"Used by invoice code to select peers for routehints",
 		json_listincoming,
 	},
 };
@@ -764,6 +747,6 @@ static const struct plugin_command commands[] = {
 int main(int argc, char *argv[])
 {
 	setup_locale();
-	plugin_main(argv, init, PLUGIN_STATIC, true, NULL, commands, ARRAY_SIZE(commands),
+	plugin_main(argv, init, NULL, PLUGIN_STATIC, true, NULL, commands, ARRAY_SIZE(commands),
 	            NULL, 0, NULL, 0, NULL, 0, NULL);
 }

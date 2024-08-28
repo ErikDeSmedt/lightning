@@ -3,7 +3,7 @@ import ipaddress
 import pyln.client
 
 
-CERTS_PATH, REST_PROTOCOL, REST_HOST, REST_PORT, REST_CSP, REST_CORS_ORIGINS = "", "", "", "", "", []
+CERTS_PATH, REST_PROTOCOL, REST_HOST, REST_PORT, REST_CSP, SWAGGER_ROOT, REST_CORS_ORIGINS = "", "", "", "", "", "", []
 
 
 class RuneError(Exception):
@@ -41,7 +41,7 @@ def validate_port(port):
 def set_config(options):
     if 'clnrest-port' not in options:
         return "`clnrest-port` option is not configured"
-    global CERTS_PATH, REST_PROTOCOL, REST_HOST, REST_PORT, REST_CSP, REST_CORS_ORIGINS
+    global CERTS_PATH, REST_PROTOCOL, REST_HOST, REST_PORT, REST_CSP, SWAGGER_ROOT, REST_CORS_ORIGINS
 
     REST_PORT = int(options["clnrest-port"])
     if validate_port(REST_PORT) is False:
@@ -57,6 +57,7 @@ def set_config(options):
 
     CERTS_PATH = str(options["clnrest-certs"])
     REST_CSP = str(options["clnrest-csp"])
+    SWAGGER_ROOT = str(options["clnrest-swagger-root"])
     cors_origins = options["clnrest-cors-origins"]
     REST_CORS_ORIGINS.clear()
     for origin in cors_origins:
@@ -103,12 +104,8 @@ def verify_rune(plugin, rune, rpc_method, rpc_params):
 def process_help_response(help_response):
     # Use json5.loads due to single quotes in response
     processed_res = json5.loads(str(help_response))["help"]
-    line = "\n---------------------------------------------------------------------------------------------------------------------------------------------------------------------------\n\n"
-    processed_html_res = ""
+    line = "\n\n---------------------------------------------------------------------------------------------------------------------------------------------------------------------------\n\n"
+    processed_html_res = "\n"
     for row in processed_res:
-        processed_html_res += f"Command: {row['command']}\n"
-        processed_html_res += f"Category: {row['category']}\n"
-        processed_html_res += f"Description: {row['description']}\n"
-        processed_html_res += f"Verbose: {row['verbose']}\n"
-        processed_html_res += line
+        processed_html_res += row['command'] + line
     return processed_html_res

@@ -171,6 +171,7 @@ struct tlv_offer *offer_decode(const tal_t *ctx,
 	struct tlv_offer *offer;
 	const u8 *data;
 	size_t dlen;
+	const struct tlv_field *badf;
 
 	data = string_to_data(tmpctx, b12, b12len, "lno", &dlen, fail);
 	if (!data)
@@ -193,7 +194,7 @@ struct tlv_offer *offer_decode(const tal_t *ctx,
 
 	/* BOLT-offers #12:
 	 * A reader of an offer:
-	 * - if the offer contains any TLV fields greater or equal to 80:
+	 * - if the offer contains any TLV fields outside the inclusive ranges: 1 to 79 and 1000000000 to 1999999999:
 	 *   - MUST NOT respond to the offer.
 	 * - if `offer_features` contains unknown _odd_ bits that are non-zero:
 	 *     - MUST ignore the bit.
@@ -201,29 +202,45 @@ struct tlv_offer *offer_decode(const tal_t *ctx,
 	 *   - MUST NOT respond to the offer.
 	 *   - SHOULD indicate the unknown bit to the user.
 	 */
-	for (size_t i = 0; i < tal_count(offer->fields); i++) {
-		if (offer->fields[i].numtype > 80) {
-			*fail = tal_fmt(ctx,
-					"Offer %"PRIu64" field >= 80",
-					offer->fields[i].numtype);
-			return tal_free(offer);
-		}
+	badf = any_field_outside_range(offer->fields, false,
+				       1, 79,
+				       1000000000, 1999999999);
+	if (badf) {
+		*fail = tal_fmt(ctx,
+				"Offer %"PRIu64" field outside offer range",
+				badf->numtype);
+		return tal_free(offer);
 	}
 
 	/* BOLT-offers #12:
-	 * - if `offer_description` is not set:
-	 *   - MUST NOT respond to the offer.
-	 * - if `offer_node_id` is not set:
-	 *   - MUST NOT respond to the offer.
+	 *
+	 * - if `offer_amount` is set and `offer_description` is not set:
+	 *    - MUST NOT respond to the offer.
 	 */
-	if (!offer->offer_description) {
-		*fail = tal_strdup(ctx, "Offer does not contain a description");
+	if (!offer->offer_description && offer->offer_amount) {
+		*fail = tal_strdup(ctx, "Offer does not contain a description, but contains an amount");
 		return tal_free(offer);
 	}
 
-	if (!offer->offer_node_id) {
-		*fail = tal_strdup(ctx, "Offer does not contain a node_id");
+	/* BOLT-offers #12:
+	 *
+	 *   - if neither `offer_issuer_id` nor `offer_paths` are set:
+	 *     - MUST NOT respond to the offer.
+	 */
+	if (!offer->offer_issuer_id && !offer->offer_paths) {
+		*fail = tal_strdup(ctx, "Offer does not contain an issuer_id or paths");
 		return tal_free(offer);
+	}
+
+	/* BOLT-offers #12:
+	 *   - if `num_hops` is 0 in any `blinded_path` in `offer_paths`:
+	 *     - MUST NOT respond to the offer.
+	 */
+	for (size_t i = 0; i < tal_count(offer->offer_paths); i++) {
+		if (tal_count(offer->offer_paths[i]->path) == 0) {
+			*fail = tal_strdup(ctx, "Offer contains an empty offer_path");
+			return tal_free(offer);
+		}
 	}
 
 	return offer;
@@ -248,6 +265,7 @@ struct tlv_invoice_request *invrequest_decode(const tal_t *ctx,
 	struct tlv_invoice_request *invrequest;
 	const u8 *data;
 	size_t dlen;
+	const struct tlv_field *badf;
 
 	data = string_to_data(tmpctx, b12, b12len, "lnr", &dlen, fail);
 	if (!data)
@@ -266,6 +284,32 @@ struct tlv_invoice_request *invrequest_decode(const tal_t *ctx,
 					 invrequest->invreq_chain, 1);
 	if (*fail)
 		return tal_free(invrequest);
+
+	/* BOLT-offers #12:
+	 * The reader:
+	 *...
+	 *  - MUST fail the request if any non-signature TLV fields are outside the inclusive ranges: 0 to 159 and 1000000000 to 2999999999
+	 */
+	badf = any_field_outside_range(invrequest->fields, true,
+				       0, 159,
+				       1000000000, 2999999999);
+	if (badf) {
+		*fail = tal_fmt(ctx,
+				"Invoice request %"PRIu64" field outside invoice request range",
+				badf->numtype);
+		return tal_free(invrequest);
+	}
+
+	/* BOLT-offers #12:
+	 *   - if `num_hops` is 0 in any `blinded_path` in `invreq_paths`:
+	 *     - MUST fail the request.
+	 */
+	for (size_t i = 0; i < tal_count(invrequest->invreq_paths); i++) {
+		if (tal_count(invrequest->invreq_paths[i]->path) == 0) {
+			*fail = tal_strdup(ctx, "Invoice request contains an empty invreq_path");
+			return tal_free(invrequest);
+		}
+	}
 
 	return invrequest;
 }
@@ -497,14 +541,20 @@ size_t tlv_span(const u8 *tlvstream, u64 minfield, u64 maxfield,
 
 static void calc_offer(const u8 *tlvstream, struct sha256 *id)
 {
-	size_t start, len;
+	size_t start1, len1, start2, len2;
+	struct sha256_ctx ctx;
 
 	/* BOLT-offers #12:
 	 * A writer of an offer:
-	 *  - MUST NOT set any tlv fields greater or equal to 80, or tlv field 0.
+	 * - MUST NOT set any TLV fields outside the inclusive ranges: 1 to 79 and 1000000000 to 1999999999.
 	 */
-	len = tlv_span(tlvstream, 1, 79, &start);
-	sha256(id, tlvstream + start, len);
+	len1 = tlv_span(tlvstream, 1, 79, &start1);
+	len2 = tlv_span(tlvstream, 1000000000, 1999999999, &start2);
+
+	sha256_init(&ctx);
+	sha256_update(&ctx, tlvstream + start1, len1);
+	sha256_update(&ctx, tlvstream + start2, len2);
+	sha256_done(&ctx, id);
 }
 
 void offer_offer_id(const struct tlv_offer *offer, struct sha256 *id)
@@ -533,15 +583,21 @@ void invoice_offer_id(const struct tlv_invoice *invoice, struct sha256 *id)
 
 static void calc_invreq(const u8 *tlvstream, struct sha256 *id)
 {
-	size_t start, len;
+	size_t start1, len1, start2, len2;
+	struct sha256_ctx ctx;
 
 	/* BOLT-offers #12:
-	 *   - if the invoice is a response to an `invoice_request`:
-	 *     - MUST reject the invoice if all fields less than type 160
-	 *       do not exactly match the `invoice_request`.
+	 * The writer:
+	 *...
+	 *   - MUST NOT set any non-signature TLV fields outside the inclusive ranges: 0 to 159 and 1000000000 to 2999999999
 	 */
-	len = tlv_span(tlvstream, 0, 159, &start);
-	sha256(id, tlvstream + start, len);
+	len1 = tlv_span(tlvstream, 0, 159, &start1);
+	len2 = tlv_span(tlvstream, 1000000000, 2999999999, &start2);
+
+	sha256_init(&ctx);
+	sha256_update(&ctx, tlvstream + start1, len1);
+	sha256_update(&ctx, tlvstream + start2, len2);
+	sha256_done(&ctx, id);
 }
 
 void invreq_invreq_id(const struct tlv_invoice_request *invreq, struct sha256 *id)
@@ -588,8 +644,9 @@ struct tlv_invoice *invoice_for_invreq(const tal_t *ctx,
 				       const struct tlv_invoice_request *invreq)
 {
 	const u8 *cursor;
-	size_t start, len;
+	size_t start1, len1, start2, len2;
 	u8 *wire = tal_arr(tmpctx, u8, 0);
+
 	towire_tlv_invoice_request(&wire, invreq);
 
 	/* BOLT-offers #12:
@@ -599,8 +656,50 @@ struct tlv_invoice *invoice_for_invreq(const tal_t *ctx,
 	 *   - MUST copy all non-signature fields from the `invoice_request` (including
 	 *     unknown fields).
 	 */
-	len = tlv_span(wire, 0, 159, &start);
-	cursor = wire + start;
-	return fromwire_tlv_invoice(ctx, &cursor, &len);
+	len1 = tlv_span(wire, 0, 159, &start1);
+	len2 = tlv_span(wire, 1000000000, 2999999999, &start2);
+
+	/* Move second span adjacent first span */
+	memmove(wire + start1 + len1, wire + start2, len2);
+
+	/* Unmarshal combined result */
+	len1 = len1 + len2;
+	cursor = wire + start1;
+	return fromwire_tlv_invoice(ctx, &cursor, &len1);
 }
 
+bool is_bolt12_signature_field(u64 typenum)
+{
+	/* BOLT-offers #12:
+	 * Each form is signed using one or more *signature TLV elements*: TLV
+	 * types 240 through 1000 (inclusive). */
+	return typenum >= 240 && typenum <= 1000;
+}
+
+static bool in_ranges(u64 numtype,
+		      u64 r1_start, u64 r1_end,
+		      u64 r2_start, u64 r2_end)
+{
+	if (numtype >= r1_start && numtype <= r1_end)
+		return true;
+	if (numtype >= r2_start && numtype <= r2_end)
+		return true;
+	return false;
+}
+
+const struct tlv_field *any_field_outside_range(const struct tlv_field *fields,
+						bool ignore_signature_fields,
+						size_t r1_start, size_t r1_end,
+						size_t r2_start, size_t r2_end)
+{
+	for (size_t i = 0; i < tal_count(fields); i++) {
+		if (ignore_signature_fields
+		    && is_bolt12_signature_field(fields[i].numtype))
+			continue;
+		if (!in_ranges(fields[i].numtype,
+			       r1_start, r1_end,
+			       r2_start, r2_end))
+			return &fields[i];
+	}
+	return NULL;
+}

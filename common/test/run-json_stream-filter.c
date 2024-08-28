@@ -50,11 +50,13 @@ struct amount_asset amount_sat_to_asset(struct amount_sat *sat UNNEEDED, const u
 /* Generated stub for amount_tx_fee */
 struct amount_sat amount_tx_fee(u32 fee_per_kw UNNEEDED, size_t weight UNNEEDED)
 { fprintf(stderr, "amount_tx_fee called!\n"); abort(); }
-/* Generated stub for command_fail */
-struct command_result *command_fail(struct command *cmd UNNEEDED, enum jsonrpc_errcode code UNNEEDED,
-				    const char *fmt UNNEEDED, ...)
-
-{ fprintf(stderr, "command_fail called!\n"); abort(); }
+/* Generated stub for command_fail_badparam */
+struct command_result *command_fail_badparam(struct command *cmd UNNEEDED,
+					     const char *paramname UNNEEDED,
+					     const char *buffer UNNEEDED,
+					     const jsmntok_t *tok UNNEEDED,
+					     const char *msg UNNEEDED)
+{ fprintf(stderr, "command_fail_badparam called!\n"); abort(); }
 /* Generated stub for command_filter_ptr */
 struct json_filter **command_filter_ptr(struct command *cmd UNNEEDED)
 { fprintf(stderr, "command_filter_ptr called!\n"); abort(); }

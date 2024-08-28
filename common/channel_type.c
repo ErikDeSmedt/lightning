@@ -2,20 +2,7 @@
 #include <ccan/array_size/array_size.h>
 #include <common/channel_type.h>
 
-/* BOLT #2:
- * Channel types are an explicit enumeration: for convenience of future
- * definitions they reuse even feature bits, but they are not an
- * arbitrary combination (they represent the persistent features which
- * affect the channel operation).
- *
- * The currently defined basic types are:
- *   - no features (no bits set)
- *   - `option_static_remotekey` (bit 12)
- *   - `option_anchor_outputs` and `option_static_remotekey` (bits 20 and 12)
- *   - `option_anchors_zero_fee_htlc_tx` and `option_static_remotekey` (bits 22
- *      and 12)
- */
-struct channel_type *channel_type_none(const tal_t *ctx)
+static struct channel_type *new_channel_type(const tal_t *ctx)
 {
 	struct channel_type *type = tal(ctx, struct channel_type);
 
@@ -23,21 +10,40 @@ struct channel_type *channel_type_none(const tal_t *ctx)
 	return type;
 }
 
+/* These can still exist in the database */
+struct channel_type *channel_type_none_obsolete(const tal_t *ctx)
+{
+	return new_channel_type(ctx);
+}
+
+
+/* BOLT #2:
+ * Channel types are an explicit enumeration: for convenience of future
+ * definitions they reuse even feature bits, but they are not an
+ * arbitrary combination (they represent the persistent features which
+ * affect the channel operation).
+ *
+ * The currently defined basic types are:
+ *   - `option_static_remotekey` (bit 12)
+ *   - `option_anchors` and `option_static_remotekey` (bits 22 and 12)
+ *
+ * Each basic type has the following variations allowed:
+ */
 struct channel_type *channel_type_static_remotekey(const tal_t *ctx)
 {
-	struct channel_type *type = channel_type_none(ctx);
+	struct channel_type *type = new_channel_type(ctx);
 
 	set_feature_bit(&type->features,
 			COMPULSORY_FEATURE(OPT_STATIC_REMOTEKEY));
  	return type;
 }
 
-struct channel_type *channel_type_anchor_outputs(const tal_t *ctx)
+struct channel_type *channel_type_anchor_outputs_obsolete(const tal_t *ctx)
 {
-	struct channel_type *type = channel_type_none(ctx);
+	struct channel_type *type = new_channel_type(ctx);
 
 	set_feature_bit(&type->features,
-			COMPULSORY_FEATURE(OPT_ANCHOR_OUTPUTS));
+			COMPULSORY_FEATURE(OPT_ANCHOR_OUTPUTS_DEPRECATED));
 	set_feature_bit(&type->features,
 			COMPULSORY_FEATURE(OPT_STATIC_REMOTEKEY));
 	return type;
@@ -57,7 +63,7 @@ void channel_type_set_scid_alias(struct channel_type *type)
 
 struct channel_type *channel_type_anchors_zero_fee_htlc(const tal_t *ctx)
 {
-	struct channel_type *type = channel_type_none(ctx);
+	struct channel_type *type = new_channel_type(ctx);
 
 	set_feature_bit(&type->features,
 			COMPULSORY_FEATURE(OPT_ANCHORS_ZERO_FEE_HTLC_TX));
@@ -75,35 +81,15 @@ struct channel_type *default_channel_type(const tal_t *ctx,
 	 *   - if `channel_type` was present in both `open_channel` and `accept_channel`:
 	 *     - This is the `channel_type` (they must be equal, required above)
 	 *   - otherwise:
-	 *     - if `option_anchors_zero_fee_htlc_tx` was negotiated:
-	 *       - the `channel_type` is `option_anchors_zero_fee_htlc_tx` and `option_static_remotekey` (bits 22 and 12)
-	 *   - otherwise, if `option_anchor_outputs` was negotiated:
-	 *     - the `channel_type` is `option_anchor_outputs` and
-	 *       `option_static_remotekey` (bits 20 and 12)
+	 *     - if `option_anchors` was negotiated:
+	 *       - the `channel_type` is `option_anchors` and `option_static_remotekey` (bits 22 and 12)
+	 * - otherwise:
+	 *   - the `channel_type` is `option_static_remotekey` (bit 12)
 	 */
 	if (feature_negotiated(our_features, their_features,
 			       OPT_ANCHORS_ZERO_FEE_HTLC_TX))
 		return channel_type_anchors_zero_fee_htlc(ctx);
-	if (feature_negotiated(our_features, their_features,
-			       OPT_ANCHOR_OUTPUTS))
-		return channel_type_anchor_outputs(ctx);
-	else if (feature_negotiated(our_features, their_features,
-				    OPT_DUAL_FUND))
-		/* OPT_DUAL_FUND implies static remotekey */
-		return channel_type_static_remotekey(ctx);
-	/* BOLT #2:
-	 * - otherwise, if `option_static_remotekey` was negotiated:
-	 *   - the `channel_type` is `option_static_remotekey` (bit 12)
-	 */
-	else if (feature_negotiated(our_features, their_features,
-				    OPT_STATIC_REMOTEKEY))
-		return channel_type_static_remotekey(ctx);
-	/* BOLT #2:
-	 *     - otherwise:
-	 *       - the `channel_type` is empty
-	 */
-	else
-		return channel_type_none(ctx);
+	return channel_type_static_remotekey(ctx);
 }
 
 bool channel_type_has(const struct channel_type *type, int feature)
@@ -113,7 +99,7 @@ bool channel_type_has(const struct channel_type *type, int feature)
 
 bool channel_type_has_anchors(const struct channel_type *type)
 {
-	return feature_offered(type->features, OPT_ANCHOR_OUTPUTS)
+	return feature_offered(type->features, OPT_ANCHOR_OUTPUTS_DEPRECATED)
 		|| feature_offered(type->features, OPT_ANCHORS_ZERO_FEE_HTLC_TX);
 }
 
@@ -148,7 +134,6 @@ struct channel_type *channel_type_accept(const tal_t *ctx,
 	proposed.features = tal_dup_talarr(tmpctx, u8, t);
 
 	static const size_t feats[] = {
-		OPT_ANCHOR_OUTPUTS,
 		OPT_ANCHORS_ZERO_FEE_HTLC_TX,
 		OPT_STATIC_REMOTEKEY,
 		OPT_SCID_ALIAS,
@@ -186,12 +171,10 @@ struct channel_type *channel_type_accept(const tal_t *ctx,
 		featurebits_unset(&proposed.features, variants[i]);
 
 	/* Otherwise, just needs to be a known channel type. */
-	if (channel_type_eq(&proposed, channel_type_none(tmpctx)) ||
-	    channel_type_eq(&proposed,
+	if (channel_type_eq(&proposed,
 			    channel_type_static_remotekey(tmpctx)) ||
 	    channel_type_eq(&proposed,
-			    channel_type_anchors_zero_fee_htlc(tmpctx)) ||
-	    channel_type_eq(&proposed, channel_type_anchor_outputs(tmpctx))) {
+			    channel_type_anchors_zero_fee_htlc(tmpctx))) {
 		/* At this point we know it matches, and maybe has
 		 * a couple of extra options. So let's just reply
 		 * with their proposal. */

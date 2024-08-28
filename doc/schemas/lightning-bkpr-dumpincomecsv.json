@@ -73,22 +73,6 @@
       }
     }
   },
-  "example_json_request": [
-    {
-      "id": "example:bkpr-dumpincomecsv#1",
-      "method": "bkpr-dumpincomecsv",
-      "params": [
-        "koinly",
-        "koinly.csv"
-      ]
-    }
-  ],
-  "example_json_response": [
-    {
-      "csv_file": "koinly.csv",
-      "csv_format": "koinly"
-    }
-  ],
   "author": [
     "Lisa Neigut <<niftynei@gmail.com>> is mainly responsible."
   ],
@@ -101,5 +85,21 @@
   ],
   "resources": [
     "Main web site: <https://github.com/ElementsProject/lightning>"
+  ],
+  "examples": [
+    {
+      "request": {
+        "id": "example:bkpr-dumpincomecsv#1",
+        "method": "bkpr-dumpincomecsv",
+        "params": [
+          "koinly",
+          "koinly.csv"
+        ]
+      },
+      "response": {
+        "csv_file": "koinly.csv",
+        "csv_format": "koinly"
+      }
+    }
   ]
 }

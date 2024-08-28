@@ -1,6 +1,7 @@
 /*~ This contains all the code to handle onion messages. */
 #include "config.h"
 #include <ccan/cast/cast.h>
+#include <ccan/tal/str/str.h>
 #include <common/blindedpath.h>
 #include <common/blinding.h>
 #include <common/daemon_conn.h>
@@ -35,36 +36,25 @@ void onionmsg_req(struct daemon *daemon, const u8 *msg)
 	}
 }
 
-/* Peer sends an onion msg. */
-void handle_onion_message(struct daemon *daemon,
-			  struct peer *peer, const u8 *msg)
+static const char *handle_onion(const tal_t *ctx,
+				struct daemon *daemon,
+				const struct pubkey *blinding,
+				const u8 *onion)
 {
-	struct pubkey blinding;
-	u8 *onion;
 	u8 *next_onion_msg;
-	struct pubkey next_node;
+	struct sciddir_or_pubkey next_node;
 	struct tlv_onionmsg_tlv *final_om;
 	struct pubkey final_alias;
 	struct secret *final_path_id;
+	const char *err;
 
-	/* Ignore unless explicitly turned on. */
-	if (!feature_offered(daemon->our_features->bits[NODE_ANNOUNCE_FEATURE],
-			     OPT_ONION_MESSAGES))
-		return;
-
-	/* FIXME: ratelimit! */
-	if (!fromwire_onion_message(msg, msg, &blinding, &onion)) {
-		inject_peer_msg(peer,
-				towire_warningfmt(NULL, NULL,
-						  "Bad onion_message"));
-		return;
+	err = onion_message_parse(tmpctx, onion, blinding,
+				  &daemon->mykey,
+				  &next_onion_msg, &next_node,
+				  &final_om, &final_alias, &final_path_id);
+	if (err) {
+		return tal_steal(ctx, err);
 	}
-
-	if (!onion_message_parse(tmpctx, onion, &blinding, &peer->id,
-				 &daemon->mykey,
-				 &next_onion_msg, &next_node,
-				 &final_om, &final_alias, &final_path_id))
-		return;
 
 	if (final_om) {
 		u8 *omsg;
@@ -83,16 +73,99 @@ void handle_onion_message(struct daemon *daemon,
 
 		assert(next_onion_msg);
 
-		/* FIXME: Handle short_channel_id! */
-		node_id_from_pubkey(&next_node_id, &next_node);
+		/* BOLT-offers #4:
+		 * - if it is not the final node according to the onion encryption:
+		 *...
+		 *    - if `next_node_id` is present:
+		 *      - the *next peer* is the peer with that node id.
+		 *   - otherwise, if `short_channel_id` is present and corresponds to an announced short_channel_id or a local alias for a channel:
+		 *      - the *next peer* is the peer at the other end of that channel.
+		 *   - otherwise:
+		 *      - MUST ignore the message.
+		 *   - SHOULD forward the message using `onion_message` to the *next peer*.
+		 */
+		/* Since an alias is legal here, we can't simply lookup in gossmap. */
+		if (!next_node.is_pubkey) {
+			struct scid_to_node_id *scid_to_node_id;
+
+			scid_to_node_id = scid_htable_get(daemon->scid_htable, next_node.scidd.scid);
+			if (!scid_to_node_id) {
+				return tal_fmt(ctx, "onion msg: unknown next scid %s",
+					       fmt_short_channel_id(tmpctx, next_node.scidd.scid));
+			}
+			next_node_id = scid_to_node_id->node_id;
+		} else {
+			node_id_from_pubkey(&next_node_id, &next_node.pubkey);
+		}
+
 		next_peer = peer_htable_get(daemon->peers, &next_node_id);
 		if (!next_peer) {
-			status_peer_debug(&peer->id,
-					  "onion msg: unknown next peer %s",
-					  fmt_pubkey(tmpctx, &next_node));
-			return;
+			return tal_fmt(ctx, "onion msg: unknown next peer %s",
+				       fmt_sciddir_or_pubkey(tmpctx, &next_node));
 		}
 		inject_peer_msg(next_peer, take(next_onion_msg));
 	}
+	return NULL;
 }
+
+
+/* Peer sends an onion msg, or (if peer NULL) lightningd injects one. */
+void handle_onion_message(struct daemon *daemon,
+			  struct peer *peer, const u8 *msg)
+{
+	struct pubkey blinding;
+	u8 *onion;
+	u64 msec;
+	struct timemono now = time_mono();
+
+	/* Ignore unless explicitly turned on. */
+	if (!feature_offered(daemon->our_features->bits[NODE_ANNOUNCE_FEATURE],
+			     OPT_ONION_MESSAGES))
+		return;
+
+	/* Adjust tokens if they're entitled to more */
+	msec = time_to_msec(timemono_between(now, peer->onionmsg_last_incoming));
+	peer->onionmsg_incoming_tokens += msec;
+	if (peer->onionmsg_incoming_tokens > ONION_MSG_TOKENS_MAX)
+		peer->onionmsg_incoming_tokens = ONION_MSG_TOKENS_MAX;
+	peer->onionmsg_last_incoming = now;
+
+	/* No tokens left?  Limit it */
+	if (peer->onionmsg_incoming_tokens < ONION_MSG_MSEC) {
+		/* Warn once, for debugging */
+		if (!peer->onionmsg_limit_warned) {
+			inject_peer_msg(peer,
+					take(towire_warningfmt(NULL, NULL,
+							       "Ratelimited onion_message: exceeded one per %umsec",
+							       ONION_MSG_MSEC)));
+			peer->onionmsg_limit_warned = true;
+		}
+		return;
+	}
+	peer->onionmsg_incoming_tokens -= ONION_MSG_MSEC;
+
+	if (!fromwire_onion_message(msg, msg, &blinding, &onion)) {
+		inject_peer_msg(peer,
+				take(towire_warningfmt(NULL, NULL,
+						       "Bad onion_message")));
+		return;
+	}
+
+	handle_onion(tmpctx, daemon, &blinding, onion);
+}
+
+void inject_onionmsg_req(struct daemon *daemon, const u8 *msg)
+{
+	u8 *onionmsg;
+	struct pubkey blinding;
+	const char *err;
+
+	if (!fromwire_connectd_inject_onionmsg(msg, msg, &blinding, &onionmsg))
+		master_badmsg(WIRE_CONNECTD_INJECT_ONIONMSG, msg);
+
+	err = handle_onion(tmpctx, daemon, &blinding, onionmsg);
+	daemon_conn_send(daemon->master,
+			 take(towire_connectd_inject_onionmsg_reply(NULL, err ? err : "")));
+}
+
 

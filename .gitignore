@@ -74,6 +74,7 @@ tests/primitives_pb2_grpc.py
 .DS_Store
 .gdb_history
 .python-version
+compile_commands.json
 
 # Rust targets
 target
@@ -83,8 +84,12 @@ plugins/cln-grpc
 bionic/
 focal/
 jammy/
+noble/
 release/
 .vscode/
+.cache/
 
 # Ignore release verification Sha256Sums
 SHA256SUMS-*
+doc/.doc_version
+autogenerate-examples-status.log

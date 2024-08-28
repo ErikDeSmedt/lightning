@@ -5,7 +5,6 @@
 #include <bitcoin/privkey.h>
 #include <bitcoin/psbt.h>
 #include <bitcoin/pubkey.h>
-#include <bitcoin/short_channel_id.h>
 #include <bitcoin/tx.h>
 #include <ccan/json_escape/json_escape.h>
 #include <ccan/mem/mem.h>
@@ -574,6 +573,25 @@ bool json_to_short_channel_id(const char *buffer, const jsmntok_t *tok,
 					  tok->end - tok->start, scid));
 }
 
+bool json_to_short_channel_id_dir(const char *buffer, const jsmntok_t *tok,
+				  struct short_channel_id_dir *scidd)
+{
+	jsmntok_t scidtok, numtok;
+	u32 dir;
+
+	if (!split_tok(buffer, tok, '/', &scidtok, &numtok))
+		return false;
+
+	if (!json_to_short_channel_id(buffer, &scidtok, &scidd->scid))
+		return false;
+
+	if (!json_to_u32(buffer, &numtok, &dir) || (dir > 1))
+		return false;
+
+	scidd->dir = dir;
+	return true;
+}
+
 bool json_to_txid(const char *buffer, const jsmntok_t *tok,
 		  struct bitcoin_txid *txid)
 {
@@ -647,42 +665,6 @@ struct wally_psbt *json_to_psbt(const tal_t *ctx, const char *buffer,
 				const jsmntok_t *tok)
 {
 	return psbt_from_b64(ctx, buffer + tok->start, tok->end - tok->start);
-}
-
-struct blinded_path *
-json_to_blinded_path(const tal_t *ctx, const char *buffer, const jsmntok_t *tok)
-{
-	struct blinded_path *rpath;
-	const jsmntok_t *hops, *t;
-	size_t i;
-	const char *err;
-
-	rpath = tal(ctx, struct blinded_path);
-	err = json_scan(tmpctx, buffer, tok, "{blinding:%,first_node_id:%}",
-			JSON_SCAN(json_to_pubkey, &rpath->blinding),
-			JSON_SCAN(json_to_pubkey, &rpath->first_node_id),
-			NULL);
-	if (err)
-		return tal_free(rpath);
-
-	hops = json_get_member(buffer, tok, "hops");
-	if (!hops || hops->size < 1)
-		return tal_free(rpath);
-
-	rpath->path = tal_arr(rpath, struct onionmsg_hop *, hops->size);
-	json_for_each_arr(i, t, hops) {
-		rpath->path[i] = tal(rpath->path, struct onionmsg_hop);
-		err = json_scan(tmpctx, buffer, t, "{blinded_node_id:%,encrypted_recipient_data:%}",
-				JSON_SCAN(json_to_pubkey,
-					  &rpath->path[i]->blinded_node_id),
-				JSON_SCAN_TAL(rpath->path[i],
-					      json_tok_bin_from_hex,
-					      &rpath->path[i]->encrypted_recipient_data));
-		if (err)
-			return tal_free(rpath);
-	}
-
-	return rpath;
 }
 
 bool

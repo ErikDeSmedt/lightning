@@ -1222,7 +1222,7 @@ param_funder_opt(struct command *cmd, const char *name,
 	opt_str = tal_strndup(cmd, buffer + tok->start,
 			      tok->end - tok->start);
 
-	err = funding_option(cmd->plugin, opt_str, *opt);
+	err = funding_option(cmd->plugin, opt_str, false, *opt);
 	if (err)
 		return command_fail_badparam(cmd, name, buffer, tok, err);
 
@@ -1242,7 +1242,7 @@ param_policy_mod(struct command *cmd, const char *name,
 	arg_str = tal_strndup(cmd, buffer + tok->start,
 			      tok->end - tok->start);
 
-	err = u64_option(cmd->plugin, arg_str, *mod);
+	err = u64_option(cmd->plugin, arg_str, false, *mod);
 	if (err) {
 		tal_free(err);
 		if (!parse_amount_sat(&sats, arg_str, strlen(arg_str)))
@@ -1432,11 +1432,6 @@ json_funderupdate(struct command *cmd,
 static const struct plugin_command commands[] = {
 	{
 		"funderupdate",
-		"liquidity",
-		"Configuration for dual-funding settings.",
-		"Update current settings. Modifies how node reacts to"
-		" incoming channel open requests. Responds with list"
-		" of current configs.",
 		json_funderupdate
 	},
 };
@@ -1542,19 +1537,23 @@ const struct plugin_notification notifs[] = {
 	},
 };
 
-static char *option_channel_base(struct plugin *plugin, const char *arg, struct funder_policy *policy)
+static char *option_channel_base(struct plugin *plugin, const char *arg,
+				 bool check_only, struct funder_policy *policy)
 {
 	struct amount_msat amt;
+	u32 cfmbm;
 
 	if (!parse_amount_msat(&amt, arg, strlen(arg)))
 		return tal_fmt(tmpctx, "Unable to parse amount '%s'", arg);
 
-	if (!policy->rates)
-		policy->rates = default_lease_rates(policy);
-
-	if (!assign_overflow_u32(&policy->rates->channel_fee_max_base_msat,
-				amt.millisatoshis)) /* Raw: conversion */
+	if (!assign_overflow_u32(&cfmbm, amt.millisatoshis)) /* Raw: conversion */
 		return tal_fmt(tmpctx, "channel_fee_max_base_msat overflowed");
+
+	if (!check_only) {
+		if (!policy->rates)
+			policy->rates = default_lease_rates(policy);
+		policy->rates->channel_fee_max_base_msat = cfmbm;
+	}
 
 	return NULL;
 }
@@ -1562,74 +1561,131 @@ static char *option_channel_base(struct plugin *plugin, const char *arg, struct 
 static char *
 option_channel_fee_proportional_thousandths_max(struct plugin *plugin,
 						const char *arg,
+						bool check_only,
 						struct funder_policy *policy)
 {
+	u16 fptm;
+	char *problem = u16_option(plugin, arg, false, &fptm);
+
+	if (problem || check_only)
+		return problem;
+
 	if (!policy->rates)
 		policy->rates = default_lease_rates(policy);
-	return u16_option(plugin, arg, &policy->rates->channel_fee_max_proportional_thousandths);
-}
-
-static char *amount_option(struct plugin *plugin, const char *arg, struct amount_sat *amt)
-{
-	if (!parse_amount_sat(amt, arg, strlen(arg)))
-		return tal_fmt(tmpctx, "Unable to parse amount '%s'", arg);
-
+	policy->rates->channel_fee_max_proportional_thousandths = fptm;
 	return NULL;
 }
 
+static char *amount_option(struct plugin *plugin, const char *arg, bool check_only,
+			   struct amount_sat *amt)
+{
+	struct amount_sat v;
+	if (!parse_amount_sat(&v, arg, strlen(arg)))
+		return tal_fmt(tmpctx, "Unable to parse amount '%s'", arg);
+
+	if (!check_only)
+		*amt = v;
+	return NULL;
+}
+
+static bool jsonfmt_amount_sat(struct plugin *plugin,
+			       struct json_stream *js,
+			       const char *fieldname,
+			       struct amount_sat *sats)
+{
+	/* We do not expose raw numbers for sats fields: raw numbers
+	 * in our interface means MSAT! */
+	json_add_str_fmt(js, fieldname, "%"PRIu64"sat", sats->satoshis /* Raw: fmt */);
+	return true;
+}
+
 static char *option_lease_fee_base(struct plugin *plugin, const char *arg,
+				   bool check_only,
 				   struct funder_policy *policy)
 {
 	struct amount_sat amt;
+	u32 lfbs;
 	char *err;
-	if (!policy->rates)
-		policy->rates = default_lease_rates(policy);
 
-	err = amount_option(plugin, arg, &amt);
+	err = amount_option(plugin, arg, false, &amt);
 	if (err)
 		return err;
 
-	if (!assign_overflow_u32(&policy->rates->lease_fee_base_sat,
-				 amt.satoshis)) /* Raw: conversion */
+	if (!assign_overflow_u32(&lfbs, amt.satoshis)) /* Raw: conversion */
 		return tal_fmt(tmpctx, "lease_fee_base_sat overflowed");
+
+	if (!check_only) {
+		if (!policy->rates)
+			policy->rates = default_lease_rates(policy);
+
+		policy->rates->lease_fee_base_sat = lfbs;
+	}
 
 	return NULL;
 }
 
 static char *option_lease_fee_basis(struct plugin *plugin, const char *arg,
+				    bool check_only,
 				    struct funder_policy *policy)
 {
+	u16 lfb;
+	char *problem = u16_option(plugin, arg, false, &lfb);
+
+	if (problem || check_only)
+		return problem;
+
 	if (!policy->rates)
 		policy->rates = default_lease_rates(policy);
-	return u16_option(plugin, arg, &policy->rates->lease_fee_basis);
+	policy->rates->lease_fee_basis = lfb;
+	return NULL;
 }
 
 static char *option_lease_weight_max(struct plugin *plugin, const char *arg,
+				     bool check_only,
 				     struct funder_policy *policy)
 {
+	u16 fw;
+	char *problem = u16_option(plugin, arg, false, &fw);
+
+	if (problem || check_only)
+		return problem;
+
 	if (!policy->rates)
 		policy->rates = default_lease_rates(policy);
-	return u16_option(plugin, arg, &policy->rates->funding_weight);
+	policy->rates->funding_weight = fw;
+	return NULL;
 }
 
 static char *amount_sat_or_u64_option(struct plugin *plugin,
-				      const char *arg, u64 *amt)
+				      const char *arg,
+				      bool check_only,
+				      u64 *amt)
 {
 	struct amount_sat sats;
 	char *err;
 
-	err = u64_option(plugin, arg, amt);
+	err = u64_option(plugin, arg, false, &sats.satoshis); /* Raw: want sats below */
 	if (err) {
 		tal_free(err);
 		if (!parse_amount_sat(&sats, arg, strlen(arg)))
 			return tal_fmt(tmpctx,
 				       "Unable to parse option '%s'",
 				       arg);
-
-		*amt = sats.satoshis; /* Raw: convert to u64 */
 	}
 
+	if (!check_only)
+		*amt = sats.satoshis; /* Raw: convert to u64 */
+
 	return NULL;
+}
+
+static bool jsonfmt_policy_mod(struct plugin *plugin,
+			       struct json_stream *js,
+			       const char *fieldname,
+			       u64 *amt)
+{
+	json_add_u64(js, fieldname, *amt);
+	return true;
 }
 
 int main(int argc, char **argv)
@@ -1639,7 +1695,7 @@ int main(int argc, char **argv)
 	/* Our default funding policy is fixed (0msat) */
 	current_policy = default_funder_policy(NULL, FIXED, 0);
 
-	plugin_main(argv, init, PLUGIN_RESTARTABLE, true,
+	plugin_main(argv, init, NULL, PLUGIN_RESTARTABLE, true,
 		    NULL,
 		    commands, ARRAY_SIZE(commands),
 		    notifs, ARRAY_SIZE(notifs),
@@ -1649,93 +1705,111 @@ int main(int argc, char **argv)
 				  "string",
 				  "Policy to use for dual-funding requests."
 				  " [match, available, fixed]",
-				  funding_option, &current_policy->opt),
+				  funding_option,
+				  jsonfmt_funding_option,
+				  &current_policy->opt),
 		    plugin_option("funder-policy-mod",
 				  "string",
 				  "Percent to apply policy at"
 				  " (match/available); or amount to fund"
 				  " (fixed)",
 				  amount_sat_or_u64_option,
+				  jsonfmt_policy_mod,
 				  &current_policy->mod),
 		    plugin_option("funder-min-their-funding",
 				  "string",
 				  "Minimum funding peer must open with"
 				  " to activate our policy",
 				  amount_option,
+				  jsonfmt_amount_sat,
 				  &current_policy->min_their_funding),
 		    plugin_option("funder-max-their-funding",
 				  "string",
 				  "Maximum funding peer may open with"
 				  " to activate our policy",
 				  amount_option,
+				  jsonfmt_amount_sat,
 				  &current_policy->max_their_funding),
 		    plugin_option("funder-per-channel-min",
 				  "string",
 				  "Minimum funding we'll add to a channel."
 				  " If we can't meet this, we don't fund",
 				  amount_option,
+				  jsonfmt_amount_sat,
 				  &current_policy->per_channel_min),
 		    plugin_option("funder-per-channel-max",
 				  "string",
 				  "Maximum funding we'll add to a channel."
 				  " We cap all contributions to this",
 				  amount_option,
+				  jsonfmt_amount_sat,
 				  &current_policy->per_channel_max),
 		    plugin_option("funder-reserve-tank",
 				  "string",
 				  "Amount of funds we'll always leave"
 				  " available.",
 				  amount_option,
+				  jsonfmt_amount_sat,
 				  &current_policy->reserve_tank),
 		    plugin_option("funder-fuzz-percent",
 				  "int",
 				  "Percent to fuzz the policy contribution by."
 				  " Defaults to 0%. Max is 100%",
-				  u32_option,
+				  u32_option, u32_jsonfmt,
 				  &current_policy->fuzz_factor),
 		    plugin_option("funder-fund-probability",
 				  "int",
 				  "Percent of requests to consider."
 				  " Defaults to 100%. Setting to 0% will"
 				  " disable dual-funding",
-				  u32_option,
+				  u32_option, u32_jsonfmt,
 				  &current_policy->fund_probability),
 		    plugin_option("funder-lease-requests-only",
 				  "bool",
 				  "Only fund lease requests. Defaults to"
 				  " true if channel lease rates are"
 				  " being advertised",
-				  bool_option,
+				  bool_option, bool_jsonfmt,
 				  &current_policy->leases_only),
 		    plugin_option("lease-fee-base-sat",
 				  "string",
 				  "Channel lease rates, base fee for leased"
 				  " funds, in satoshi.",
-				  option_lease_fee_base, current_policy),
+				  option_lease_fee_base,
+				  NULL,
+				  current_policy),
 		    plugin_option("lease-fee-basis",
 				  "int",
 				  "Channel lease rates, basis charged"
 				  " for leased funds (per 10,000 satoshi.)",
-				  option_lease_fee_basis, current_policy),
+				  option_lease_fee_basis,
+				  NULL,
+				  current_policy),
 		    plugin_option("lease-funding-weight",
 				  "int",
 				  "Channel lease rates, weight"
 				  " we'll ask opening peer to pay for in"
 				  " funding transaction",
-				  option_lease_weight_max, current_policy),
+				  option_lease_weight_max,
+				  NULL,
+				  current_policy),
 		    plugin_option("channel-fee-max-base-msat",
 				  "string",
 				  "Channel lease rates, maximum channel"
 				  " fee base we'll charge for funds"
 				  " routed through a leased channel.",
-				  option_channel_base, current_policy),
+				  option_channel_base,
+				  NULL,
+				  current_policy),
 		    plugin_option("channel-fee-max-proportional-thousandths",
 				  "int",
 				  "Channel lease rates, maximum"
 				  " proportional fee (in thousandths, or ppt)"
 				  " we'll charge for funds routed through a"
 				  " leased channel. Note: 1ppt = 1,000ppm",
-				  option_channel_fee_proportional_thousandths_max, current_policy),
+				  option_channel_fee_proportional_thousandths_max,
+				  NULL,
+				  current_policy),
 		    NULL);
 
 	tal_free(current_policy);

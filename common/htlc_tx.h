@@ -20,17 +20,17 @@ static inline struct amount_sat htlc_timeout_fee(u32 feerate_per_kw,
 	/* BOLT #3:
 	 *
 	 * The fee for an HTLC-timeout transaction:
-	 * - If `option_anchors_zero_fee_htlc_tx` applies:
+	 * - If `option_anchors` applies:
 	 *   1. MUST be 0.
 	 * - Otherwise, MUST be calculated to match:
-	 *   1. Multiply `feerate_per_kw` by 663 (666 if `option_anchor_outputs`
-	 *      applies) and divide by 1000 (rounding down).
+	 *   1. Multiply `feerate_per_kw` by 663 and divide by 1000 (rounding down).
 	 */
 	u32 base;
 
 	if (option_anchors_zero_fee_htlc_tx)
 		return AMOUNT_SAT(0);
 
+	/* FIXME: Older bolt had "(666 if `option_anchor_outputs` applies)" */
 	if (option_anchor_outputs)
 		base = 666;
 	else
@@ -46,17 +46,17 @@ static inline struct amount_sat htlc_success_fee(u32 feerate_per_kw,
 	/* BOLT #3:
 	 *
 	 * The fee for an HTLC-success transaction:
-	 * - If `option_anchors_zero_fee_htlc_tx` applies:
+	 * - If `option_anchors` applies:
 	 *   1. MUST be 0.
 	 * - Otherwise, MUST be calculated to match:
-	 *   1. Multiply `feerate_per_kw` by 703 (706 if `option_anchor_outputs`
-	 *      applies) and divide by 1000 (rounding down).
+	 *   1. Multiply `feerate_per_kw` by 703 and divide by 1000 (rounding down).
 	 */
 	u32 base;
 
 	if (option_anchors_zero_fee_htlc_tx)
 		return AMOUNT_SAT(0);
 
+	/* FIXME: older bolt used to say "(706 if `option_anchor_outputs` applies) */
 	if (option_anchor_outputs)
 		base = 706;
 	else

@@ -128,6 +128,8 @@ static const char *level_prefix(enum log_level level)
 	case LOG_IO_OUT:
 	case LOG_IO_IN:
 		return "IO     ";
+	case LOG_TRACE:
+		return "TRACE  ";
 	case LOG_DBG:
 		return "DEBUG  ";
 	case LOG_INFORM:
@@ -298,6 +300,9 @@ static u32 delete_threshold(enum log_level level)
 	case LOG_IO_OUT:
 	case LOG_IO_IN:
 		return 900;
+	/* 50% of LOG_TRACE */
+	case LOG_TRACE:
+		return 750;
 	/* 50% of LOG_DBG */
 	case LOG_DBG:
 		return 500;
@@ -470,7 +475,7 @@ const char *log_prefix(const struct logger *log)
 
 bool log_has_io_logging(const struct logger *log)
 {
-	return print_level(log->log_book, log->prefix, log->default_node_id, NULL) < LOG_DBG;
+	return print_level(log->log_book, log->prefix, log->default_node_id, NULL) < LOG_TRACE;
 }
 
 /* This may move entry! */
@@ -540,6 +545,13 @@ static void maybe_print(struct logger *log, const struct log_entry *l)
 			     log->log_book->log_files);
 }
 
+static void maybe_notify_log(struct logger *log,
+			     const struct log_entry *l)
+{
+	if (l->level >= log->print_level)
+		notify_log(log->log_book->ld, l);
+}
+
 void logv(struct logger *log, enum log_level level,
 	  const struct node_id *node_id,
 	  bool call_notifier,
@@ -561,6 +573,7 @@ void logv(struct logger *log, enum log_level level,
 			l->log[i] = '?';
 
 	maybe_print(log, l);
+	maybe_notify_log(log, l);
 
 	add_entry(log, &l);
 
@@ -682,6 +695,7 @@ static void log_one_line(unsigned int skipped,
 		prefix,
 		level == LOG_IO_IN ? "IO_IN"
 		: level == LOG_IO_OUT ? "IO_OUT"
+		: level == LOG_TRACE ? "TRACE"
 		: level == LOG_DBG ? "DEBUG"
 		: level == LOG_INFORM ? "INFO"
 		: level == LOG_UNUSUAL ? "UNUSUAL"
@@ -901,9 +915,8 @@ void opt_register_logging(struct lightningd *ld)
 		       opt_set_bool_arg, opt_show_bool,
 		       &ld->log_book->print_timestamps,
 		       "prefix log messages with timestamp");
-	opt_register_early_arg("--log-prefix", arg_log_prefix, show_log_prefix,
-			       ld->log_book,
-			       "log prefix");
+	clnopt_witharg("--log-prefix", OPT_EARLY|OPT_KEEP_WHITESPACE,
+		       arg_log_prefix, show_log_prefix, ld->log_book, "log prefix");
 	clnopt_witharg("--log-file=<file>",
 		       OPT_EARLY|OPT_MULTI,
 		       arg_log_to_file, NULL, ld,
@@ -1084,6 +1097,7 @@ static void log_to_json(unsigned int skipped,
 			: level == LOG_UNUSUAL ? "UNUSUAL"
 			: level == LOG_INFORM ? "INFO"
 			: level == LOG_DBG ? "DEBUG"
+			: level == LOG_TRACE ? "TRACE"
 			: level == LOG_IO_IN ? "IO_IN"
 			: level == LOG_IO_OUT ? "IO_OUT"
 			: "UNKNOWN");
@@ -1157,8 +1171,6 @@ static struct command_result *json_getlog(struct command *cmd,
 
 static const struct json_command getlog_command = {
 	"getlog",
-	"utility",
 	json_getlog,
-	"Show logs, with optional log {level} (info|unusual|debug|io)"
 };
 AUTODATA(json_command, &getlog_command);

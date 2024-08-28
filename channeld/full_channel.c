@@ -241,7 +241,7 @@ static void add_htlcs(struct bitcoin_tx ***txs,
 {
 	struct bitcoin_outpoint outpoint;
 	u32 htlc_feerate_per_kw;
-	bool option_anchor_outputs = channel_has(channel, OPT_ANCHOR_OUTPUTS);
+	bool option_anchor_outputs = channel_has(channel, OPT_ANCHOR_OUTPUTS_DEPRECATED);
 	bool option_anchors_zero_fee_htlc_tx = channel_has(channel, OPT_ANCHORS_ZERO_FEE_HTLC_TX);
 
 	if (channel_has(channel, OPT_ANCHORS_ZERO_FEE_HTLC_TX))
@@ -361,7 +361,7 @@ struct bitcoin_tx **channel_txs(const tal_t *ctx,
 	    channel->config[side].dust_limit, side_pay,
 	    other_side_pay, committed, htlcmap, direct_outputs,
 	    commitment_number ^ channel->commitment_number_obscurer,
-	    channel_has(channel, OPT_ANCHOR_OUTPUTS),
+	    channel_has(channel, OPT_ANCHOR_OUTPUTS_DEPRECATED),
 	    channel_has(channel, OPT_ANCHORS_ZERO_FEE_HTLC_TX),
 	    side, other_anchor_outnum);
 
@@ -462,7 +462,7 @@ static struct amount_sat fee_for_htlcs(const struct channel *channel,
 	u32 feerate = channel_feerate(channel, side);
 	struct amount_sat dust_limit = channel->config[side].dust_limit;
 	size_t untrimmed;
-	bool option_anchor_outputs = channel_has(channel, OPT_ANCHOR_OUTPUTS);
+	bool option_anchor_outputs = channel_has(channel, OPT_ANCHOR_OUTPUTS_DEPRECATED);
 	bool option_anchors_zero_fee_htlc_tx = channel_has(channel, OPT_ANCHORS_ZERO_FEE_HTLC_TX);
 
 	untrimmed = num_untrimmed_htlcs(side, dust_limit, feerate,
@@ -484,7 +484,7 @@ static bool htlc_dust(const struct channel *channel,
 		      struct amount_msat *trim_total)
 {
 	struct amount_sat dust_limit = channel->config[side].dust_limit;
-	bool option_anchor_outputs = channel_has(channel, OPT_ANCHOR_OUTPUTS);
+	bool option_anchor_outputs = channel_has(channel, OPT_ANCHOR_OUTPUTS_DEPRECATED);
 	bool option_anchors_zero_fee_htlc_tx = channel_has(channel, OPT_ANCHORS_ZERO_FEE_HTLC_TX);
 	struct amount_msat trim_rmvd = AMOUNT_MSAT(0);
 
@@ -522,7 +522,7 @@ static bool htlc_dust(const struct channel *channel,
  *
  * To mostly avoid this situation, at least from our side, we apply an
  * additional constraint when we're opener trying to add an HTLC: make
- * sure we can afford one more HTLC, even if fees increase by 100%.
+ * sure we can afford one more HTLC, even if fees increase.
  *
  * We could do this for the peer, as well, by rejecting their HTLC
  * immediately in this case.  But rejecting a remote HTLC here causes
@@ -544,7 +544,7 @@ static bool local_opener_has_fee_headroom(const struct channel *channel,
 	u32 feerate = channel_feerate(channel, LOCAL);
 	size_t untrimmed;
 	struct amount_sat fee;
-	bool option_anchor_outputs = channel_has(channel, OPT_ANCHOR_OUTPUTS);
+	bool option_anchor_outputs = channel_has(channel, OPT_ANCHOR_OUTPUTS_DEPRECATED);
 	bool option_anchors_zero_fee_htlc_tx = channel_has(channel, OPT_ANCHORS_ZERO_FEE_HTLC_TX);
 
 	assert(channel->opener == LOCAL);
@@ -559,17 +559,17 @@ static bool local_opener_has_fee_headroom(const struct channel *channel,
 
 	/* Now, how much would it cost us if feerate increases 100% and we added
 	 * another HTLC? */
-	fee = commit_tx_base_fee(2 * feerate, untrimmed + 1,
+	fee = commit_tx_base_fee(marginal_feerate(feerate), untrimmed + 1,
 				 option_anchor_outputs,
 				 option_anchors_zero_fee_htlc_tx);
 	if (amount_msat_greater_eq_sat(remainder, fee))
 		return true;
 
 	status_debug("Adding HTLC would leave us only %s: we need %s for"
-		     " another HTLC if fees increase by 100%% to %uperkw",
+		     " another HTLC if fees increase from %uperkw to %uperkw",
 		     fmt_amount_msat(tmpctx, remainder),
 		     fmt_amount_sat(tmpctx, fee),
-		     feerate + feerate);
+		     feerate, marginal_feerate(feerate));
 	return false;
 }
 
@@ -593,7 +593,7 @@ static enum channel_add_err add_htlc(struct channel *channel,
 	const struct htlc **committed, **adding, **removing;
 	const struct channel_view *view;
 	size_t htlc_count;
-	bool option_anchor_outputs = channel_has(channel, OPT_ANCHOR_OUTPUTS);
+	bool option_anchor_outputs = channel_has(channel, OPT_ANCHOR_OUTPUTS_DEPRECATED);
 	bool option_anchors_zero_fee_htlc_tx = channel_has(channel, OPT_ANCHORS_ZERO_FEE_HTLC_TX);
 	u32 feerate, feerate_ceil;
 
@@ -1217,7 +1217,7 @@ u32 approx_max_feerate(const struct channel *channel)
 	struct amount_msat avail;
 	struct balance balance;
 	const struct htlc **committed, **adding, **removing;
-	bool option_anchor_outputs = channel_has(channel, OPT_ANCHOR_OUTPUTS);
+	bool option_anchor_outputs = channel_has(channel, OPT_ANCHOR_OUTPUTS_DEPRECATED);
 	bool option_anchors_zero_fee_htlc_tx = channel_has(channel, OPT_ANCHORS_ZERO_FEE_HTLC_TX);
 
 	gather_htlcs(tmpctx, channel, !channel->opener,
@@ -1298,7 +1298,7 @@ bool can_opener_afford_feerate(const struct channel *channel, u32 feerate_per_kw
 	struct amount_sat dust_limit = channel->config[!channel->opener].dust_limit;
 	size_t untrimmed;
 	const struct htlc **committed, **adding, **removing;
-	bool option_anchor_outputs = channel_has(channel, OPT_ANCHOR_OUTPUTS);
+	bool option_anchor_outputs = channel_has(channel, OPT_ANCHOR_OUTPUTS_DEPRECATED);
 	bool option_anchors_zero_fee_htlc_tx = channel_has(channel, OPT_ANCHORS_ZERO_FEE_HTLC_TX);
 	struct balance balance;
 	struct amount_msat available;

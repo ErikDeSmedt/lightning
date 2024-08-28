@@ -9,6 +9,9 @@
     "",
     "There are two considerations for how good a route is: how low the fees are, and how long your payment will get stuck in a delayed output if a node goes down during the process. ."
   ],
+  "categories": [
+    "readonly"
+  ],
   "request": {
     "required": [
       "id",
@@ -352,81 +355,6 @@
     "",
     "The default for lightning-pay(7) is 10, which starts to become a major factor for larger amounts, and is basically ignored for tiny ones."
   ],
-  "example_json_request": [
-    {
-      "id": "example:getroute#1",
-      "method": "getroute",
-      "params": {
-        "id": "0266e4598d1d3c415f572a8488830b60f7e744ed9235eb0b1ba93283b315c03518",
-        "amount_msat": 50000000,
-        "riskfactor": 1,
-        "cltv": 9,
-        "fromid": null,
-        "fuzzpercent": null,
-        "exclude": null,
-        "maxhops": null
-      }
-    },
-    {
-      "id": "example:getroute#2",
-      "method": "getroute",
-      "params": {
-        "id": "035d2b1192dfba134e10e540875d366ebc8bc353d5aa766b80c090b39c3a5d885d",
-        "amount_msat": "50000sat",
-        "riskfactor": 10
-      }
-    }
-  ],
-  "example_json_response": [
-    {
-      "route": [
-        {
-          "id": "035d2b1192dfba134e10e540875d366ebc8bc353d5aa766b80c090b39c3a5d885d",
-          "channel": "103x3x0",
-          "direction": 1,
-          "amount_msat": 50001002,
-          "delay": 21,
-          "style": "tlv"
-        },
-        {
-          "id": "022d223620a359a47ff7f7ac447c85c46c923da53389221a0054c11c1e3ca31d59",
-          "channel": "103x1x0",
-          "direction": 1,
-          "amount_msat": 50000501,
-          "delay": 15,
-          "style": "tlv"
-        },
-        {
-          "id": "0266e4598d1d3c415f572a8488830b60f7e744ed9235eb0b1ba93283b315c03518",
-          "channel": "103x2x0",
-          "direction": 0,
-          "amount_msat": 50000000,
-          "delay": 9,
-          "style": "tlv"
-        }
-      ]
-    },
-    {
-      "route": [
-        {
-          "id": "022d223620a359a47ff7f7ac447c85c46c923da53389221a0054c11c1e3ca31d59",
-          "channel": "103x2x0",
-          "direction": 1,
-          "amount_msat": 50051000,
-          "delay": 15,
-          "style": "tlv"
-        },
-        {
-          "id": "035d2b1192dfba134e10e540875d366ebc8bc353d5aa766b80c090b39c3a5d885d",
-          "channel": "103x1x0",
-          "direction": 0,
-          "amount_msat": 50000000,
-          "delay": 9,
-          "style": "tlv"
-        }
-      ]
-    }
-  ],
   "author": [
     "Rusty Russell <<rusty@rustcorp.com.au>> is mainly responsible."
   ],
@@ -436,5 +364,70 @@
   ],
   "resources": [
     "Main web site: <https://github.com/ElementsProject/lightning>"
+  ],
+  "examples": [
+    {
+      "request": {
+        "id": "example:getroute#1",
+        "method": "getroute",
+        "params": {
+          "id": "035d2b1192dfba134e10e540875d366ebc8bc353d5aa766b80c090b39c3a5d885d",
+          "amount_msat": 10000,
+          "riskfactor": 1
+        }
+      },
+      "response": {
+        "route": [
+          {
+            "id": "022d223620a359a47ff7f7ac447c85c46c923da53389221a0054c11c1e3ca31d59",
+            "channel": "109x1x1",
+            "direction": 1,
+            "amount_msat": 10001,
+            "delay": 15,
+            "style": "tlv"
+          },
+          {
+            "id": "035d2b1192dfba134e10e540875d366ebc8bc353d5aa766b80c090b39c3a5d885d",
+            "channel": "111x1x0",
+            "direction": 0,
+            "amount_msat": 10000,
+            "delay": 9,
+            "style": "tlv"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "id": "example:getroute#2",
+        "method": "getroute",
+        "params": {
+          "id": "0382ce59ebf18be7d84677c2e35f23294b9992ceca95491fcf8a56c6cb2d9de199",
+          "amount_msat": 500000,
+          "riskfactor": 10,
+          "cltv": 9
+        }
+      },
+      "response": {
+        "route": [
+          {
+            "id": "035d2b1192dfba134e10e540875d366ebc8bc353d5aa766b80c090b39c3a5d885d",
+            "channel": "111x1x0",
+            "direction": 0,
+            "amount_msat": 500006,
+            "delay": 15,
+            "style": "tlv"
+          },
+          {
+            "id": "0382ce59ebf18be7d84677c2e35f23294b9992ceca95491fcf8a56c6cb2d9de199",
+            "channel": "113x1x1",
+            "direction": 0,
+            "amount_msat": 500000,
+            "delay": 9,
+            "style": "tlv"
+          }
+        ]
+      }
+    }
   ]
 }

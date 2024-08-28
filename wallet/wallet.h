@@ -608,6 +608,16 @@ void wallet_htlcsigs_confirm_inflight(struct wallet *w, struct channel *chan,
 void wallet_channel_save(struct wallet *w, struct channel *chan);
 
 /**
+ * wallet_channels_by_dbid -- Check if an ID is preoccupied inside the `channels` table
+ *
+ * @wallet: the wallet
+ * @dbid: the ID at which we want to check the value.
+ *
+ * Returns `true` if it is occupied, false otherwise.
+*/
+bool channel_exists_by_id(struct wallet *w, u64 dbid);
+
+/**
  * wallet_channel_insert -- Insert the initial channel into the database
  *
  * @wallet: the wallet to save into
@@ -717,15 +727,11 @@ void wallet_channel_stats_load(struct wallet *w, u64 cdbid, struct channel_stats
 /**
  * Retrieve the blockheight of the last block processed by lightningd.
  *
- * Will set min/max either the minimal/maximal blockheight or the default value
- * if the wallet was never used before.
+ * Will return the 0 if the wallet was never used before.
  *
  * @w: wallet to load from.
- * @def: the default value to return if we've never used the wallet before
- * @min(out): height of the first block we track
- * @max(out): height of the last block we added
  */
-void wallet_blocks_heights(struct wallet *w, u32 def, u32 *min, u32 *max);
+u32 wallet_blocks_maxheight(struct wallet *w);
 
 /**
  * wallet_extract_owned_outputs - given a tx, extract all of our outputs
@@ -1244,16 +1250,22 @@ void wallet_forwarded_payment_add(struct wallet *w, const struct htlc_in *in,
 struct amount_msat wallet_total_forward_fees(struct wallet *w);
 
 /**
- * Retrieve a list of all forwarded_payments
+ * Retrieve forwarded_payments
  */
-const struct forwarding *wallet_forwarded_payments_get(const tal_t *ctx,
-						       struct wallet *w,
-						       enum forward_status state,
-						       const struct short_channel_id *chan_in,
-						       const struct short_channel_id *chan_out,
-						       const enum wait_index *listindex,
-						       u64 liststart,
-						       const u32 *listlimit);
+struct db_stmt *forwarding_first(struct wallet *w,
+				 enum forward_status status,
+				 const struct short_channel_id *chan_in,
+				 const struct short_channel_id *chan_out,
+				 const enum wait_index *listindex,
+				 u64 liststart,
+				 const u32 *listlimit);
+
+struct db_stmt *forwarding_next(struct wallet *w,
+				struct db_stmt *stmt);
+
+const struct forwarding *forwarding_details(const tal_t *ctx,
+					    struct wallet *w,
+					    struct db_stmt *stmt);
 
 /**
  * Delete a particular forward entry
@@ -1450,6 +1462,18 @@ struct db_stmt *wallet_offer_id_next(struct wallet *w,
  *
  * Must exist.  Returns new status. */
 enum offer_status wallet_offer_disable(struct wallet *w,
+				       const struct sha256 *offer_id,
+				       enum offer_status s)
+	NO_NULL_ARGS;
+
+/**
+ * Enable an offer in the database.
+ * @w: the wallet
+ * @offer_id: the merkle root, as used for signing (must be unique)
+ * @s: the current status (must be active).
+ *
+ * Must exist.  Returns new status. */
+enum offer_status wallet_offer_enable(struct wallet *w,
 				       const struct sha256 *offer_id,
 				       enum offer_status s)
 	NO_NULL_ARGS;

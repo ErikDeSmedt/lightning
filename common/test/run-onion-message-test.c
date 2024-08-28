@@ -14,6 +14,7 @@ static void maybe_print(const char *fmt, ...);
 #include "../hmac.c"
 #include "../onion_encode.c"
 #include "../onion_message_parse.c"
+#include "../sciddir_or_pubkey.c"
 #include "../sphinx.c"
 #include "../../wire/onion_wiregen.c"
 #include "../../wire/peer_wiregen.c"
@@ -35,12 +36,6 @@ struct onionreply *new_onionreply(const tal_t *ctx UNNEEDED, const u8 *contents 
 /* Generated stub for pubkey_from_node_id */
 bool pubkey_from_node_id(struct pubkey *key UNNEEDED, const struct node_id *id UNNEEDED)
 { fprintf(stderr, "pubkey_from_node_id called!\n"); abort(); }
-/* Generated stub for status_fmt */
-void status_fmt(enum log_level level UNNEEDED,
-		const struct node_id *peer UNNEEDED,
-		const char *fmt UNNEEDED, ...)
-
-{ fprintf(stderr, "status_fmt called!\n"); abort(); }
 /* Generated stub for towire_channel_id */
 void towire_channel_id(u8 **pptr UNNEEDED, const struct channel_id *channel_id UNNEEDED)
 { fprintf(stderr, "towire_channel_id called!\n"); abort(); }
@@ -330,7 +325,7 @@ int main(int argc, char *argv[])
 	/* Make it use our session key! */
 	sphinx_path->session_key = &session_key;
 
-	/* BOLT-onion-message #4:
+	/* BOLT #4:
 	 * - SHOULD set `onion_message_packet` `len` to 1366 or 32834.
 	 */
 	op = create_onionpacket(tmpctx, sphinx_path, ROUTING_INFO_SIZE,
@@ -347,7 +342,7 @@ int main(int argc, char *argv[])
 
 	json_start("hops", '[');
 	for (size_t i = 0; i < ARRAY_SIZE(erd); i++) {
-		struct pubkey next_node_id;
+		struct sciddir_or_pubkey next_node;
 		struct tlv_onionmsg_tlv *final_om;
 		struct pubkey final_alias;
 		struct secret *final_path_id;
@@ -363,14 +358,15 @@ int main(int argc, char *argv[])
 
 		/* For test_ecdh */
 		mykey = &privkey[i];
-		assert(onion_message_parse(tmpctx, onion_message_packet, &blinding_pub, NULL,
+		assert(onion_message_parse(tmpctx, onion_message_packet, &blinding_pub,
 					   &id[i],
-					   &onion_message, &next_node_id,
+					   &onion_message, &next_node,
 					   &final_om,
 					   &final_alias,
-					   &final_path_id));
+					   &final_path_id) == NULL);
 		if (onion_message) {
-			json_pubkey("next_node_id", &next_node_id);
+			assert(next_node.is_pubkey);
+			json_pubkey("next_node_id", &next_node.pubkey);
 		} else {
 			const struct tlv_field *hello;
 			json_start("tlvs", '{');

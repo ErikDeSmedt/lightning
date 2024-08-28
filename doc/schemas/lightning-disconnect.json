@@ -15,17 +15,7 @@
       "id": {
         "type": "pubkey",
         "description": [
-          "The public key of the peer to terminate the connection. It can be discovered in the output of the listpeers command, which returns a set of peers:",
-          "{",
-          "  'peers':",
-          "  [",
-          "    {",
-          "      'id': '0563aea81...',",
-          "      'connected': true,",
-          "      ...",
-          "    }",
-          "  ]",
-          "}"
+          "The public key of the peer to terminate the connection. It can be discovered as peer_id in the output of the listpeerchannels command."
         ]
       },
       "force": {
@@ -45,36 +35,38 @@
     "- -32602: If the given parameters are wrong.",
     "- -1: Catchall nonspecific error."
   ],
-  "example_json_request": [
-    {
-      "id": "example:disconnect#1",
-      "method": "disconnect",
-      "params": {
-        "id": "0266e4598d1d3c415f572a8488830b60f7e744ed9235eb0b1ba93283b315c03518",
-        "force": false
-      }
-    },
-    {
-      "id": "example:disconnect#2",
-      "method": "disconnect",
-      "params": {
-        "id": "022d223620a359a47ff7f7ac447c85c46c923da53389221a0054c11c1e3ca31d59",
-        "force": true
-      }
-    }
-  ],
-  "example_json_response": [
-    {},
-    {}
-  ],
   "author": [
     "Michael Hawkins <<michael.hawkins@protonmail.com>>."
   ],
   "see_also": [
-    "lightning-connect(1)",
-    "lightning-listpeers(1)"
+    "lightning-connect(7)",
+    "lightning-listpeerchannels(7)"
   ],
   "resources": [
     "Main web site: <https://github.com/ElementsProject/lightning>"
+  ],
+  "examples": [
+    {
+      "request": {
+        "id": "example:disconnect#1",
+        "method": "disconnect",
+        "params": {
+          "id": "0382ce59ebf18be7d84677c2e35f23294b9992ceca95491fcf8a56c6cb2d9de199",
+          "force": false
+        }
+      },
+      "response": {}
+    },
+    {
+      "request": {
+        "id": "example:disconnect#2",
+        "method": "disconnect",
+        "params": {
+          "id": "032cf15d1ad9c4a08d26eab1918f732d8ef8fdc6abb9640bf3db174372c491304e",
+          "force": true
+        }
+      },
+      "response": {}
+    }
   ]
 }

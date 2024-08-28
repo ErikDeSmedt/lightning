@@ -136,9 +136,7 @@ static struct command_result *json_reserveinputs(struct command *cmd,
 
 static const struct json_command reserveinputs_command = {
 	"reserveinputs",
-	"bitcoin",
 	json_reserveinputs,
-	"Reserve utxos (or increase their reservation)",
 	false
 };
 AUTODATA(json_command, &reserveinputs_command);
@@ -220,9 +218,7 @@ static struct command_result *json_unreserveinputs(struct command *cmd,
 
 static const struct json_command unreserveinputs_command = {
 	"unreserveinputs",
-	"bitcoin",
 	json_unreserveinputs,
-	"Unreserve utxos (or at least, reduce their reservation)",
 	false
 };
 AUTODATA(json_command, &unreserveinputs_command);
@@ -642,9 +638,7 @@ static struct command_result *json_fundpsbt(struct command *cmd,
 
 static const struct json_command fundpsbt_command = {
 	"fundpsbt",
-	"bitcoin",
 	json_fundpsbt,
-	"Create PSBT using enough utxos to allow an output of {satoshi} at {feerate}",
 	false
 };
 AUTODATA(json_command, &fundpsbt_command);
@@ -736,9 +730,7 @@ static struct command_result *json_addpsbtoutput(struct command *cmd,
 
 static const struct json_command addpsbtoutput_command = {
 	"addpsbtoutput",
-	"bitcoin",
 	json_addpsbtoutput,
-	"Create a PSBT (or modify existing {initialpsbt}) with an output receiving {satoshi} amount.",
 	false
 };
 AUTODATA(json_command, &addpsbtoutput_command);
@@ -914,9 +906,7 @@ static struct command_result *json_utxopsbt(struct command *cmd,
 }
 static const struct json_command utxopsbt_command = {
 	"utxopsbt",
-	"bitcoin",
 	json_utxopsbt,
-	"Create PSBT using these utxos",
 	false
 };
 AUTODATA(json_command, &utxopsbt_command);

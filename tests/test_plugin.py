@@ -668,7 +668,7 @@ def test_openchannel_hook(node_factory, bitcoind):
         'to_self_delay': '5',
     }
 
-    if 'anchors_zero_fee_htlc_tx/even' in only_one(l1.rpc.listpeerchannels()['channels'])['channel_type']['names']:
+    if 'anchors/even' in only_one(l1.rpc.listpeerchannels()['channels'])['channel_type']['names']:
         feerate = 3750
     else:
         feerate = 7500
@@ -721,8 +721,8 @@ def test_openchannel_hook_error_handling(node_factory, bitcoind):
     l1 = node_factory.get_node()
     l2 = node_factory.get_node(options=opts,
                                expect_fail=True,
-                               may_fail=True,
-                               allow_broken_log=True)
+                               broken_log='lightningd: ',
+                               may_fail=True)
     l1.connect(l2)
     l1.fundwallet(10**6)
 
@@ -1230,7 +1230,7 @@ def test_htlc_accepted_hook_forward_restart(node_factory, executor):
 def test_warning_notification(node_factory):
     """ test 'warning' notifications
     """
-    l1 = node_factory.get_node(options={'plugin': os.path.join(os.getcwd(), 'tests/plugins/pretend_badlog.py')}, allow_broken_log=True)
+    l1 = node_factory.get_node(options={'plugin': os.path.join(os.getcwd(), 'tests/plugins/pretend_badlog.py')}, broken_log=r'Test warning notification\(for broken event\)')
 
     # 1. test 'warn' level
     event = "Test warning notification(for unusual event)"
@@ -1549,7 +1549,7 @@ def test_libplugin(node_factory):
     l1 = node_factory.get_node(options={"plugin": plugin,
                                         'allow-deprecated-apis': False,
                                         'log-level': 'io'},
-                               allow_broken_log=True)
+                               broken_log='plugin-test_libplugin: Datastore gave nonstring result')
 
     # Test startup
     assert l1.daemon.is_in_log("test_libplugin initialised!")
@@ -1559,6 +1559,28 @@ def test_libplugin(node_factory):
     # This will look on datastore for default, won't find it.
     assert l1.rpc.call("helloworld") == {"hello": "NOT FOUND"}
     l1.daemon.wait_for_log("get_ds_bin_done: NOT FOUND")
+
+    # Check dynamic!
+    assert l1.rpc.listconfigs('dynamicopt')['configs']['dynamicopt']['value_int'] == 7
+
+    with pytest.raises(RpcError) as err:
+        l1.rpc.setconfig('dynamicopt', 4)
+    assert err.value.error['message'] == 'I don\'t like \\"even\\" numbers (valid JSON? Try {})!'
+
+    with pytest.raises(RpcError) as err:
+        l1.rpc.check(command_to_check='setconfig', config='dynamicopt', val=4)
+    assert err.value.error['message'] == 'I don\'t like \\"even\\" numbers (valid JSON? Try {})!'
+
+    l1.rpc.check(command_to_check='setconfig', config='dynamicopt', val=9)
+
+    # Unchanged!
+    assert l1.rpc.listconfigs('dynamicopt')['configs']['dynamicopt']['value_int'] == 7
+
+    l1.rpc.setconfig('dynamicopt', 9)
+    conf = l1.rpc.listconfigs('dynamicopt')['configs']['dynamicopt']
+    assert conf['value_int'] == 9
+    assert conf['plugin'] == plugin
+    assert conf['dynamic'] is True
 
     # Test dynamic startup
     l1.rpc.plugin_stop(plugin)
@@ -1627,6 +1649,17 @@ def test_libplugin(node_factory):
     del l1.daemon.opts["somearg-deprecated"]
     l1.start()
 
+    # Test that check works as expected.
+    assert only_one(l1.rpc.checkthis(["test_libplugin", "name"])['datastore'])['string'] == "foobar"
+    with pytest.raises(RpcError, match="key: should be an array"):
+        assert l1.rpc.checkthis("badkey")
+
+    with pytest.raises(RpcError, match="key: should be an array"):
+        assert l1.rpc.check('checkthis', key="badkey")
+
+    # This works
+    assert l1.rpc.check('checkthis', key=["test_libplugin", "name"]) == {'command_to_check': 'checkthis'}
+
 
 def test_libplugin_deprecated(node_factory):
     """Sanity checks for plugins made with libplugin using deprecated args"""
@@ -1635,7 +1668,7 @@ def test_libplugin_deprecated(node_factory):
                                         'somearg-deprecated': 'test_opt depr',
                                         'allow-deprecated-apis': True},
                                # testrpc-deprecated causes a complaint!
-                               allow_broken_log=True)
+                               broken_log='DEPRECATED API USED')
 
     assert l1.daemon.is_in_log("somearg = test_opt depr")
     l1.rpc.help('testrpc-deprecated')
@@ -1755,7 +1788,7 @@ def test_bitcoin_backend(node_factory, bitcoind):
     This tests interaction with the Bitcoin backend, but not specifically bcli
     """
     l1 = node_factory.get_node(start=False, options={"disable-plugin": "bcli"},
-                               may_fail=True, allow_broken_log=True)
+                               may_fail=True)
 
     # We don't start if we haven't all the required methods registered.
     plugin = os.path.join(os.getcwd(), "tests/plugins/bitcoin/part1.py")
@@ -1792,7 +1825,7 @@ def test_bitcoin_bad_estimatefee(node_factory, bitcoind):
                                         "plugin": plugin,
                                         "badestimate-badorder": True},
                                start=False,
-                               may_fail=True, allow_broken_log=True)
+                               may_fail=True)
     l1.daemon.start(wait_for_initialized=False, stderr_redir=True)
     assert l1.daemon.wait() == 1
     l1.daemon.is_in_stderr(r"badestimate.py error: bad response to estimatefees.feerates \(Blocks must be ascending order: 2 <= 100!\)")
@@ -1958,7 +1991,7 @@ def test_replacement_payload(node_factory):
     with pytest.raises(RpcError, match=r"WIRE_INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS \(reply from remote\)"):
         l1.rpc.pay(inv)
 
-    assert l2.daemon.wait_for_log("Attempt to pay.*with wrong secret")
+    assert l2.daemon.wait_for_log("Attempt to pay.*with wrong payment_secret")
 
 
 def test_watchtower(node_factory, bitcoind, directory, chainparams):
@@ -1973,7 +2006,9 @@ def test_watchtower(node_factory, bitcoind, directory, chainparams):
     p = os.path.join(os.path.dirname(__file__), "plugins/watchtower.py")
     l1, l2 = node_factory.line_graph(
         2,
-        opts=[{'may_fail': True, 'allow_broken_log': True}, {'plugin': p}]
+        opts=[{'may_fail': True,
+               'broken_log': r"onchaind-chan#[0-9]*: Could not find resolution for output .*: did \*we\* cheat\?"},
+              {'plugin': p}]
     )
     channel_id = l1.rpc.listpeerchannels()['channels'][0]['channel_id']
 
@@ -2026,11 +2061,8 @@ def test_watchtower(node_factory, bitcoind, directory, chainparams):
     # Restart l2, and it should continue where the watchtower left off:
     l2.start()
 
-    # l2 will still try to broadcast its latest commitment tx, but it'll fail
-    # since l1 has cheated. All commitments share the same prefix, so look for
-    # that.
-    penalty_prefix = tx[:(4 + 1 + 36) * 2]  # version, txin_count, first txin in hex
-    l2.daemon.wait_for_log(r'Expected error broadcasting tx {}'.format(penalty_prefix))
+    # l2 notices that there has been a unilateral close from l1.
+    l2.daemon.wait_for_log(r'Peer permanent failure in')
 
     # Now make sure the penalty output ends up in our wallet
     fund_txids = [o['txid'] for o in l2.rpc.listfunds()['outputs']]
@@ -2180,7 +2212,9 @@ def test_important_plugin(node_factory):
 
     n = node_factory.get_node(options={"important-plugin": os.path.join(pluginsdir, "nonexistent")},
                               may_fail=True, expect_fail=True,
-                              allow_broken_log=True, start=False)
+                              # Other plugins can complain as lightningd stops suddenly:
+                              broken_log='Plugin marked as important, shutting down lightningd|Reading JSON input: Connection reset by peer',
+                              start=False)
 
     n.daemon.start(wait_for_initialized=False, stderr_redir=True)
     # Will exit with failure code.
@@ -2247,7 +2281,7 @@ def test_htlc_accepted_hook_crash(node_factory, executor):
     l1 = node_factory.get_node()
     l2 = node_factory.get_node(
         options={'plugin': plugin},
-        allow_broken_log=True
+        broken_log='plugin-htlc_accepted-crash.py: Hook handler for htlc_accepted failed with an exception. Returning safe fallback response'
     )
     l1.connect(l2)
     l1.fundchannel(l2)
@@ -2267,7 +2301,6 @@ def test_htlc_accepted_hook_crash(node_factory, executor):
         f.result(10)
 
 
-@pytest.mark.skip("With newer GCC versions reports a '*** buffer overflow detected ***: terminated'")
 def test_notify(node_factory):
     """Test that notifications from plugins get ignored"""
     plugins = [os.path.join(os.getcwd(), 'tests/plugins/notify.py'),
@@ -2291,17 +2324,17 @@ def test_notify(node_factory):
         else:
             assert out[2 + i].endswith("|\r")
 
-    assert out[102] == '# Beginning stage 2\n'
-    assert out[103] == '\r'
-
+    # These messages are DEBUG level, and default is INFO, so there is no
+    # "'# Beginning stage 2\n'
+    assert out[102] == '\r'
     for i in range(10):
-        assert out[104 + i].startswith("# Stage 2/2 {:>2}/10 |".format(1 + i))
+        assert out[103 + i].startswith("# Stage 2/2 {:>2}/10 |".format(1 + i))
         if i == 9:
-            assert out[104 + i].endswith("|\n")
+            assert out[103 + i].endswith("|\n")
         else:
-            assert out[104 + i].endswith("|\r")
-    assert out[114] == '"This worked"\n'
-    assert len(out) == 115
+            assert out[103 + i].endswith("|\r")
+    assert out[113] == '"This worked"\n'
+    assert len(out) == 114
 
     # At debug level, we get the second prompt.
     out = subprocess.check_output(['cli/lightning-cli',
@@ -2635,7 +2668,7 @@ def test_plugin_shutdown(node_factory):
 
 def test_commando(node_factory, executor):
     l1, l2 = node_factory.line_graph(2, fundchannel=False,
-                                     opts={'log-level': 'io'})
+                                     opts={'log-level': 'io', 'allow-deprecated-apis': True})
 
     rune = l1.rpc.commando_rune()['rune']
 
@@ -2731,7 +2764,9 @@ def test_commando(node_factory, executor):
 
 
 def test_commando_rune(node_factory):
-    l1, l2 = node_factory.line_graph(2, fundchannel=False)
+    l1, l2 = node_factory.line_graph(2, fundchannel=False, opts={
+        'allow-deprecated-apis': True,
+    })
 
     rune1 = l1.rpc.commando_rune()
     assert rune1['rune'] == 'OSqc7ixY6F-gjcigBfxtzKUI54uzgFSA6YfBQoWGDV89MA=='
@@ -2870,7 +2905,9 @@ def test_commando_rune(node_factory):
 
 
 def test_commando_listrunes(node_factory):
-    l1 = node_factory.get_node()
+    l1 = node_factory.get_node(options={
+        'allow-deprecated-apis': True,
+    })
     rune = l1.rpc.commando_rune()
     assert rune == {
         'rune': 'OSqc7ixY6F-gjcigBfxtzKUI54uzgFSA6YfBQoWGDV89MA==',
@@ -2910,7 +2947,9 @@ def test_commando_listrunes(node_factory):
 
 
 def test_commando_rune_pay_amount(node_factory):
-    l1, l2 = node_factory.line_graph(2)
+    l1, l2 = node_factory.line_graph(2, opts={
+        'allow-deprecated-apis': True,
+    })
 
     # This doesn't really work, since amount_msat is illegal if invoice
     # includes an amount, and runes aren't smart enough to decode bolt11!
@@ -2962,7 +3001,9 @@ def test_commando_rune_pay_amount(node_factory):
 
 
 def test_commando_blacklist(node_factory):
-    l1, l2 = node_factory.get_nodes(2)
+    l1, l2 = node_factory.get_nodes(2, opts={
+        'allow-deprecated-apis': True,
+    })
 
     l2.connect(l1)
     rune0 = l1.rpc.commando_rune()
@@ -3045,7 +3086,9 @@ def test_commando_blacklist(node_factory):
 @pytest.mark.slow_test
 def test_commando_stress(node_factory, executor):
     """Stress test to slam commando with many large queries"""
-    nodes = node_factory.get_nodes(5)
+    nodes = node_factory.get_nodes(5, opts={
+        'allow-deprecated-apis': True,
+    })
 
     rune = nodes[0].rpc.commando_rune()['rune']
     for n in nodes[1:]:
@@ -3081,7 +3124,9 @@ def test_commando_stress(node_factory, executor):
 
 def test_commando_badrune(node_factory):
     """Test invalid UTF-8 encodings in rune: used to make us kill the offers plugin which implements decode, as it gave bad utf8!"""
-    l1 = node_factory.get_node()
+    l1 = node_factory.get_node(options={
+        'allow-deprecated-apis': True,
+    })
     l1.rpc.decode('5zi6-ugA6hC4_XZ0R7snl5IuiQX4ugL4gm9BQKYaKUU9gCZtZXRob2RebGlzdHxtZXRob2ReZ2V0fG1ldGhvZD1zdW1tYXJ5Jm1ldGhvZC9saXN0ZGF0YXN0b3Jl')
     rune = l1.rpc.commando_rune(restrictions="readonly")
 
@@ -3121,6 +3166,14 @@ def test_autoclean(node_factory):
     # It must be an integer!
     with pytest.raises(RpcError, match=r'is not a number'):
         l3.rpc.setconfig('autoclean-expiredinvoices-age', 'xxx')
+
+    # check gives the same answer.
+    with pytest.raises(RpcError, match=r'is not a number'):
+        l3.rpc.check('setconfig', config='autoclean-expiredinvoices-age', val='xxx')
+
+    # check does not actually set!
+    l3.rpc.check('setconfig', config='autoclean-expiredinvoices-age', val=2) == {'command_to_check': 'setconfig'}
+    assert l3.rpc.autoclean_status()['autoclean']['expiredinvoices']['enabled'] is False
 
     l3.rpc.setconfig('autoclean-expiredinvoices-age', 2)
     assert l3.rpc.autoclean_status()['autoclean']['expiredinvoices']['enabled'] is True
@@ -4260,8 +4313,20 @@ def test_dynamic_option_python_plugin(node_factory):
 
     assert result["configs"]["test-dynamic-config"]["value_str"] == "initial"
 
+    assert ln.rpc.dynamic_option_report() == {'test-dynamic-config': 'initial'}
     result = ln.rpc.setconfig("test-dynamic-config", "changed")
     assert result["config"]["value_str"] == "changed"
+    assert ln.rpc.dynamic_option_report() == {'test-dynamic-config': 'changed'}
+
+    ln.daemon.wait_for_log(
+        'dynamic_option.py:.*Setting config test-dynamic-config to changed'
+    )
+
+    with pytest.raises(RpcError, match="I don't like bad values!"):
+        ln.rpc.setconfig("test-dynamic-config", "bad value")
+
+    # Does not alter value!
+    assert ln.rpc.dynamic_option_report() == {'test-dynamic-config': 'changed'}
 
 
 def test_renepay_not_important(node_factory):
@@ -4296,5 +4361,57 @@ def test_plugin_nostart(node_factory):
 @unittest.skip("A bit flaky, but when breaks, it is costing us 2h of CI time")
 def test_plugin_startdir_lol(node_factory):
     """Though we fail to start many of them, we don't crash!"""
-    l1 = node_factory.get_node(allow_broken_log=True)
+    l1 = node_factory.get_node(broken_log='.*')
     l1.rpc.plugin_startdir(os.path.join(os.getcwd(), 'tests/plugins'))
+
+
+def test_autoclean_batch(node_factory):
+    l1 = node_factory.get_node(1)
+
+    # Many expired invoices
+    for i in range(100):
+        l1.rpc.invoice(amount_msat=12300, label=f'inv1{i}', description='description', expiry=1)
+
+    time.sleep(3)
+    l1.rpc.setconfig('dev-autoclean-max-batch', 2)
+
+    # Test manual clean
+    ret = l1.rpc.autoclean_once('expiredinvoices', 1)
+    assert ret == {'autoclean': {'expiredinvoices': {'cleaned': 100, 'uncleaned': 0}}}
+
+    for i in range(100):
+        l1.rpc.invoice(amount_msat=12300, label=f'inv2{i}', description='description', expiry=1)
+
+    time.sleep(3)
+
+    # Test cycle clean
+    assert (l1.rpc.autoclean_status('expiredinvoices')
+            == {'autoclean': {'expiredinvoices': {'enabled': False, 'cleaned': 100}}})
+
+    l1.rpc.setconfig('autoclean-expiredinvoices-age', 2)
+    assert (l1.rpc.autoclean_status('expiredinvoices')
+            == {'autoclean': {'expiredinvoices': {'enabled': True, 'cleaned': 100, 'age': 2}}})
+
+    l1.rpc.setconfig('autoclean-cycle', 5)
+    wait_for(lambda: l1.rpc.autoclean_status('expiredinvoices')
+             == {'autoclean': {'expiredinvoices': {'enabled': True, 'cleaned': 200, 'age': 2}}})
+
+
+def test_sql_crash(node_factory, bitcoind):
+    """sub-object with inner-sub-object is missing -> Crash.  This only
+    happens for local and remote inside listpeerchannels.update (for
+    now).
+
+    """
+    l1, l2 = node_factory.line_graph(2, fundchannel=False)
+
+    addr = l1.rpc.newaddr()['bech32']
+    bitcoind.rpc.sendtoaddress(addr, 1)
+    bitcoind.generate_block(1)
+
+    wait_for(lambda: l1.rpc.listfunds()['outputs'] != [])
+
+    l1.rpc.fundchannel_start(l2.info['id'], '10000000sat')
+
+    assert 'updates' not in only_one(l1.rpc.listpeerchannels()['channels'])
+    l1.rpc.sql(f"SELECT * FROM peerchannels;")

@@ -253,10 +253,7 @@ static struct command_result *json_connect(struct command *cmd,
 
 static const struct json_command connect_command = {
 	"connect",
-	"network",
 	json_connect,
-	"Connect to {id} at {host} (which can end in ':port' if not default). "
-	"{id} can also be of the form id@host"
 };
 AUTODATA(json_command, &connect_command);
 
@@ -292,16 +289,23 @@ static void gossipd_got_addrs(struct subd *subd,
 {
 	struct wireaddr *addrs;
 	u8 *connectmsg;
+	struct peer *peer;
+	bool transient;
 
 	if (!fromwire_gossipd_get_addrs_reply(tmpctx, msg, &addrs))
 		fatal("Gossipd gave bad GOSSIPD_GET_ADDRS_REPLY %s",
 		      tal_hex(msg, msg));
 
+	/* We consider this transient unless we have a channel */
+	peer = peer_by_id(d->ld, &d->id);
+	transient = !peer || !peer_any_channel(peer, channel_state_wants_peercomms, NULL);
+
 	connectmsg = towire_connectd_connect_to_peer(NULL,
 						     &d->id,
 						     addrs,
 						     d->addrhint,
-						     d->dns_fallback);
+						     d->dns_fallback,
+						     transient);
 	subd_send_msg(d->ld->connectd, take(connectmsg));
 	tal_free(d);
 }
@@ -601,15 +605,20 @@ static unsigned connectd_msg(struct subd *connectd, const u8 *msg, const int *fd
 	case WIRE_CONNECTD_PEER_CONNECT_SUBD:
 	case WIRE_CONNECTD_PING:
 	case WIRE_CONNECTD_SEND_ONIONMSG:
+	case WIRE_CONNECTD_INJECT_ONIONMSG:
 	case WIRE_CONNECTD_CUSTOMMSG_OUT:
 	case WIRE_CONNECTD_START_SHUTDOWN:
 	case WIRE_CONNECTD_SET_CUSTOMMSGS:
+	case WIRE_CONNECTD_DEV_EXHAUST_FDS:
+	case WIRE_CONNECTD_DEV_SET_MAX_SCIDS_ENCODE_SIZE:
+	case WIRE_CONNECTD_SCID_MAP:
 	/* This is a reply, so never gets through to here. */
 	case WIRE_CONNECTD_INIT_REPLY:
 	case WIRE_CONNECTD_ACTIVATE_REPLY:
 	case WIRE_CONNECTD_DEV_MEMLEAK_REPLY:
 	case WIRE_CONNECTD_PING_REPLY:
 	case WIRE_CONNECTD_START_SHUTDOWN_REPLY:
+	case WIRE_CONNECTD_INJECT_ONIONMSG_REPLY:
 		break;
 
 	case WIRE_CONNECTD_PEER_CONNECTED:
@@ -742,21 +751,24 @@ int connectd_init(struct lightningd *ld)
 		/* Make it clear that autolisten is not active! */
 		ld->autolisten = false;
 
-	msg = towire_connectd_init(
-	    tmpctx, chainparams,
-	    ld->our_features,
-	    &ld->id,
-	    wireaddrs,
-	    listen_announce,
-	    ld->proxyaddr, ld->always_use_proxy || ld->pure_tor_setup,
-	    ld->dev_allow_localhost, ld->config.use_dns,
-	    ld->tor_service_password ? ld->tor_service_password : "",
-	    ld->config.connection_timeout_secs,
-	    websocket_helper_path,
-	    !ld->deprecated_ok,
-	    ld->dev_fast_gossip,
-	    ld->dev_disconnect_fd >= 0,
-	    ld->dev_no_ping_timer);
+	msg = towire_connectd_init(tmpctx, chainparams,
+				   ld->our_features,
+				   &ld->our_nodeid,
+				   wireaddrs,
+				   listen_announce,
+				   ld->proxyaddr,
+				   ld->always_use_proxy || ld->pure_tor_setup,
+				   ld->dev_allow_localhost,
+				   ld->config.use_dns,
+				   ld->tor_service_password ? ld->tor_service_password : "",
+				   ld->config.connection_timeout_secs,
+				   websocket_helper_path,
+				   !ld->deprecated_ok,
+				   ld->dev_fast_gossip,
+				   ld->dev_disconnect_fd >= 0,
+				   ld->dev_no_ping_timer,
+				   ld->dev_handshake_no_reply,
+				   ld->dev_throttle_gossip);
 
 	subd_req(ld->connectd, ld->connectd, take(msg), -1, 0,
 		 connect_init_done, NULL);
@@ -791,11 +803,39 @@ static void connect_activate_done(struct subd *connectd,
 	io_break(connectd);
 }
 
+void tell_connectd_scid(struct lightningd *ld,
+			struct short_channel_id scid,
+			const struct node_id *peer_id)
+{
+	subd_send_msg(ld->connectd,
+		      take(towire_connectd_scid_map(NULL,
+						    scid,
+						    peer_id)));
+}
+
 void connectd_activate(struct lightningd *ld)
 {
 	void *ret;
-	const u8 *msg = towire_connectd_activate(NULL, ld->listen);
+	const u8 *msg;
+	struct peer *peer;
+	struct channel *channel;
+	struct peer_node_id_map_iter it;
 
+	/* Tell connectd about all aliases/scids for known peers */
+	for (peer = peer_node_id_map_first(ld->peers, &it);
+	     peer;
+	     peer = peer_node_id_map_next(ld->peers, &it)) {
+		list_for_each(&peer->channels, channel, list) {
+			if (channel->alias[LOCAL])
+				tell_connectd_scid(ld, *channel->alias[LOCAL], &peer->id);
+			if (channel->scid &&
+			    (channel->channel_flags & CHANNEL_FLAGS_ANNOUNCE_CHANNEL)) {
+				tell_connectd_scid(ld, *channel->scid, &peer->id);
+			}
+		}
+	}
+
+	msg = towire_connectd_activate(NULL, ld->listen);
 	subd_req(ld->connectd, ld->connectd, take(msg), -1, 0,
 		 connect_activate_done, NULL);
 
@@ -872,10 +912,7 @@ static struct command_result *json_sendcustommsg(struct command *cmd,
 
 static const struct json_command sendcustommsg_command = {
     "sendcustommsg",
-    "utility",
     json_sendcustommsg,
-    "Send a custom message to the peer with the given {node_id}",
-    .verbose = "sendcustommsg node_id hexcustommsg",
 };
 
 AUTODATA(json_command, &sendcustommsg_command);
@@ -890,15 +927,14 @@ static struct command_result *json_dev_suppress_gossip(struct command *cmd,
 
 	subd_send_msg(cmd->ld->connectd,
 		      take(towire_connectd_dev_suppress_gossip(NULL)));
+	cmd->ld->dev_suppress_gossip = true;
 
 	return command_success(cmd, json_stream_success(cmd));
 }
 
 static const struct json_command dev_suppress_gossip = {
 	"dev-suppress-gossip",
-	"developer",
 	json_dev_suppress_gossip,
-	"Stop this node from sending any more gossip.",
 	.dev_only = true,
 };
 AUTODATA(json_command, &dev_suppress_gossip);
@@ -919,9 +955,28 @@ static struct command_result *json_dev_report_fds(struct command *cmd,
 
 static const struct json_command dev_report_fds = {
 	"dev-report-fds",
-	"developer",
 	json_dev_report_fds,
-	"Ask connectd to report status of all its open files.",
 	.dev_only = true,
 };
 AUTODATA(json_command, &dev_report_fds);
+
+static struct command_result *json_dev_connectd_exhaust_fds(struct command *cmd,
+							    const char *buffer,
+							    const jsmntok_t *obj UNNEEDED,
+							    const jsmntok_t *params)
+{
+	if (!param(cmd, buffer, params, NULL))
+		return command_param_failed();
+
+	subd_send_msg(cmd->ld->connectd,
+		      take(towire_connectd_dev_exhaust_fds(NULL)));
+
+	return command_success(cmd, json_stream_success(cmd));
+}
+
+static const struct json_command dev_connectd_exhaust_fds = {
+	"dev-connectd-exhaust-fds",
+	json_dev_connectd_exhaust_fds,
+	.dev_only = true,
+};
+AUTODATA(json_command, &dev_connectd_exhaust_fds);

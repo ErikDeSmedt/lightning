@@ -48,8 +48,6 @@ static u32 to_self_delay[NUM_SIDES];
 
 /* Where we send money to (our wallet) */
 static u32 our_wallet_index;
-static struct ext_key our_wallet_ext_key;
-static struct pubkey our_wallet_pubkey;
 
 /* Their revocation secret (only if they cheated). */
 static const struct secret *remote_per_commitment_secret;
@@ -418,19 +416,17 @@ static bool grind_htlc_tx_fee(struct amount_sat *fee,
 		/* BOLT #3:
 		 *
 		 * The fee for an HTLC-timeout transaction:
-		 *   - If `option_anchors_zero_fee_htlc_tx` applies:
+		 *   - If `option_anchors` applies:
 		 *     1. MUST be 0.
 		 *   - Otherwise, MUST be calculated to match:
 		 *     1. Multiply `feerate_per_kw` by 663
-		 *        (666 if `option_anchor_outputs` applies)
 		 *        and divide by 1000 (rounding down).
 		 *
 		 * The fee for an HTLC-success transaction:
-		 *  - If `option_anchors_zero_fee_htlc_tx` applies:
+		 *  - If `option_anchors` applies:
 		 *    1. MUST be 0.
 		 *  - Otherwise, MUST be calculated to match:
 		 *     1. Multiply `feerate_per_kw` by 703
-		 *        (706 if `option_anchor_outputs` applies)
 		 *        and divide by 1000 (rounding down).
 		 */
 		struct amount_sat out;
@@ -473,17 +469,17 @@ static bool set_htlc_timeout_fee(struct bitcoin_tx *tx,
 	/* BOLT #3:
 	 *
 	 * The fee for an HTLC-timeout transaction:
-	 *  - If `option_anchors_zero_fee_htlc_tx` applies:
+	 *  - If `option_anchors` applies:
 	 *    1. MUST be 0.
 	 *  - Otherwise, MUST be calculated to match:
-	 *    1. Multiply `feerate_per_kw` by 663 (666 if `option_anchor_outputs`
-	 *       applies) and divide by 1000 (rounding down).
+	 *    1. Multiply `feerate_per_kw` by 663 and divide by 1000 (rounding down).
 	 */
 	if (option_anchors_zero_fee_htlc_tx) {
 		fee = AMOUNT_SAT(0);
 		goto set_amount;
 	}
 
+	/* FIXME: older bolt used to say (666 if `option_anchor_outputs` applies) */
 	if (option_anchor_outputs)
 		weight = 666;
 	else
@@ -548,12 +544,12 @@ static struct amount_sat get_htlc_success_fee(struct tracked_output *out)
 	/* BOLT #3:
 	 *
 	 * The fee for an HTLC-success transaction:
-	 * - If `option_anchors_zero_fee_htlc_tx` applies:
+	 * - If `option_anchors` applies:
 	 *   1. MUST be 0.
 	 * - Otherwise, MUST be calculated to match:
-	 *   1. Multiply `feerate_per_kw` by 703 (706 if `option_anchor_outputs`
-	 *      applies) and divide by 1000 (rounding down).
+	 *   1. Multiply `feerate_per_kw` by 703 and divide by 1000 (rounding down).
 	 */
+	/* FIXME: Older bolt used to say (706 if `option_anchor_outputs` applies) */
 	if (option_anchor_outputs)
 		weight = 706;
 	else
@@ -3282,77 +3278,40 @@ static void handle_their_unilateral(const struct tx_parts *tx,
 
 static void handle_unknown_commitment(const struct tx_parts *tx,
 				      u32 tx_blockheight,
-				      const struct pubkey *possible_remote_per_commitment_point,
 				      const struct basepoints basepoints[NUM_SIDES],
 				      struct tracked_output **outs)
 {
 	int to_us_output = -1;
-	/* We have two possible local scripts, depending on options */
-	u8 *local_scripts[2];
 	struct htlcs_info *htlcs_info;
 
 	onchain_annotate_txin(&tx->txid, 0, TX_CHANNEL_UNILATERAL | TX_THEIRS);
 
 	resolved_by_other(outs[0], &tx->txid, UNKNOWN_UNILATERAL);
 
-	/* This is the not-option_static_remotekey case, if we got a hint
-	 * from them about the per-commitment point */
-	if (possible_remote_per_commitment_point) {
-		struct keyset *ks = tal(tmpctx, struct keyset);
-		if (!derive_keyset(possible_remote_per_commitment_point,
-				   &basepoints[REMOTE],
-				   &basepoints[LOCAL],
-				   false,
-				   ks))
-			status_failed(STATUS_FAIL_INTERNAL_ERROR,
-				      "Deriving keyset for possible_remote_per_commitment_point %s",
-				      fmt_pubkey(tmpctx,
-						 possible_remote_per_commitment_point));
-
-		local_scripts[0] = scriptpubkey_p2wpkh(tmpctx,
-						       &ks->other_payment_key);
-	} else {
-		local_scripts[0] = NULL;
-	}
-
-	/* For option_will_fund, we need to figure out what CSV lock was used */
+	/* Normally, csv is 1, but for option_will_fund, we need to
+	 * figure out what CSV lock was used */
 	for (size_t csv = 1; csv <= LEASE_RATE_DURATION; csv++) {
-
-		/* Other possible local script is for option_static_remotekey */
-		local_scripts[1] = scriptpubkey_to_remote(tmpctx,
-							  &basepoints[LOCAL].payment,
-							  csv);
+		const u8 *local_script;
+		local_script = scriptpubkey_to_remote(tmpctx,
+						      &basepoints[LOCAL].payment,
+						      csv);
 
 		for (size_t i = 0; i < tal_count(tx->outputs); i++) {
-			struct tracked_output *out;
-			struct amount_asset asset = wally_tx_output_get_amount(tx->outputs[i]);
+			struct amount_asset asset;
 			struct amount_sat amt;
-			int which_script;
 			struct bitcoin_outpoint outpoint;
+			struct tracked_output *out;
 
+			if (!wally_tx_output_scripteq(tx->outputs[i],
+						      local_script))
+				continue;
+
+			asset = wally_tx_output_get_amount(tx->outputs[i]);
 			assert(amount_asset_is_main(&asset));
 			amt = amount_asset_to_sat(&asset);
 
 			outpoint.txid = tx->txid;
 			outpoint.n = i;
-
-			/* Elements can have empty output scripts (fee output) */
-			if (local_scripts[0]
-			    && wally_tx_output_scripteq(tx->outputs[i], local_scripts[0]))
-				which_script = 0;
-			else if (local_scripts[1]
-				 && wally_tx_output_scripteq(tx->outputs[i],
-							     local_scripts[1]))
-				which_script = 1;
-			else {
-				/* Record every output on this tx as an
-				 * external 'penalty' */
-				record_external_output(&outpoint, amt,
-						       tx_blockheight,
-						       PENALTY);
-
-				continue;
-			}
 
 			/* BOLT #5:
 			 *
@@ -3371,15 +3330,36 @@ static void handle_unknown_commitment(const struct tx_parts *tx,
 
 			tell_wallet_to_remote(tx, &outpoint,
 					      tx_blockheight,
-					      local_scripts[which_script],
-					      possible_remote_per_commitment_point,
-					      which_script == 1,
+					      local_script,
+					      NULL,
+					      true,
 					      csv);
-			local_scripts[0] = local_scripts[1] = NULL;
 			to_us_output = i;
-			/* Even though we're finished, we keep rolling
-			 * so we log all the outputs */
+			goto found;
 		}
+	}
+
+found:
+	/* Record every unidentified output on this tx as an external
+	 * 'penalty' */
+	for (size_t i = 0; i < tal_count(tx->outputs); i++) {
+		struct amount_asset asset;
+		struct amount_sat amt;
+		struct bitcoin_outpoint outpoint;
+
+		if (i == to_us_output)
+			continue;
+
+		asset = wally_tx_output_get_amount(tx->outputs[i]);
+		assert(amount_asset_is_main(&asset));
+		amt = amount_asset_to_sat(&asset);
+
+		outpoint.txid = tx->txid;
+		outpoint.n = i;
+
+		record_external_output(&outpoint, amt,
+				       tx_blockheight,
+				       PENALTY);
 	}
 
 	if (to_us_output == -1) {
@@ -3427,7 +3407,6 @@ int main(int argc, char *argv[])
 	struct amount_sat funding_sats;
 	u8 *scriptpubkey[NUM_SIDES];
 	u32 locktime, tx_blockheight;
-	struct pubkey *possible_remote_per_commitment_point;
 
 	subdaemon_setup(argc, argv);
 
@@ -3451,8 +3430,6 @@ int main(int argc, char *argv[])
 				   &scriptpubkey[LOCAL],
 				   &scriptpubkey[REMOTE],
 				   &our_wallet_index,
-				   &our_wallet_ext_key,
-				   &our_wallet_pubkey,
 				   &opener,
 				   &basepoints[LOCAL],
 				   &basepoints[REMOTE],
@@ -3463,7 +3440,6 @@ int main(int argc, char *argv[])
 				   &remote_htlc_sigs,
 				   &min_possible_feerate,
 				   &max_possible_feerate,
-				   &possible_remote_per_commitment_point,
 				   &funding_pubkey[LOCAL],
 				   &funding_pubkey[REMOTE],
 				   &static_remotekey_start[LOCAL],
@@ -3487,14 +3463,15 @@ int main(int argc, char *argv[])
 			   FUNDING_OUTPUT, NULL, NULL, NULL);
 
 	/* Record funding output spent */
-	send_coin_mvt(take(new_coin_channel_close(NULL, &tx->txid,
+	send_coin_mvt(take(new_coin_channel_close(NULL, NULL, &tx->txid,
 						  &funding, tx_blockheight,
 						  our_msat,
 						  funding_sats,
 						  is_elements(chainparams) ?
 						  /* Minus 1, fee output */
 						  tal_count(tx->outputs) - 1 :
-						  tal_count(tx->outputs))));
+						  tal_count(tx->outputs),
+						  /* is_splice? */ false)));
 
 	status_debug("Remote per-commit point: %s",
 		     fmt_pubkey(tmpctx, &remote_per_commit_point));
@@ -3580,7 +3557,6 @@ int main(int argc, char *argv[])
 						outs);
 		} else {
 			handle_unknown_commitment(tx, tx_blockheight,
-						  possible_remote_per_commitment_point,
 						  basepoints,
 						  outs);
 		}

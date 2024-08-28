@@ -31,34 +31,13 @@
           "type": "object",
           "additionalProperties": true,
           "required": [
-            "command",
-            "category",
-            "description",
-            "verbose"
+            "command"
           ],
           "properties": {
             "command": {
               "type": "string",
               "description": [
                 "The command."
-              ]
-            },
-            "category": {
-              "type": "string",
-              "description": [
-                "The category for this command (useful for grouping)."
-              ]
-            },
-            "description": {
-              "type": "string",
-              "description": [
-                "A one-line description of the purpose of this command."
-              ]
-            },
-            "verbose": {
-              "type": "string",
-              "description": [
-                "A full description of this command (including whether it's deprecated)."
               ]
             }
           }
@@ -75,50 +54,10 @@
       }
     }
   },
-  "example_json_request": [
-    {
-      "id": "example:help#1",
-      "method": "help",
-      "params": {
-        "command": "pay"
-      }
-    },
-    {
-      "id": "example:help#2",
-      "method": "help",
-      "params": {
-        "command": "dev"
-      }
-    }
-  ],
   "errors": [
     "On failure, one of the following error codes may be returned:",
     "",
     "- -32602: Error in given parameters."
-  ],
-  "example_json_response": [
-    {
-      "help": [
-        {
-          "command": "pay bolt11 [amount_msat] [label] [riskfactor] [maxfeepercent] [retry_for] [maxdelay] [exemptfee] [localinvreqid] [exclude] [maxfee] [description] [dev_use_shadow]",
-          "category": "plugin",
-          "description": "Send payment specified by {bolt11}",
-          "verbose": "Attempt to pay the {bolt11} invoice."
-        }
-      ],
-      "format-hint": "simple"
-    },
-    {
-      "help": [
-        {
-          "command": "dev subcommand=crash|rhash|slowcmd",
-          "category": "developer",
-          "description": "Developer command test multiplexer",
-          "verbose": "dev rhash {secret}\n\tShow SHA256 of {secret}\ndev crash\n\tCrash lightningd by calling fatal()\ndev slowcmd {msec}\n\tTorture test for slow commands, optional {msec}\n"
-        }
-      ],
-      "format-hint": "simple"
-    }
   ],
   "author": [
     "Vincenzo Palazzo <<vincenzo.palazzo@protonmail.com>> wrote the initial version of this man page,",
@@ -126,5 +65,41 @@
   ],
   "resources": [
     "Main web site: <https://github.com/ElementsProject/lightning>"
+  ],
+  "examples": [
+    {
+      "request": {
+        "id": "example:help#1",
+        "method": "help",
+        "params": {
+          "command": "pay"
+        }
+      },
+      "response": {
+        "help": [
+          {
+            "command": "pay bolt11 [amount_msat] [label] [riskfactor] [maxfeepercent] [retry_for] [maxdelay] [exemptfee] [localinvreqid] [exclude] [maxfee] [description] [partial_msat] [dev_use_shadow]"
+          }
+        ],
+        "format-hint": "simple"
+      }
+    },
+    {
+      "request": {
+        "id": "example:help#2",
+        "method": "help",
+        "params": {
+          "command": "dev"
+        }
+      },
+      "response": {
+        "help": [
+          {
+            "command": "dev subcommand=crash|rhash|slowcmd"
+          }
+        ],
+        "format-hint": "simple"
+      }
+    }
   ]
 }

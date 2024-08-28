@@ -69,61 +69,6 @@
       }
     }
   },
-  "example_json_request": [
-    {
-      "id": "example:blacklistrune#1",
-      "method": "blacklistrune",
-      "params": {
-        "start": 2
-      }
-    },
-    {
-      "id": "example:blacklistrune#2",
-      "method": "blacklistrune",
-      "params": {
-        "start": 5,
-        "end": 7
-      }
-    },
-    {
-      "id": "example:blacklistrune#3",
-      "method": "blacklistrune",
-      "params": {
-        "start": 3,
-        "end": 4
-      }
-    }
-  ],
-  "example_json_response": [
-    {
-      "blacklist": [
-        {
-          "start": 2,
-          "end": 2
-        }
-      ]
-    },
-    {
-      "blacklist": [
-        {
-          "start": 2,
-          "end": 2
-        },
-        {
-          "start": 5,
-          "end": 7
-        }
-      ]
-    },
-    {
-      "blacklist": [
-        {
-          "start": 2,
-          "end": 7
-        }
-      ]
-    }
-  ],
   "author": [
     "Shahana Farooqui <<sfarooqui@blockstream.com>> is mainly responsible."
   ],
@@ -133,5 +78,60 @@
   ],
   "resources": [
     "Main web site: <https://github.com/ElementsProject/lightning>"
+  ],
+  "examples": [
+    {
+      "request": {
+        "id": "example:blacklistrune#1",
+        "method": "blacklistrune",
+        "params": {
+          "start": 1
+        }
+      },
+      "response": {
+        "blacklist": [
+          {
+            "start": 1,
+            "end": 3
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "id": "example:blacklistrune#2",
+        "method": "blacklistrune",
+        "params": {
+          "start": 0,
+          "end": 2
+        }
+      },
+      "response": {
+        "blacklist": [
+          {
+            "start": 0,
+            "end": 3
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "id": "example:blacklistrune#3",
+        "method": "blacklistrune",
+        "params": {
+          "start": 3,
+          "end": 4
+        }
+      },
+      "response": {
+        "blacklist": [
+          {
+            "start": 0,
+            "end": 4
+          }
+        ]
+      }
+    }
   ]
 }

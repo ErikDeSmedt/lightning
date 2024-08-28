@@ -4,7 +4,7 @@
 VERSION=$(shell git describe --always --dirty=-modded --abbrev=7 2>/dev/null || pwd | sed -n 's|.*/c\{0,1\}lightning-v\{0,1\}\([0-9a-f.rc\-]*\)$$|\1|gp')
 
 # Next release.
-CLN_NEXT_VERSION := v24.05
+CLN_NEXT_VERSION := v24.08
 
 # --quiet / -s means quiet, dammit!
 ifeq ($(findstring s,$(word 1, $(MAKEFLAGS))),s)
@@ -26,7 +26,7 @@ CCANDIR := ccan
 
 # Where we keep the BOLT RFCs
 BOLTDIR := ../bolts/
-DEFAULT_BOLTVERSION := 6e85df448bfee7d10f26aabb06b8eba3d7505888
+DEFAULT_BOLTVERSION := 57ce4b1e05c996fa649f00dc13521f6d496a288f
 # Can be overridden on cmdline.
 BOLTVERSION := $(DEFAULT_BOLTVERSION)
 
@@ -72,7 +72,7 @@ endif
 
 # (method=thread to support xdist)
 PYTEST_OPTS := -v -p no:logging $(PYTEST_OPTS)
-MY_CHECK_PYTHONPATH=$${PYTHONPATH}$${PYTHONPATH:+:}$(shell pwd)/contrib/pyln-client:$(shell pwd)/contrib/pyln-testing:$(shell pwd)/contrib/pyln-proto/:$(shell pwd)/contrib/pyln-spec/bolt1:$(shell pwd)/contrib/pyln-spec/bolt2:$(shell pwd)/contrib/pyln-spec/bolt4:$(shell pwd)/contrib/pyln-spec/bolt7
+MY_CHECK_PYTHONPATH=$${PYTHONPATH}$${PYTHONPATH:+:}$(shell pwd)/contrib/pyln-client:$(shell pwd)/contrib/pyln-testing:$(shell pwd)/contrib/pyln-proto/:$(shell pwd)/contrib/pyln-spec/bolt1:$(shell pwd)/contrib/pyln-spec/bolt2:$(shell pwd)/contrib/pyln-spec/bolt4:$(shell pwd)/contrib/pyln-spec/bolt7:$(shell pwd)/contrib/pyln-grpc-proto
 # Collect generated python files to be excluded from lint checks
 PYTHON_GENERATED= \
 	contrib/pyln-grpc-proto/pyln/grpc/primitives_pb2.py \
@@ -232,7 +232,7 @@ ALL_TEST_PROGRAMS :=
 ALL_TEST_GEN :=
 ALL_FUZZ_TARGETS :=
 ALL_C_SOURCES :=
-ALL_C_HEADERS := header_versions_gen.h version_gen.h
+ALL_C_HEADERS :=
 # Extra (non C) targets that should be built by default.
 DEFAULT_TARGETS :=
 
@@ -252,7 +252,7 @@ CPATH := /usr/local/include
 LIBRARY_PATH := /usr/local/lib
 endif
 
-CPPFLAGS += -DCLN_NEXT_VERSION="\"$(CLN_NEXT_VERSION)\"" -DBINTOPKGLIBEXECDIR="\"$(shell sh tools/rel.sh $(bindir) $(pkglibexecdir))\""
+CPPFLAGS += -DCLN_NEXT_VERSION="\"$(CLN_NEXT_VERSION)\"" -DPKGLIBEXECDIR="\"$(pkglibexecdir)\"" -DPLUGINDIR="\"$(plugindir)\"" -DCCAN_TAL_NEVER_RETURN_NULL=1
 CFLAGS = $(CPPFLAGS) $(CWARNFLAGS) $(CDEBUGFLAGS) $(COPTFLAGS) -I $(CCANDIR) $(EXTERNAL_INCLUDE_FLAGS) -I . -I$(CPATH) $(SQLITE3_CFLAGS) $(POSTGRES_INCLUDE) $(FEATURES) $(COVFLAGS) $(DEV_CFLAGS) -DSHACHAIN_BITS=48 -DJSMN_PARENT_LINKS $(PIE_CFLAGS) $(COMPAT_CFLAGS) $(CSANFLAGS)
 
 # If CFLAGS is already set in the environment of make (to whatever value, it
@@ -271,9 +271,9 @@ ifeq ($(STATIC),1)
 # For MacOS, Jacob Rapoport <jacob@rumblemonkey.com> changed this to:
 #  -L/usr/local/lib -lsqlite3 -lz -Wl,-lm -lpthread -ldl $(COVFLAGS)
 # But that doesn't static link.
-LDLIBS = -L$(CPATH) -Wl,-dn $(SQLITE3_LDLIBS) -lz -Wl,-dy -lm -lpthread -ldl $(COVFLAGS)
+LDLIBS = -L$(CPATH) -Wl,-dn $(SQLITE3_LDLIBS) -Wl,-dy -lm -lpthread -ldl $(COVFLAGS)
 else
-LDLIBS = -L$(CPATH) -lm $(SQLITE3_LDLIBS) -lz $(COVFLAGS)
+LDLIBS = -L$(CPATH) -lm $(SQLITE3_LDLIBS) $(COVFLAGS)
 endif
 
 # If we have the postgres client library we need to link against it as well
@@ -370,8 +370,12 @@ ifneq ($(RUST),0)
 endif
 include cln-grpc/Makefile
 
+ifneq ($V,1)
+MSGGEN_ARGS := -s
+endif
+
 $(MSGGEN_GENALL)&: contrib/msggen/msggen/schema.json
-	PYTHONPATH=contrib/msggen $(PYTHON) contrib/msggen/msggen/__main__.py generate
+	@$(call VERBOSE, "msggen $@", PYTHONPATH=contrib/msggen $(PYTHON) contrib/msggen/msggen/__main__.py $(MSGGEN_ARGS) generate)
 
 # The compiler assumes that the proto files are in the same
 # directory structure as the generated files will be. Since we
@@ -541,11 +545,11 @@ check-includes: check-src-includes check-hdr-includes
 	@tools/check-includes.sh
 
 # cppcheck gets confused by list_for_each(head, i, list): thinks i is uninit.
-.cppcheck-suppress:
-	@git ls-files -z -- "*.c" "*.h" | grep -vzE '^(ccan|contrib)/' | xargs -0 grep -n '_for_each' | sed 's/\([^:]*:.*\):.*/uninitvar:\1/' > $@
+.cppcheck-suppress: $(ALL_NONGEN_SRCFILES)
+	@ls $(ALL_NONGEN_SRCFILES) | grep -vzE '^(ccan|contrib)/' | xargs grep -n '_for_each' | sed 's/\([^:]*:.*\):.*/uninitvar:\1/' > $@
 
 check-cppcheck: .cppcheck-suppress
-	@trap 'rm -f .cppcheck-suppress' 0; git ls-files -z -- "*.c" "*.h" | grep -vzE '^ccan/' | xargs -0 cppcheck  ${CPPCHECK_OPTS}
+	@trap 'rm -f .cppcheck-suppress' 0; ls $(ALL_NONGEN_SRCFILES) | grep -vzE '^(ccan|contrib)/' | xargs cppcheck  ${CPPCHECK_OPTS}
 
 check-shellcheck:
 	@git ls-files -z -- "*.sh" | xargs -0 shellcheck -f gcc
@@ -636,7 +640,7 @@ version_gen.h: $(FORCE)
 endif
 
 # That forces this rule to be run every time, too.
-header_versions_gen.h: tools/headerversions
+header_versions_gen.h: tools/headerversions $(FORCE)
 	@tools/headerversions $@
 
 # We make a static library, this way linker can discard unused parts.
@@ -654,7 +658,7 @@ $(ALL_TEST_PROGRAMS) $(ALL_FUZZ_TARGETS): %: %.o
 # uses some ccan modules internally).  We want to rely on -lwallycore etc.
 # (as per EXTERNAL_LDLIBS) so we filter them out here.
 $(ALL_PROGRAMS) $(ALL_TEST_PROGRAMS):
-	@$(call VERBOSE, "ld $@", $(LINK.o) $(filter-out %.a,$^) $(LOADLIBES) $(EXTERNAL_LDLIBS) $(LDLIBS) libccan.a -o $@)
+	@$(call VERBOSE, "ld $@", $(LINK.o) $(filter-out %.a,$^) $(LOADLIBES) $(EXTERNAL_LDLIBS) $(LDLIBS) libccan.a $($(@)_LDLIBS) -o $@)
 
 # We special case the fuzzing target binaries, as they need to link against libfuzzer,
 # which brings its own main().
@@ -717,7 +721,7 @@ clean: obsclean
 
 PYLNS=client proto testing
 # See doc/contribute-to-core-lightning/contributor-workflow.md
-update-py-versions: update-pyln-versions update-clnrest-version update-poetry-lock
+update-py-versions: update-pyln-versions update-clnrest-version update-wss-proxy-version update-poetry-lock
 
 update-pyln-versions: $(PYLNS:%=update-pyln-version-%)
 
@@ -734,8 +738,16 @@ update-clnrest-version:
 	@if [ -z "$(NEW_VERSION)" ]; then echo "Set NEW_VERSION!" >&2; exit 1; fi
 	cd plugins/clnrest && $(MAKE) upgrade-version
 
+update-wss-proxy-version:
+	@if [ -z "$(NEW_VERSION)" ]; then echo "Set NEW_VERSION!" >&2; exit 1; fi
+	cd plugins/wss-proxy && $(MAKE) upgrade-version
+
 update-poetry-lock:
-	poetry update clnrest pyln-client pyln-proto pyln-testing
+	poetry update clnrest wss-proxy pyln-client pyln-proto pyln-testing update-reckless-version
+
+update-reckless-version:
+	@if [ -z "$(NEW_VERSION)" ]; then echo "Set NEW_VERSION!" >&2; exit 1; fi
+	@sed -i "s/__VERSION__ = '\([.-z]*\)'/__VERSION__ = '$(NEW_VERSION)'/" tools/reckless
 
 update-mocks: $(ALL_TEST_PROGRAMS:%=update-mocks/%.c)
 
@@ -744,8 +756,8 @@ $(ALL_TEST_PROGRAMS:%=update-mocks/%.c): $(ALL_GEN_HEADERS) $(EXTERNAL_LIBS) lib
 update-mocks/%: % $(ALL_GEN_HEADERS) $(ALL_GEN_SOURCES)
 	@MAKE=$(MAKE) tools/update-mocks.sh "$*" $(SUPPRESS_OUTPUT)
 
-unittest/%: %
-	$(VG) $(VG_TEST_ARGS) $* > /dev/null
+unittest/%: % bolt-precheck
+	BOLTDIR=$(LOCAL_BOLTDIR) $(VG) $(VG_TEST_ARGS) $* > /dev/null
 
 # Installation directories
 exec_prefix = $(PREFIX)
@@ -874,7 +886,7 @@ uninstall:
 installcheck: all-programs
 	@rm -rf testinstall || true
 	$(MAKE) DESTDIR=$$(pwd)/testinstall install
-	testinstall$(bindir)/lightningd --test-daemons-only --lightning-dir=testinstall
+	DEV_LIGHTNINGD_DESTDIR_PREFIX=$$(pwd)/testinstall/ testinstall$(bindir)/lightningd --test-daemons-only --lightning-dir=testinstall
 	$(MAKE) DESTDIR=$$(pwd)/testinstall uninstall
 	@if test `find testinstall '!' -type d | wc -l` -ne 0; then \
 		echo 'make uninstall left some files in testinstall directory!'; \

@@ -407,9 +407,7 @@ static struct command_result *json_showrunes(struct command *cmd,
 
 static const struct json_command showrunes_command = {
 	"showrunes",
-	"utility",
 	json_showrunes,
-	"Show the list of runes or decode an optional {rune}."
 };
 AUTODATA(json_command, &showrunes_command);
 
@@ -587,17 +585,13 @@ static struct command_result *json_createrune(struct command *cmd,
 
 static const struct json_command creatrune_command = {
 	"createrune",
-	"utility",
 	json_createrune,
-	"Create or restrict an optional {rune} with optional {restrictions} and returns {rune}"
 };
 AUTODATA(json_command, &creatrune_command);
 
 static const struct json_command invokerune_command = {
 	"invokerune",
-	"utility",
 	json_createrune,
-	"Invoke or restrict an optional {rune} with optional {restrictions} and returns {rune}"
 };
 AUTODATA(json_command, &invokerune_command);
 
@@ -700,17 +694,13 @@ static struct command_result *json_blacklistrune(struct command *cmd,
 
 static const struct json_command blacklistrune_command = {
 	"blacklistrune",
-	"utility",
 	json_blacklistrune,
-	"Blacklist a rune or range of runes by taking an optional {start} and an optional {end} and returns {blacklist} array containing {start}, {end}"
 };
 AUTODATA(json_command, &blacklistrune_command);
 
 static const struct json_command destroyrune_command = {
 	"destroyrune",
-	"utility",
 	json_blacklistrune,
-	"Destroy a rune or range of runes by taking an optional {start} and an optional {end} and returns {blacklist} array containing {start}, {end}"
 };
 AUTODATA(json_command, &destroyrune_command);
 
@@ -775,9 +765,9 @@ static const char *check_bolt12_condition(const tal_t *ctx,
 			return rune_alt_single_missing(ctx, alt);
 		return rune_alt_single_int(ctx, alt, *b12->invoice_amount);
 	case INV_FIELD_NODE_ID: {
-		if (!b12->offer_node_id)
+		if (!b12->offer_issuer_id)
 			return rune_alt_single_missing(ctx, alt);
-		const char *id = fmt_pubkey(tmpctx, b12->offer_node_id);
+		const char *id = fmt_pubkey(tmpctx, b12->offer_issuer_id);
 		return rune_alt_single_str(ctx, alt, id, strlen(id));
 	}
 	case INV_FIELD_DESCRIPTION:
@@ -998,8 +988,6 @@ static struct command_result *json_checkrune(struct command *cmd,
 
 static const struct json_command checkrune_command = {
 	"checkrune",
-	"utility",
 	json_checkrune,
-	"Checks rune for validity with required {rune} and optional {nodeid}, {method}, {params} and returns {valid: true} or error message"
 };
 AUTODATA(json_command, &checkrune_command);

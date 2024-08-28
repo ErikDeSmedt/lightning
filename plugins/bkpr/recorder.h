@@ -63,6 +63,11 @@ struct channel_event **account_get_channel_events(const tal_t *ctx,
 						  struct db *db,
 						  struct account *acct);
 
+/* Get all channel events for a payment id, order by timestamp */
+struct channel_event **get_channel_events_by_id(const tal_t *ctx,
+						struct db *db,
+						struct sha256 *id);
+
 /* Get all channel events, ordered by timestamp */
 struct channel_event **list_channel_events(const tal_t *ctx, struct db *db);
 
@@ -82,6 +87,10 @@ struct channel_event **list_channel_events_timebox(const tal_t *ctx,
 struct chain_event **account_get_chain_events(const tal_t *ctx,
 					      struct db *db,
 					      struct account *acct);
+
+/* Get all chain events for a transaction id, order by timestamp */
+struct chain_event **find_chain_events_bytxid(const tal_t *ctx, struct db *db,
+					      struct bitcoin_txid *txid);
 
 /* Get all chain events, order by timestamp.  */
 struct chain_event **list_chain_events(const tal_t *ctx, struct db *db);
@@ -114,6 +123,10 @@ char *account_get_balance(const tal_t *ctx,
 /* Get chain fees for account */
 struct onchain_fee **account_get_chain_fees(const tal_t *ctx, struct db *db,
 					    struct account *acct);
+
+/* Get all chain fees for a transaction id, order by timestamp */
+struct onchain_fee **get_chain_fees_by_txid(const tal_t *ctx, struct db *db,
+					    struct bitcoin_txid *txid);
 
 /* Find a chain event by its database id */
 struct chain_event *find_chain_event_by_id(const tal_t *ctx,
@@ -208,7 +221,9 @@ void add_payment_hash_desc(struct db *db,
  *
  * This method updates the blockheight on these events to the
  * height an input was spent into */
-void maybe_closeout_external_deposits(struct db *db, struct chain_event *ev);
+void maybe_closeout_external_deposits(struct db *db,
+				      const struct bitcoin_txid *txid,
+				      u32 blockheight);
 
 /* Keep track of rebalancing payments (payments paid to/from ourselves.
  * Returns true if was rebalance */
@@ -224,9 +239,10 @@ void log_channel_event(struct db *db,
 		       struct channel_event *e);
 
 /* Log a chain event.
- * Returns true if inserted, false if already exists */
+ * Returns true if inserted, false if already exists;
+ * ctx is for allocating objects onto chain_event `e` */
 bool log_chain_event(struct db *db,
-		     const struct account *acct,
-		     struct chain_event *e);
+                     const struct account *acct,
+                     struct chain_event *e);
 
 #endif /* LIGHTNING_PLUGINS_BKPR_RECORDER_H */

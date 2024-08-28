@@ -53,6 +53,7 @@ struct command {
 	const char *id;
 	const char *methodname;
 	bool usage_only;
+	bool check;
 	struct plugin *plugin;
 	/* Optional output field filter. */
 	struct json_filter *filter;
@@ -61,9 +62,6 @@ struct command {
 /* Create an array of these, one for each command you support. */
 struct plugin_command {
 	const char *name;
-	const char *category;
-	const char *description;
-	const char *long_description;
 	struct command_result *(*handle)(struct command *cmd,
 					 const char *buf,
 					 const jsmntok_t *params);
@@ -71,21 +69,6 @@ struct plugin_command {
 	const char *depr_start, *depr_end;
 	/* If true, this option requires --developer to be enabled */
 	bool dev_only;
-};
-
-/* Create an array of these, one for each --option you support. */
-struct plugin_option {
-	const char *name;
-	const char *type;
-	const char *description;
-	char *(*handle)(struct plugin *plugin, const char *str, void *arg);
-	void *arg;
-	/* If true, this option requires --developer to be enabled */
-	bool dev_only;
-	/* If it's deprecated from a particular release (or NULL) */
-	const char *depr_start, *depr_end;
-	/* If true, allow setting after plugin has initialized */
-	bool dynamic;
 };
 
 /* Create an array of these, one for each notification you subscribe to. */
@@ -117,6 +100,7 @@ struct out_req *jsonrpc_request_start_(struct plugin *plugin,
 				       struct command *cmd,
 				       const char *method,
 				       const char *id_prefix,
+				       const char *filter,
 				       struct command_result *(*cb)(struct command *command,
 								    const char *buf,
 								    const jsmntok_t *result,
@@ -131,7 +115,7 @@ struct out_req *jsonrpc_request_start_(struct plugin *plugin,
  * "error" members. */
 #define jsonrpc_request_start(plugin, cmd, method, cb, errcb, arg)	\
 	jsonrpc_request_start_((plugin), (cmd), (method),		\
-		     json_id_prefix(tmpctx, (cmd)),			\
+		     json_id_prefix(tmpctx, (cmd)), NULL,		\
 		     typesafe_cb_preargs(struct command_result *, void *, \
 					 (cb), (arg),			\
 					 struct command *command,	\
@@ -144,11 +128,25 @@ struct out_req *jsonrpc_request_start_(struct plugin *plugin,
 					 const jsmntok_t *result),	\
 		     (arg))
 
+#define jsonrpc_request_with_filter_start(plugin, cmd, method, filter, cb, errcb, arg) \
+	jsonrpc_request_start_((plugin), (cmd), (method),		\
+		     json_id_prefix(tmpctx, (cmd)), (filter),		\
+		     typesafe_cb_preargs(struct command_result *, void *, \
+					 (cb), (arg),			\
+					 struct command *command,	\
+					 const char *buf,		\
+					 const jsmntok_t *result),	\
+		     typesafe_cb_preargs(struct command_result *, void *, \
+					 (errcb), (arg),		\
+					 struct command *command,	\
+					 const char *buf,		\
+					 const jsmntok_t *result),	\
+		     (arg))
 
 /* This variant has callbacks received whole obj, not "result" or
  * "error" members.  It also doesn't start params{}. */
 #define jsonrpc_request_whole_object_start(plugin, cmd, method, id_prefix, cb, arg) \
-	jsonrpc_request_start_((plugin), (cmd), (method), (id_prefix),	\
+	jsonrpc_request_start_((plugin), (cmd), (method), (id_prefix), NULL, \
 			       typesafe_cb_preargs(struct command_result *, void *, \
 						   (cb), (arg),		\
 						   struct command *command, \
@@ -423,54 +421,95 @@ void plugin_notify_progress(struct command *cmd,
 
 /* Simply exists to check that `set` to plugin_option* is correct type */
 static inline void *plugin_option_cb_check(char *(*set)(struct plugin *plugin,
-							const char *arg, void *))
+							const char *arg,
+							bool check_only,
+							void *))
 {
 	return set;
+}
+
+/* Simply exists to check that `jsonfmt` to plugin_option* is correct type */
+static inline void *plugin_option_jsonfmt_check(bool (*jsonfmt)(struct plugin *,
+								struct json_stream *,
+								const char *,
+								void *))
+{
+	return jsonfmt;
 }
 
 /* Is --developer enabled? */
 bool plugin_developer_mode(const struct plugin *plugin);
 
+/* Store a single pointer for our state in the plugin */
+void plugin_set_data(struct plugin *plugin, void *data TAKES);
+void *plugin_get_data_(struct plugin *plugin);
+#define plugin_get_data(plugin, type) ((type *)(plugin_get_data_(plugin)))
+
 /* Macro to define arguments */
-#define plugin_option_(name, type, description, set, arg, dev_only, depr_start, depr_end, dynamic) \
+#define plugin_option_(name, type, description, set, jsonfmt, arg, dev_only, depr_start, depr_end, dynamic) \
 	(name),								\
 	(type),								\
 	(description),							\
 	plugin_option_cb_check(typesafe_cb_preargs(char *, void *,	\
 						   (set), (arg),	\
 						   struct plugin *,	\
-						   const char *)),	\
+						   const char *, bool)),\
+	plugin_option_jsonfmt_check(typesafe_cb_preargs(bool, void *,	\
+							(jsonfmt), (arg), \
+							struct plugin *, \
+							struct json_stream *, \
+							const char *)),	\
 	(arg),								\
 	(dev_only),							\
 	(depr_start),							\
 	(depr_end),							\
 	(dynamic)
 
-#define plugin_option(name, type, description, set, arg) \
-	plugin_option_((name), (type), (description), (set), (arg), false, NULL, NULL, false)
+/* jsonfmt can be NULL, but then default won't be printed */
+#define plugin_option(name, type, description, set, jsonfmt, arg)	\
+	plugin_option_((name), (type), (description), (set), (jsonfmt), (arg), false, NULL, NULL, false)
 
-#define plugin_option_dev(name, type, description, set, arg) \
-	plugin_option_((name), (type), (description), (set), (arg), true, NULL, NULL, false)
+#define plugin_option_dev(name, type, description, set, jsonfmt, arg)	\
+	plugin_option_((name), (type), (description), (set), (jsonfmt), (arg), true, NULL, NULL, false)
 
-#define plugin_option_dynamic(name, type, description, set, arg) \
-	plugin_option_((name), (type), (description), (set), (arg), false, NULL, NULL, true)
+#define plugin_option_dev_dynamic(name, type, description, set, jsonfmt, arg) \
+	plugin_option_((name), (type), (description), (set), (jsonfmt), (arg), true, NULL, NULL, true)
 
-#define plugin_option_deprecated(name, type, description, depr_start, depr_end, set, arg) \
-	plugin_option_((name), (type), (description), (set), (arg), false, (depr_start), (depr_end), false)
+#define plugin_option_dynamic(name, type, description, set, jsonfmt, arg) \
+	plugin_option_((name), (type), (description), (set), (jsonfmt), (arg), false, NULL, NULL, true)
+
+#define plugin_option_deprecated(name, type, description, depr_start, depr_end, set, jsonfmt, arg) \
+	plugin_option_((name), (type), (description), (set), (jsonfmt), (arg), false, (depr_start), (depr_end), false)
 
 /* Standard helpers */
-char *u64_option(struct plugin *plugin, const char *arg, u64 *i);
-char *u32_option(struct plugin *plugin, const char *arg, u32 *i);
-char *u16_option(struct plugin *plugin, const char *arg, u16 *i);
-char *bool_option(struct plugin *plugin, const char *arg, bool *i);
-char *charp_option(struct plugin *plugin, const char *arg, char **p);
-char *flag_option(struct plugin *plugin, const char *arg, bool *i);
+char *u64_option(struct plugin *plugin, const char *arg, bool check_only, u64 *i);
+char *u32_option(struct plugin *plugin, const char *arg, bool check_only, u32 *i);
+char *u16_option(struct plugin *plugin, const char *arg, bool check_only, u16 *i);
+char *bool_option(struct plugin *plugin, const char *arg, bool check_only, bool *i);
+char *charp_option(struct plugin *plugin, const char *arg, bool check_only, char **p);
+char *flag_option(struct plugin *plugin, const char *arg, bool check_only, bool *i);
+
+bool u64_jsonfmt(struct plugin *plugin, struct json_stream *js, const char *fieldname,
+		 u64 *i);
+bool u32_jsonfmt(struct plugin *plugin, struct json_stream *js, const char *fieldname,
+		 u32 *i);
+bool u16_jsonfmt(struct plugin *plugin, struct json_stream *js, const char *fieldname,
+		 u16 *i);
+bool bool_jsonfmt(struct plugin *plugin, struct json_stream *js, const char *fieldname,
+		  bool *i);
+bool charp_jsonfmt(struct plugin *plugin, struct json_stream *js, const char *fieldname,
+		   char **p);
+
+/* Usually equivalent to NULL, since flag must default to false be useful! */
+bool flag_jsonfmt(struct plugin *plugin, struct json_stream *js, const char *fieldname,
+		  bool *i);
 
 /* The main plugin runner: append with 0 or more plugin_option(), then NULL. */
 void NORETURN LAST_ARG_NULL plugin_main(char *argv[],
 					const char *(*init)(struct plugin *p,
 							    const char *buf,
 							    const jsmntok_t *),
+					void *data TAKES,
 					const enum plugin_restartability restartability,
 					bool init_rpc,
 					struct feature_set *features STEALS,

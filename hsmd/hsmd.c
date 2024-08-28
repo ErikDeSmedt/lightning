@@ -425,6 +425,29 @@ static void load_hsm(const struct secret *encryption_key)
 	close(fd);
 }
 
+/*~ We have a pre-init call in developer mode, to set dev flags */
+static struct io_plan *preinit_hsm(struct io_conn *conn,
+				   struct client *c,
+				   const u8 *msg_in)
+{
+	struct tlv_hsmd_dev_preinit_tlvs *tlv;
+	assert(developer);
+
+	if (!fromwire_hsmd_dev_preinit(tmpctx, msg_in, &tlv))
+		return bad_req(conn, c, msg_in);
+
+	if (tlv->fail_preapprove)
+		dev_fail_preapprove = *tlv->fail_preapprove;
+
+	if (tlv->no_preapprove_check)
+		dev_no_preapprove_check = *tlv->no_preapprove_check;
+
+	status_debug("preinit: dev_fail_preapprove = %u, dev_no_preapprove_check = %u",
+		     dev_fail_preapprove, dev_no_preapprove_check);
+	/* We don't send a reply, just read next */
+	return client_read_next(conn, c);
+}
+
 /*~ This is the response to lightningd's HSM_INIT request, which is the first
  * thing it sends. */
 static struct io_plan *init_hsm(struct io_conn *conn,
@@ -434,7 +457,7 @@ static struct io_plan *init_hsm(struct io_conn *conn,
 	struct secret *hsm_encryption_key;
 	struct bip32_key_version bip32_key_version;
 	u32 minversion, maxversion;
-	const u32 our_minversion = 4, our_maxversion = 5;
+	const u32 our_minversion = 4, our_maxversion = 6;
 
 	/* This must be lightningd. */
 	assert(is_lightningd(c));
@@ -488,8 +511,8 @@ static struct io_plan *init_hsm(struct io_conn *conn,
 		discard_key(take(hsm_encryption_key));
 
 	/* Define the minimum common max version for the hsmd one */
-	u64 mutual_version = maxversion < our_maxversion ? maxversion : our_maxversion;
-	return req_reply(conn, c, hsmd_init(hsm_secret, mutual_version,
+	hsmd_mutual_version = maxversion < our_maxversion ? maxversion : our_maxversion;
+	return req_reply(conn, c, hsmd_init(hsm_secret, hsmd_mutual_version,
 					    bip32_key_version));
 }
 
@@ -634,6 +657,9 @@ static struct io_plan *handle_client(struct io_conn *conn, struct client *c)
 
 	/* Now actually go and do what the client asked for */
 	switch (t) {
+	case WIRE_HSMD_DEV_PREINIT:
+		return preinit_hsm(conn, c, c->msg_in);
+
 	case WIRE_HSMD_INIT:
 		return init_hsm(conn, c, c->msg_in);
 
@@ -665,8 +691,11 @@ static struct io_plan *handle_client(struct io_conn *conn, struct client *c)
 	case WIRE_HSMD_SIGN_MESSAGE:
 	case WIRE_HSMD_SIGN_OPTION_WILL_FUND_OFFER:
 	case WIRE_HSMD_SIGN_BOLT12:
+	case WIRE_HSMD_SIGN_BOLT12_2:
 	case WIRE_HSMD_PREAPPROVE_INVOICE:
 	case WIRE_HSMD_PREAPPROVE_KEYSEND:
+	case WIRE_HSMD_PREAPPROVE_INVOICE_CHECK:
+	case WIRE_HSMD_PREAPPROVE_KEYSEND_CHECK:
 	case WIRE_HSMD_ECDH_REQ:
 	case WIRE_HSMD_CHECK_FUTURE_SECRET:
 	case WIRE_HSMD_GET_OUTPUT_SCRIPTPUBKEY:
@@ -718,8 +747,11 @@ static struct io_plan *handle_client(struct io_conn *conn, struct client *c)
 	case WIRE_HSMD_SIGN_MESSAGE_REPLY:
 	case WIRE_HSMD_GET_OUTPUT_SCRIPTPUBKEY_REPLY:
 	case WIRE_HSMD_SIGN_BOLT12_REPLY:
+	case WIRE_HSMD_SIGN_BOLT12_2_REPLY:
 	case WIRE_HSMD_PREAPPROVE_INVOICE_REPLY:
 	case WIRE_HSMD_PREAPPROVE_KEYSEND_REPLY:
+	case WIRE_HSMD_PREAPPROVE_INVOICE_CHECK_REPLY:
+	case WIRE_HSMD_PREAPPROVE_KEYSEND_CHECK_REPLY:
 	case WIRE_HSMD_CHECK_PUBKEY_REPLY:
 	case WIRE_HSMD_SIGN_ANCHORSPEND_REPLY:
 	case WIRE_HSMD_SIGN_HTLC_TX_MINGLE_REPLY:

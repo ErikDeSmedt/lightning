@@ -31,7 +31,8 @@
 #include <sodium/randombytes.h>
 #include <wally_psbt.h>
 
-void json_add_uncommitted_channel(struct json_stream *response,
+void json_add_uncommitted_channel(struct command *cmd,
+				  struct json_stream *response,
 				  const struct uncommitted_channel *uc,
 				  const struct peer *peer)
 {
@@ -73,13 +74,11 @@ void json_add_uncommitted_channel(struct json_stream *response,
 
 	if (feature_negotiated(uc->peer->ld->our_features,
 			       uc->peer->their_features,
-			       OPT_ANCHOR_OUTPUTS))
-		json_add_string(response, NULL, "option_anchor_outputs");
-
-	if (feature_negotiated(uc->peer->ld->our_features,
-			       uc->peer->their_features,
-			       OPT_ANCHORS_ZERO_FEE_HTLC_TX))
-		json_add_string(response, NULL, "option_anchors_zero_fee_htlc_tx");
+			       OPT_ANCHORS_ZERO_FEE_HTLC_TX)) {
+		if (command_deprecated_out_ok(cmd, "features", "v24.08", "v25.08"))
+			json_add_string(response, NULL, "option_anchors_zero_fee_htlc_tx");
+		json_add_string(response, NULL, "option_anchors");
+	}
 
 	json_array_end(response);
 	json_object_end(response);
@@ -151,16 +150,6 @@ wallet_commit_channel(struct lightningd *ld,
 	 *
 	 * Both peers:
 	 * ...
-	 *   - if `option_anchors_zero_fee_htlc_tx` was negotiated:
-	 *     - the `channel_type` is `option_anchors_zero_fee_htlc_tx` and
-	 *       `option_static_remotekey` (bits 22 and 12)
-	 *   - otherwise, if `option_anchor_outputs` was negotiated:
-	 *     - the `channel_type` is `option_anchor_outputs` and
-	 *       `option_static_remotekey` (bits 20 and 12)
-	 *   - otherwise, if `option_static_remotekey` was negotiated:
-	 *     - the `channel_type` is `option_static_remotekey` (bit 12)
-	 *   - otherwise:
-	 *     - the `channel_type` is empty
 	 * - MUST use that `channel_type` for all commitment transactions.
 	 */
 	/* i.e. We set it now for the channel permanently. */
@@ -215,7 +204,7 @@ wallet_commit_channel(struct lightningd *ld,
 			      feerate, feerate,
 			      &uc->local_basepoints,
 			      &uc->local_funding_pubkey,
-			      NULL,
+			      false, /* !has_future_per_commitment_point */
 			      ld->config.fee_base,
 			      ld->config.fee_per_satoshi,
 			      remote_upfront_shutdown_script,
@@ -453,8 +442,11 @@ static void opening_funder_finished(struct subd *openingd, const u8 *resp,
 	if (pbase)
 		wallet_penalty_base_add(ld->wallet, channel->dbid, pbase);
 
+	/* If this fails, it cleans up */
+	if (!peer_start_channeld(channel, peer_fd, NULL, false, NULL))
+		return;
+
 	funding_success(channel);
-	peer_start_channeld(channel, peer_fd, NULL, false, NULL);
 
 cleanup:
 	/* Frees fc too */
@@ -557,10 +549,9 @@ static void opening_fundee_finished(struct subd *openingd,
 	if (pbase)
 		wallet_penalty_base_add(ld->wallet, channel->dbid, pbase);
 
-	/* On to normal operation! */
-	peer_start_channeld(channel, peer_fd, fwd_msg, false, NULL);
-
-	tal_free(uc);
+	/* On to normal operation (frees if it fails!) */
+	if (peer_start_channeld(channel, peer_fd, fwd_msg, false, NULL))
+		tal_free(uc);
 	return;
 
 failed:
@@ -934,6 +925,15 @@ bool peer_start_openingd(struct peer *peer, struct peer_fd *peer_fd)
 				  HSM_PERM_COMMITMENT_POINT
 				  | HSM_PERM_SIGN_REMOTE_TX);
 
+	if (hsmfd < 0) {
+		uncommitted_channel_disconnect(uc, LOG_BROKEN,
+					       tal_fmt(tmpctx,
+						       "Getting hsmfd for lightning_openingd: %s",
+						       strerror(errno)));
+		tal_free(uc);
+		return false;
+	}
+
 	uc->open_daemon = new_channel_subd(peer, peer->ld,
 					"lightning_openingd",
 					uc, &peer->id, uc->log,
@@ -1126,6 +1126,96 @@ static struct command_result *json_fundchannel_cancel(struct command *cmd,
 	return cancel_channel_before_broadcast(cmd, peer);
 }
 
+static struct command_result *fundchannel_start(struct command *cmd,
+						struct peer *peer,
+						struct funding_channel *fc STEALS,
+						const struct channel_id *tmp_channel_id,
+						u32 mindepth,
+						struct amount_sat *reserve STEALS)
+{
+	int fds[2];
+
+	/* Re-check in case it's changed */
+	if (!peer->uncommitted_channel) {
+		log_debug(cmd->ld->log, "fundchannel_start: allocating uncommitted_channel");
+		peer->uncommitted_channel = new_uncommitted_channel(peer);
+	} else
+		log_debug(cmd->ld->log, "fundchannel_start: reusing uncommitted_channel");
+
+	if (peer->uncommitted_channel->fc) {
+		return command_fail(cmd, LIGHTNINGD, "Already funding channel");
+	}
+
+	if (peer->uncommitted_channel->got_offer) {
+		return command_fail(cmd, LIGHTNINGD,
+				    "Have in-progress "
+				    "`open_channel` from "
+				    "peer");
+	}
+
+	peer->uncommitted_channel->cid = *tmp_channel_id;
+
+	peer->uncommitted_channel->fc = tal_steal(peer->uncommitted_channel, fc);
+	fc->uc = peer->uncommitted_channel;
+
+	fc->uc->minimum_depth = mindepth;
+
+	fc->uc->reserve = tal_steal(fc->uc, reserve);
+
+	if (socketpair(AF_LOCAL, SOCK_STREAM, 0, fds) != 0) {
+		return command_fail(cmd, FUND_MAX_EXCEEDED,
+				    "Failed to create socketpair: %s",
+				    strerror(errno));
+	}
+	if (!peer_start_openingd(peer, new_peer_fd(cmd, fds[0]))) {
+		close(fds[1]);
+		/* FIXME: gets completed by failure path above! */
+		return command_its_complicated("completed by peer_start_openingd");
+	}
+
+	/* Tell it to start funding */
+	subd_send_msg(peer->uncommitted_channel->open_daemon, fc->open_msg);
+
+	/* Tell connectd connect this to this channel id. */
+	subd_send_msg(peer->ld->connectd,
+		      take(towire_connectd_peer_connect_subd(NULL,
+							     &peer->id,
+							     peer->connectd_counter,
+							     &peer->uncommitted_channel->cid)));
+	subd_send_fd(peer->ld->connectd, fds[1]);
+	return command_still_pending(cmd);
+}
+
+struct fundchannel_start_info {
+	struct command *cmd;
+	struct node_id id;
+	struct funding_channel *fc;
+	struct channel_id tmp_channel_id;
+	struct amount_sat *reserve;
+	u32 mindepth;
+};
+
+static void fundchannel_start_after_sync(struct chain_topology *topo,
+					 struct fundchannel_start_info *info)
+{
+	struct peer *peer;
+
+	/* Look up peer again in case it's gone! */
+	peer = peer_by_id(info->cmd->ld, &info->id);
+	if (!peer) {
+		was_pending(command_fail(info->cmd, FUNDING_UNKNOWN_PEER, "Unknown peer"));
+		return;
+	}
+
+	if (peer->connected != PEER_CONNECTED)
+		was_pending(command_fail(info->cmd, FUNDING_PEER_NOT_CONNECTED,
+					 "Peer %s",
+					 peer->connected == PEER_DISCONNECTED
+					 ? "not connected" : "still connecting"));
+	fundchannel_start(info->cmd, peer, info->fc,
+			  &info->tmp_channel_id, info->mindepth, info->reserve);
+}
+
 /**
  * json_fundchannel_start - Entrypoint for funding a channel
  */
@@ -1139,7 +1229,6 @@ static struct command_result *json_fundchannel_start(struct command *cmd,
 	struct peer *peer;
 	bool *announce_channel;
 	u32 *feerate_non_anchor, feerate_anchor, *mindepth;
-	int fds[2];
 	struct amount_sat *amount, *reserve;
 	struct amount_msat *push_msat;
 	u32 *upfront_shutdown_script_wallet_index;
@@ -1159,7 +1248,7 @@ static struct command_result *json_fundchannel_start(struct command *cmd,
 			 p_opt_def("announce", param_bool, &announce_channel, true),
 			 p_opt("close_to", param_bitcoin_address, &fc->our_upfront_shutdown_script),
 			 p_opt("push_msat", param_msat, &push_msat),
-			 p_opt_def("mindepth", param_u32, &mindepth, cmd->ld->config.anchor_confirms),
+			 p_opt("mindepth", param_u32, &mindepth),
 			 p_opt("reserve", param_sat, &reserve),
 			 p_opt("channel_type", param_channel_type, &ctype),
 			 NULL))
@@ -1174,9 +1263,32 @@ static struct command_result *json_fundchannel_start(struct command *cmd,
 			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 					    "channel_type not supported");
 		}
+		/* BOLT #2:
+		 *
+		 * The sender:
+		 *   - if `channel_type` includes `option_zeroconf`:
+		 *      - MUST set `minimum_depth` to zero.
+		 *   - otherwise:
+		 *     - SHOULD set `minimum_depth` to a number of blocks it
+		 *       considers reasonable to avoid double-spending of the
+		 *       funding transaction.
+		 */
+		if (channel_type_has(ctype, OPT_ZEROCONF)) {
+			if (mindepth && *mindepth != 0) {
+				return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+						    "Cannot set non-zero mindepth for zero-conf channel_type");
+			}
+			if (!mindepth) {
+				mindepth = tal(cmd, u32);
+				*mindepth = 0;
+			}
+		}
 	} else {
 		fc->channel_type = NULL;
 	}
+
+	if (!mindepth)
+		mindepth = tal_dup(cmd, u32, &cmd->ld->config.anchor_confirms);
 
 	if (push_msat && amount_msat_greater_sat(*push_msat, *amount))
 		return command_fail(cmd, FUND_CANNOT_AFFORD,
@@ -1214,11 +1326,6 @@ static struct command_result *json_fundchannel_start(struct command *cmd,
 				    *feerate_non_anchor, get_feerate_floor(cmd->ld->topology));
 	}
 
-	if (!topology_synced(cmd->ld->topology)) {
-		return command_fail(cmd, FUNDING_STILL_SYNCING_BITCOIN,
-				    "Still syncing with bitcoin network");
-	}
-
 	peer = peer_by_id(cmd->ld, id);
 	if (!peer) {
 		return command_fail(cmd, FUNDING_UNKNOWN_PEER, "Unknown peer");
@@ -1229,36 +1336,6 @@ static struct command_result *json_fundchannel_start(struct command *cmd,
 				    "Peer %s",
 				    peer->connected == PEER_DISCONNECTED
 				    ? "not connected" : "still connecting");
-
-	temporary_channel_id(&tmp_channel_id);
-
-	if (!peer->uncommitted_channel) {
-		if (feature_negotiated(cmd->ld->our_features,
-				       peer->their_features,
-				       OPT_DUAL_FUND))
-			return command_fail(cmd, FUNDING_STATE_INVALID,
-					    "Peer negotiated"
-					    " `option_dual_fund`,"
-					    " must use `openchannel_init` not"
-					    " `fundchannel_start`.");
-
-		log_debug(cmd->ld->log, "fundchannel_start: allocating uncommitted_channel");
-		peer->uncommitted_channel = new_uncommitted_channel(peer);
-	} else
-		log_debug(cmd->ld->log, "fundchannel_start: reusing uncommitted_channel");
-
-	if (peer->uncommitted_channel->fc) {
-		return command_fail(cmd, LIGHTNINGD, "Already funding channel");
-	}
-
-	if (peer->uncommitted_channel->got_offer) {
-		return command_fail(cmd, LIGHTNINGD,
-				    "Have in-progress "
-				    "`open_channel` from "
-				    "peer");
-	}
-
-	peer->uncommitted_channel->cid = tmp_channel_id;
 
 	/* BOLT #2:
 	 *  - if both nodes advertised `option_support_large_channel`:
@@ -1274,6 +1351,28 @@ static struct command_result *json_fundchannel_start(struct command *cmd,
 				    fmt_amount_sat(tmpctx,
 						   chainparams->max_funding));
 
+	if (feature_negotiated(cmd->ld->our_features,
+			       peer->their_features,
+			       OPT_DUAL_FUND))
+		return command_fail(cmd, FUNDING_STATE_INVALID,
+				    "Peer negotiated"
+				    " `option_dual_fund`,"
+				    " must use `openchannel_init` not"
+				    " `fundchannel_start`.");
+
+	if (peer->uncommitted_channel) {
+		if (peer->uncommitted_channel->fc) {
+			return command_fail(cmd, LIGHTNINGD, "Already funding channel");
+		}
+
+		if (peer->uncommitted_channel->got_offer) {
+			return command_fail(cmd, LIGHTNINGD,
+					    "Have in-progress "
+					    "`open_channel` from "
+					    "peer");
+		}
+	}
+
 	if (command_check_only(cmd))
 		return command_check_done(cmd);
 
@@ -1284,24 +1383,6 @@ static struct command_result *json_fundchannel_start(struct command *cmd,
 		log_info(peer->ld->log, "Will open private channel with node %s",
 			fmt_node_id(fc, id));
 	}
-
-	peer->uncommitted_channel->fc = tal_steal(peer->uncommitted_channel, fc);
-	fc->uc = peer->uncommitted_channel;
-
-	/* BOLT #2:
-	 *
-	 * The sender:
-	 *   - if `channel_type` includes `option_zeroconf`:
-	 *      - MUST set `minimum_depth` to zero.
-	 *   - otherwise:
-	 *     - SHOULD set `minimum_depth` to a number of blocks it
-	 *       considers reasonable to avoid double-spending of the
-	 *       funding transaction.
-	 */
-	assert(mindepth != NULL);
-	fc->uc->minimum_depth = *mindepth;
-
-	fc->uc->reserve = reserve;
 
 	/* Needs to be stolen away from cmd */
 	if (fc->our_upfront_shutdown_script)
@@ -1319,6 +1400,7 @@ static struct command_result *json_fundchannel_start(struct command *cmd,
 	} else
 		upfront_shutdown_script_wallet_index = NULL;
 
+	temporary_channel_id(&tmp_channel_id);
 	fc->open_msg = towire_openingd_funder_start(
 			fc,
 			*amount,
@@ -1329,30 +1411,32 @@ static struct command_result *json_fundchannel_start(struct command *cmd,
 			feerate_anchor,
 			&tmp_channel_id,
 			fc->channel_flags,
-			fc->uc->reserve,
+			reserve,
 			ctype);
 
-	if (socketpair(AF_LOCAL, SOCK_STREAM, 0, fds) != 0) {
-		return command_fail(cmd, FUND_MAX_EXCEEDED,
-				    "Failed to create socketpair: %s",
-				    strerror(errno));
-	}
-	if (!peer_start_openingd(peer, new_peer_fd(cmd, fds[0]))) {
-		close(fds[1]);
-		/* FIXME: gets completed by failure path above! */
-		return command_its_complicated("completed by peer_start_openingd");
-	}
-	/* Tell it to start funding */
-	subd_send_msg(peer->uncommitted_channel->open_daemon, fc->open_msg);
+	if (!topology_synced(cmd->ld->topology)) {
+		struct fundchannel_start_info *info
+			= tal(cmd, struct fundchannel_start_info);
 
-	/* Tell connectd connect this to this channel id. */
-	subd_send_msg(peer->ld->connectd,
-		      take(towire_connectd_peer_connect_subd(NULL,
-							     &peer->id,
-							     peer->connectd_counter,
-							     &peer->uncommitted_channel->cid)));
-	subd_send_fd(peer->ld->connectd, fds[1]);
-	return command_still_pending(cmd);
+		json_notify_fmt(cmd, LOG_UNUSUAL,
+				"Waiting to sync with bitcoind network (block %u of %u)",
+				get_block_height(cmd->ld->topology),
+				get_network_blockheight(cmd->ld->topology));
+
+		info->cmd = cmd;
+		info->fc = fc;
+		info->id = *id;
+		info->tmp_channel_id = tmp_channel_id;
+		info->reserve = reserve;
+		info->mindepth = *mindepth;
+		topology_add_sync_waiter(cmd, cmd->ld->topology,
+					 fundchannel_start_after_sync,
+					 info);
+		return command_still_pending(cmd);
+	}
+
+	return fundchannel_start(cmd, peer, fc,
+				 &tmp_channel_id, *mindepth, reserve);
 }
 
 static struct channel *stub_chan(struct command *cmd,
@@ -1385,14 +1469,14 @@ static struct channel *stub_chan(struct command *cmd,
 				    144);
 
 	/* If the channel is already stored, return NULL. */
+	if (channel_exists_by_id(cmd->ld->wallet, id)) {
+		log_debug(cmd->ld->log, "channel %s already exists!",
+				fmt_channel_id(tmpctx, &cid));
+		return NULL;
+	}
+
 	peer = peer_by_id(cmd->ld, &nodeid);
-	if (peer) {
-		if (find_channel_by_id(peer, &cid)) {
-			log_debug(cmd->ld->log, "channel %s already exists!",
-				  fmt_channel_id(tmpctx, &cid));
-			return NULL;
-		}
-	} else {
+	if (!peer) {
 		struct wireaddr_internal wint;
 
 		wint.itype = ADDR_INTERNAL_WIREADDR;
@@ -1494,7 +1578,7 @@ static struct channel *stub_chan(struct command *cmd,
                               funding_sats.satoshis / MINIMUM_TX_WEIGHT * 1000 /* Raw: convert to feerate */,
 			      &basepoints,
 			      &localFundingPubkey,
-			      NULL,
+			      false,
 			      ld->config.fee_base,
 			      ld->config.fee_per_satoshi,
 			      NULL,
@@ -1583,36 +1667,24 @@ static struct command_result *json_recoverchannel(struct command *cmd,
 
 static const struct json_command fundchannel_start_command = {
     "fundchannel_start",
-    "channels",
     json_fundchannel_start,
-    "Start fund channel with {id} using {amount} satoshis. "
-    "Returns a bech32 address to use as an output for a funding transaction."
 };
 AUTODATA(json_command, &fundchannel_start_command);
 
 static const struct json_command fundchannel_cancel_command = {
     "fundchannel_cancel",
-    "channels",
     json_fundchannel_cancel,
-    "Cancel inflight channel establishment with peer {id}."
 };
 AUTODATA(json_command, &fundchannel_cancel_command);
 
 static const struct json_command fundchannel_complete_command = {
     "fundchannel_complete",
-    "channels",
     json_fundchannel_complete,
-    "Complete channel establishment with peer {id} for funding transaction"
-    "with {psbt}. Returns true on success, false otherwise."
 };
 AUTODATA(json_command, &fundchannel_complete_command);
 
 static const struct json_command json_commitchan_command = {
         "recoverchannel",
-        "channels",
         json_recoverchannel,
-        "Populate the DB with a channel and peer"
-        "Used for recovering the channel using DLP."
-        "This needs param in the form of an array [scb1,scb2,...]"
 };
 AUTODATA(json_command, &json_commitchan_command);

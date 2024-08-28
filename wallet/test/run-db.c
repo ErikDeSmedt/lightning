@@ -34,6 +34,9 @@ void channel_gossip_update(struct channel *channel UNNEEDED)
 /* Generated stub for channel_scid_or_local_alias */
 struct short_channel_id channel_scid_or_local_alias(const struct channel *chan UNNEEDED)
 { fprintf(stderr, "channel_scid_or_local_alias called!\n"); abort(); }
+/* Generated stub for channel_state_name */
+const char *channel_state_name(const struct channel *channel UNNEEDED)
+{ fprintf(stderr, "channel_state_name called!\n"); abort(); }
 /* Generated stub for connect_htlc_in */
 void connect_htlc_in(struct htlc_in_map *map UNNEEDED, struct htlc_in *hin UNNEEDED)
 { fprintf(stderr, "connect_htlc_in called!\n"); abort(); }
@@ -166,7 +169,7 @@ struct channel *new_channel(struct peer *peer UNNEEDED, u64 dbid UNNEEDED,
 			    u32 max_possible_feerate UNNEEDED,
 			    const struct basepoints *local_basepoints UNNEEDED,
 			    const struct pubkey *local_funding_pubkey UNNEEDED,
-			    const struct pubkey *future_per_commitment_point UNNEEDED,
+			    bool has_future_per_commitment_point UNNEEDED,
 			    u32 feerate_base UNNEEDED,
 			    u32 feerate_ppm UNNEEDED,
 			    /* NULL or stolen */

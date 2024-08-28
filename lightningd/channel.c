@@ -301,14 +301,10 @@ struct channel *new_unsaved_channel(struct peer *peer,
 					     ld->our_features,
 					     peer->their_features);
 
-	/* BOLT-7b04b1461739c5036add61782d58ac490842d98b #9
-	 * | 222/223 | `option_dual_fund`
-	 * | Use v2 of channel open, enables dual funding
-	 * | IN9 */
 	channel->static_remotekey_start[LOCAL]
 		= channel->static_remotekey_start[REMOTE] = 0;
 
-	channel->future_per_commitment_point = NULL;
+	channel->has_future_per_commitment_point = false;
 
 	channel->lease_commit_sig = NULL;
 	channel->ignore_fee_limits = ld->config.ignore_fee_limits;
@@ -428,7 +424,7 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 			    u32 max_possible_feerate,
 			    const struct basepoints *local_basepoints,
 			    const struct pubkey *local_funding_pubkey,
-			    const struct pubkey *future_per_commitment_point,
+			    bool has_future_per_commitment_point,
 			    u32 feerate_base,
 			    u32 feerate_ppm,
 			    const u8 *remote_upfront_shutdown_script,
@@ -559,8 +555,7 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 	channel->max_possible_feerate = max_possible_feerate;
 	channel->local_basepoints = *local_basepoints;
 	channel->local_funding_pubkey = *local_funding_pubkey;
-	channel->future_per_commitment_point
-		= tal_steal(channel, future_per_commitment_point);
+	channel->has_future_per_commitment_point = has_future_per_commitment_point;
 	channel->feerate_base = feerate_base;
 	channel->feerate_ppm = feerate_ppm;
 	channel->old_feerate_timeout.ts.tv_sec = 0;
@@ -907,13 +902,19 @@ void channel_fail_permanent(struct channel *channel,
 	struct lightningd *ld = channel->peer->ld;
 	va_list ap;
 	char *why;
+	/* Do we want to rebroadcast close transactions? If we're
+	 * witnessing the close on-chain there is no point in doing
+	 * this. */
+	bool rebroadcast;
 
 	va_start(ap, fmt);
 	why = tal_vfmt(tmpctx, fmt, ap);
 	va_end(ap);
 
-	log_unusual(channel->log, "Peer permanent failure in %s: %s",
-		    channel_state_name(channel), why);
+	log_unusual(channel->log,
+		    "Peer permanent failure in %s: %s (reason=%s)",
+		    channel_state_name(channel), why,
+		    channel_change_state_reason_str(reason));
 
 	/* We can have multiple errors, eg. onchaind failures. */
 	if (!channel->error)
@@ -921,8 +922,15 @@ void channel_fail_permanent(struct channel *channel,
 						 &channel->cid, "%s", why);
 
 	channel_set_owner(channel, NULL);
-	/* Drop non-cooperatively (unilateral) to chain. */
-	drop_to_chain(ld, channel, false);
+
+	/* Drop non-cooperatively (unilateral) to chain. If we detect
+	 * the close from the blockchain (i.e., reason is
+	 * REASON_ONCHAIN, or FUNDING_SPEND_SEEN) then we can observe
+	 * passively, and not broadcast our own unilateral close, as
+	 * it doesn't stand a chance anyway. */
+	rebroadcast = !(channel->state == ONCHAIN ||
+			channel->state == FUNDING_SPEND_SEEN);
+	drop_to_chain(ld, channel, false, rebroadcast);
 
 	if (channel_state_wants_onchain_fail(channel->state))
 		channel_set_state(channel,
@@ -1014,7 +1022,7 @@ void channel_internal_error(struct channel *channel, const char *fmt, ...)
 	char *why;
 
 	va_start(ap, fmt);
-	why = tal_vfmt(channel, fmt, ap);
+	why = tal_vfmt(tmpctx, fmt, ap);
 	va_end(ap);
 
 	log_broken(channel->log, "Internal error %s: %s",
@@ -1026,7 +1034,6 @@ void channel_internal_error(struct channel *channel, const char *fmt, ...)
 	if (channel_state_uncommitted(channel->state)) {
 		channel_set_owner(channel, NULL);
 		delete_channel(channel);
-		tal_free(why);
 		return;
 	}
 
@@ -1036,7 +1043,6 @@ void channel_internal_error(struct channel *channel, const char *fmt, ...)
 				       REASON_LOCAL, "Internal error: %s", why);
 	else
 		channel_fail_permanent(channel, REASON_LOCAL, "Internal error");
-	tal_free(why);
 }
 
 void channel_set_billboard(struct channel *channel, bool perm, const char *str)

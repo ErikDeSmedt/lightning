@@ -6,9 +6,18 @@
 #include <common/memleak.h>
 #include <plugins/libplugin.h>
 
-static char *somearg;
-static bool self_disable = false;
-static bool dont_shutdown = false;
+/* Stash this in plugin's data */
+struct test_libplugin {
+	char *somearg;
+	bool self_disable;
+	bool dont_shutdown;
+	u32 dynamic_opt;
+};
+
+static struct test_libplugin *get_test_libplugin(struct plugin *plugin)
+{
+	return plugin_get_data(plugin, struct test_libplugin);
+}
 
 static struct command_result *get_ds_done(struct command *cmd,
 					  const char *val,
@@ -93,9 +102,10 @@ static struct command_result *json_shutdown(struct command *cmd,
 					    const char *buf,
 					    const jsmntok_t *params)
 {
+	struct test_libplugin *tlp = get_test_libplugin(cmd->plugin);
 	plugin_log(cmd->plugin, LOG_DBG, "shutdown called");
 
-	if (dont_shutdown)
+	if (tlp->dont_shutdown)
 		return notification_handled(cmd);
 
 	plugin_exit(cmd->plugin, 0);
@@ -142,19 +152,73 @@ static struct command_result *json_testrpc(struct command *cmd,
 	return send_outreq(cmd->plugin, req);
 }
 
+static struct command_result *listdatastore_ok(struct command *cmd,
+					       const char *buf,
+					       const jsmntok_t *params,
+					       void *cb_arg UNUSED)
+{
+	if (command_check_only(cmd))
+		return command_check_done(cmd);
+
+	return forward_result(cmd, buf, params, NULL);
+}
+
+/* A command which does async, even if it is a check */
+static struct command_result *json_checkthis(struct command *cmd,
+					     const char *buf,
+					     const jsmntok_t *params)
+{
+	struct out_req *req;
+	const jsmntok_t *key;
+
+	/* We are deliberately MORE restrictive than datastore, so we can
+	 * fail here if we want to */
+	if (!param_check(cmd, buf, params,
+			 p_opt("key", param_array, &key),
+			 NULL))
+		return command_param_failed();
+
+	req = jsonrpc_request_start(cmd->plugin, cmd,
+				    "listdatastore",
+				    listdatastore_ok,
+				    forward_error, NULL);
+	if (key)
+		json_add_tok(req->js, "key", key, buf);
+	return send_outreq(cmd->plugin, req);
+}
+
+static char *set_dynamic(struct plugin *plugin,
+			 const char *arg,
+			 bool check_only,
+			 u32 *dynamic_opt)
+{
+	int val = atol(arg);
+
+	/* Whee, let's allow odd */
+	if (val % 2 == 0)
+		return "I don't like \"even\" numbers (valid JSON? Try {})!";
+
+	if (check_only)
+		return NULL;
+
+	*dynamic_opt = val;
+	return NULL;
+}
+
 static const char *init(struct plugin *p,
 			const char *buf UNUSED,
 			const jsmntok_t *config UNUSED)
 {
 	const char *name, *err_str, *err_hex;
 	const u8 *binname;
+	struct test_libplugin *tlp = get_test_libplugin(p);
 
 	plugin_log(p, LOG_DBG, "test_libplugin initialised!");
-	if (somearg)
-		plugin_log(p, LOG_DBG, "somearg = %s", somearg);
-	somearg = tal_free(somearg);
+	if (tlp->somearg)
+		plugin_log(p, LOG_DBG, "somearg = %s", tlp->somearg);
+	tlp->somearg = tal_free(tlp->somearg);
 
-	if (self_disable)
+	if (tlp->self_disable)
 		return "Disabled via selfdisable option";
 
 	/* Test rpc_scan_datastore funcs */
@@ -179,29 +243,22 @@ static const char *init(struct plugin *p,
 
 static const struct plugin_command commands[] = { {
 		"helloworld",
-		"utils",
-		"Say hello to the world.",
-		"Returns 'hello world' by default, 'hello {name}' if the name"
-		" option was set, and 'hello {name}' if the name parameter "
-		"was passed (takes over the option)",
 		json_helloworld,
 	},
 	{
 		"testrpc",
-		"utils",
-		"Makes a simple getinfo call, to test rpc socket.",
-		"",
 		json_testrpc,
 	},
 	{
 		"testrpc-deprecated",
-		"utils",
-		"Makes a simple getinfo call, to test rpc socket.",
-		"",
 		json_testrpc,
 		"v0.9.1",
 		CLN_NEXT_VERSION,
-	}
+	},
+	{
+		"checkthis",
+		json_checkthis,
+	},
 };
 
 static const char *before[] = { "dummy", NULL };
@@ -230,26 +287,43 @@ static const struct plugin_notification notifs[] = { {
 int main(int argc, char *argv[])
 {
 	setup_locale();
-	plugin_main(argv, init, PLUGIN_RESTARTABLE, true, NULL,
+	/* We allocate now, so we can hand pointers for plugin options,
+	 * but by specifying take() to plugin_main, it reparents it to
+	 * the plugin */
+	struct test_libplugin *tlp = tal(NULL, struct test_libplugin);
+	tlp->somearg = NULL;
+	tlp->self_disable = false;
+	tlp->dont_shutdown = false;
+	tlp->dynamic_opt = 7;
+
+	plugin_main(argv, init, take(tlp), PLUGIN_RESTARTABLE, true, NULL,
 		    commands, ARRAY_SIZE(commands),
 	            notifs, ARRAY_SIZE(notifs), hooks, ARRAY_SIZE(hooks),
 		    NULL, 0,  /* Notification topics we publish */
 		    plugin_option("somearg",
 				  "string",
 				  "Argument to print at init.",
-				  charp_option, &somearg),
+				  charp_option, charp_jsonfmt, &tlp->somearg),
 		    plugin_option_deprecated("somearg-deprecated",
 					     "string",
 					     "Deprecated arg for init.",
 					     CLN_NEXT_VERSION, NULL,
-					     charp_option, &somearg),
+					     charp_option, charp_jsonfmt,
+					     &tlp->somearg),
 		    plugin_option("selfdisable",
 				  "flag",
 				  "Whether to disable.",
-				  flag_option, &self_disable),
+				  flag_option, flag_jsonfmt,
+				  &tlp->self_disable),
 		    plugin_option("dont_shutdown",
 				  "flag",
 				  "Whether to timeout when asked to shutdown.",
-				  flag_option, &dont_shutdown),
+				  flag_option, flag_jsonfmt,
+				  &tlp->dont_shutdown),
+		    plugin_option_dynamic("dynamicopt",
+					  "int",
+					  "Set me!",
+					  set_dynamic, u32_jsonfmt,
+					  &tlp->dynamic_opt),
 		    NULL);
 }

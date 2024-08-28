@@ -78,6 +78,15 @@ class Field:
 
         self.type_override: Optional[str] = None
 
+    def __lt__(self, other):
+        return self.path < other.path
+
+    def __eq__(self, other):
+        return self.path == other.path
+
+    def __iter__(self):
+        yield self.path
+
     @property
     def name(self):
         return FieldName(self.path.split(".")[-1])
@@ -126,9 +135,10 @@ class Field:
 class Service:
     """Top level class that wraps all the RPC methods.
     """
-    def __init__(self, name: str, methods=None):
-        self.name = name
-        self.methods = [] if methods is None else methods
+    def __init__(self, name: str, methods=None, notifications=None):
+        self.name: str = name
+        self.methods: List[Method] = [] if methods is None else methods
+        self.notifications: List[Notification] = [] if notifications is None else notifications
 
         # If we require linking with some external files we'll add
         # them here so the generator can use them.
@@ -157,12 +167,29 @@ class Service:
                 types.extend(gather_subfields(field))
             for field in method.response.fields:
                 types.extend(gather_subfields(field))
+
+        for notification in self.notifications:
+            types.extend([notification.request])
+            for field in notification.request.fields:
+                types.extend(gather_subfields(field))
+            for field in notification.response.fields:
+                types.extend(gather_subfields(field))
+
         return types
+
+
+class Notification:
+    def __init__(self, name: str, typename: str, request: Field, response: Field):
+        self.name = name
+        self.typename = typename
+        self.request = request
+        self.response = response
 
 
 class Method:
     def __init__(self, name: str, request: Field, response: Field):
         self.name = name
+        self.name_raw = name
         self.request = request
         self.response = response
 
@@ -199,20 +226,45 @@ class CompositeField(Field):
             'else': {'properties': js.get('else', {}).get('properties', [])},
         }
         # Yes, this is ugly, but walking nested dicts always is.
+
+        def merge_dicts(dict1, dict2):
+            merged_dict = {}
+            for key in set(dict1.keys()) | set(dict2.keys()):
+                if key in dict1 and key in dict2:
+                    if isinstance(dict1[key], dict) and isinstance(dict2[key], dict):
+                        merged_dict[key] = merge_dicts(dict1[key], dict2[key])
+                    else:
+                        if isinstance(dict1[key], list) and isinstance(dict2[key], list):
+                            merged_dict[key] = sorted(list(set(dict1[key]).union(set(dict2[key]))))
+                        elif key in dict1:
+                            merged_dict[key] = dict1[key]
+                        else:
+                            merged_dict[key] = dict2[key]
+                elif key in dict1:
+                    merged_dict[key] = dict1[key]
+                else:
+                    merged_dict[key] = dict2[key]
+            return merged_dict
+
         for a in [top] + js.get('allOf', []):
             var = a.get('then', {})
-            props = var.get('properties', None)
+            props = var.get('properties', {})
             if isinstance(props, dict):
                 for k, v in props.items():
-                    if k not in properties:
-                        properties[k] = v
+                    if properties != {}:
+                        if k in properties:
+                            properties[k] = merge_dicts(properties[k], v)
+                        else:
+                            properties[k] = v
             var = a.get('else', {})
-            props = var.get('properties', None)
+            props = var.get('properties', {})
             if isinstance(props, dict):
                 for k, v in props.items():
-                    if k not in properties:
-                        properties[k] = v
-
+                    if properties != {}:
+                        if k in properties:
+                            properties[k] = merge_dicts(properties[k], v)
+                        else:
+                            properties[k] = v
         # Identify required fields
         required = js.get("required", [])
         fields = []
@@ -253,7 +305,7 @@ class CompositeField(Field):
                 )
 
             if field is not None:
-                field.deprecated = ftype.get("deprecated", False)
+                field.deprecated = ftype.get("deprecated", None)
                 field.required = fname in required
                 fields.append(field)
                 logger.debug(field)
@@ -261,6 +313,9 @@ class CompositeField(Field):
         return CompositeField(
             typename, fields, path, js["description"] if "description" in js else "", added=js.get('added', None), deprecated=js.get('deprecated', None)
         )
+
+    def sort(self):
+        self.fields = sorted(self.fields)
 
     def __str__(self):
         fieldnames = ",".join([f.path.split(".")[-1] for f in self.fields])
@@ -275,6 +330,12 @@ class EnumVariant(Field):
 
     def __str__(self):
         return self.variant
+
+    def __lt__(self, other):
+        return self.variant < other.variant
+
+    def __eq__(self, other):
+        return self.variant == other.variant
 
     def normalized(self):
         return self.variant.replace(' ', '_').replace('-', '_').replace("/", "_").upper()
@@ -354,6 +415,8 @@ class PrimitiveField(Field):
         "msat",
         "msat_or_any",
         "msat_or_all",
+        "sat",
+        "sat_or_all",
         "currency",
         "hex",
         "short_channel_id",
@@ -435,8 +498,9 @@ OfferStringField = PrimitiveField("string", None, None, added=None, deprecated=N
 InvoiceLabelField = PrimitiveField("string", None, None, added=None, deprecated=None)
 DatastoreKeyField = ArrayField(itemtype=PrimitiveField("string", None, None, added=None, deprecated=None), dims=1, path=None, description=None, added=None, deprecated=None)
 DatastoreUsageKeyField = ArrayField(itemtype=PrimitiveField("string", None, None, added="v23.11", deprecated=None), dims=1, path=None, description=None, added="v23.11", deprecated=None)
-InvoiceExposeprivatechannelsField = PrimitiveField("boolean", None, None, added=None, deprecated=None)
+InvoiceExposeprivatechannelsField = ArrayField(itemtype=PrimitiveField("short_channel_id", None, None, added=None, deprecated=None), dims=1, path=None, description=None, added=None, deprecated=None)
 PayExclude = ArrayField(itemtype=PrimitiveField("string", None, None, added=None, deprecated=None), dims=1, path=None, description=None, added=None, deprecated=None)
+RenePayExclude = ArrayField(itemtype=PrimitiveField("string", None, None, added=None, deprecated=None), dims=1, path=None, description=None, added="v24.08", deprecated=None)
 RoutehintListField = PrimitiveField(
     "RoutehintList",
     None,
@@ -444,6 +508,16 @@ RoutehintListField = PrimitiveField(
     added=None,
     deprecated=None
 )
+SetConfigValField = PrimitiveField("string", None, None, added=None, deprecated=None)
+DecodeRoutehintListField = PrimitiveField(
+    "DecodeRoutehintList",
+    None,
+    None,
+    added=None,
+    deprecated=None
+)
+CreateRuneRestrictionsField = ArrayField(itemtype=PrimitiveField("string", None, None, added=None, deprecated=None), dims=1, path=None, description=None, added=None, deprecated=None)
+CheckRuneParamsField = ArrayField(itemtype=PrimitiveField("string", None, None, added=None, deprecated=None), dims=1, path=None, description=None, added=None, deprecated=None)
 
 # TlvStreams are special, they don't have preset dict-keys, rather
 # they can specify `u64` keys pointing to hex payloads. So the schema
@@ -466,13 +540,19 @@ overrides = {
     'ListDatastore.key': DatastoreKeyField,
     'Invoice.exposeprivatechannels': InvoiceExposeprivatechannelsField,
     'Pay.exclude': PayExclude,
+    'RenePay.exclude': RenePayExclude,
     'KeySend.routehints': RoutehintListField,
     'KeySend.extratlvs': TlvStreamField,
+    'Decode.routes': DecodeRoutehintListField,
+    'DecodePay.routes': DecodeRoutehintListField,
     'CreateInvoice.label': InvoiceLabelField,
     'DatastoreUsage.key': DatastoreUsageKeyField,
     'WaitInvoice.label': InvoiceLabelField,
     'Offer.recurrence_base': OfferStringField,
-    'Offer.amount': OfferStringField
+    'Offer.amount': OfferStringField,
+    'SetConfig.val': SetConfigValField,
+    'CreateRune.restrictions': CreateRuneRestrictionsField,
+    'CheckRune.params': CheckRuneParamsField,
 }
 
 

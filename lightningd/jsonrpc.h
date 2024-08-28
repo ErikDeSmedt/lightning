@@ -55,15 +55,17 @@ struct command_result;
 
 struct json_command {
 	const char *name;
-	const char *category;
 	struct command_result *(*dispatch)(struct command *,
 					   const char *buffer,
 					   const jsmntok_t *obj,
 					   const jsmntok_t *params);
-	const char *description;
-	const char *verbose;
 	bool dev_only;
 	const char *depr_start, *depr_end;
+	/* Special hook if we want raw access for check command */
+	struct command_result *(*check)(struct command *,
+					const char *buffer,
+					const jsmntok_t *obj,
+					const jsmntok_t *params);
 };
 
 struct jsonrpc_notification {
@@ -145,15 +147,10 @@ struct command_result *command_raw_complete(struct command *cmd,
 					    struct json_stream *result);
 
 /* Logging point to use for this command (usually, the JSON connection). */
-struct logger *command_log(struct command *cmd);
+struct logger *command_logger(struct command *cmd);
 
 /* To return if param() fails. */
 extern struct command_result *command_param_failed(void)
-	 WARN_UNUSED_RESULT;
-
-/* To return after param_check() succeeds but we're still
- * command_check_only(cmd). */
-struct command_result *command_check_done(struct command *cmd)
 	 WARN_UNUSED_RESULT;
 
 /* Wrapper for pending commands (ignores return) */

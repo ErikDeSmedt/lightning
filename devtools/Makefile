@@ -1,4 +1,4 @@
-DEVTOOLS := devtools/bolt11-cli devtools/decodemsg devtools/onion devtools/dump-gossipstore devtools/gossipwith devtools/create-gossipstore devtools/mkcommit devtools/mkfunding devtools/mkclose devtools/mkgossip devtools/mkencoded devtools/mkquery devtools/lightning-checkmessage devtools/topology devtools/route devtools/bolt12-cli devtools/encodeaddr devtools/features devtools/fp16 devtools/rune
+DEVTOOLS := devtools/bolt11-cli devtools/decodemsg devtools/onion devtools/dump-gossipstore devtools/gossipwith devtools/create-gossipstore devtools/mkcommit devtools/mkfunding devtools/mkclose devtools/mkgossip devtools/mkencoded devtools/mkquery devtools/lightning-checkmessage devtools/topology devtools/route devtools/bolt12-cli devtools/encodeaddr devtools/features devtools/fp16 devtools/rune devtools/gossmap-compress
 ifeq ($(HAVE_SQLITE3),1)
 DEVTOOLS += devtools/checkchannels
 endif
@@ -10,6 +10,11 @@ DEVTOOLS_TOOL_OBJS := $(DEVTOOLS_TOOL_SRC:.c=.o)
 ALL_C_SOURCES += $(DEVTOOLS_TOOL_SRC)
 ALL_C_HEADERS +=
 ALL_PROGRAMS += $(DEVTOOLS)
+
+# gossmap-compress wants -lz if we say we have it.
+ifeq ($(HAVE_ZLIB),1)
+devtools/gossmap-compress_LDLIBS=-lz
+endif # ZLIB
 
 DEVTOOLS_COMMON_OBJS :=				\
 	common/amount.o				\
@@ -37,6 +42,7 @@ DEVTOOLS_COMMON_OBJS :=				\
 	common/per_peer_state.o			\
 	common/psbt_open.o			\
 	common/pseudorand.o			\
+	common/sciddir_or_pubkey.o		\
 	common/setup.o				\
 	common/utils.o				\
 	common/version.o			\
@@ -55,6 +61,8 @@ devtools/fp16: common/fp16.o common/utils.o common/setup.o common/autodata.o dev
 devtools/bolt11-cli: $(DEVTOOLS_COMMON_OBJS) $(JSMN_OBJS) $(BITCOIN_OBJS) wire/fromwire.o wire/towire.o devtools/bolt11-cli.o
 
 devtools/encodeaddr: common/utils.o common/bech32.o devtools/encodeaddr.o
+
+devtools/gossmap-compress: $(DEVTOOLS_COMMON_OBJS) $(BITCOIN_OBJS) wire/fromwire.o wire/towire.o wire/tlvstream.o common/gossmap.o common/fp16.o devtools/gossmap-compress.o gossipd/gossip_store_wiregen.o
 
 devtools/bolt12-cli: $(DEVTOOLS_COMMON_OBJS) $(BITCOIN_OBJS) wire/bolt12_wiregen.o wire/fromwire.o wire/towire.o common/bolt12.o common/bolt12_merkle.o devtools/bolt12-cli.o common/setup.o common/iso4217.o
 

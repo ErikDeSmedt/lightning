@@ -327,13 +327,7 @@ modern:
 
 static const struct json_command listconfigs_command = {
 	"listconfigs",
-	"utility",
 	json_listconfigs,
-	"List all configuration options, or with [config], just that one.",
-	.verbose = "listconfigs [config]\n"
-	"Outputs an object, with each field a config options\n"
-	"(Option names which start with # are comments)\n"
-	"With [config], object only has that field"
 };
 AUTODATA(json_command, &listconfigs_command);
 
@@ -558,6 +552,9 @@ static struct command_result *setconfig_success(struct command *cmd,
 	struct json_stream *response;
 	const char **names, *confline;
 
+	if (command_check_only(cmd))
+		return command_check_done(cmd);
+
 	names = opt_names_arr(tmpctx, ot);
 
 	if (val)
@@ -583,15 +580,24 @@ static struct command_result *json_setconfig(struct command *cmd,
 	const struct opt_table *ot;
 	const char *val;
 	char *err;
+	void *arg;
 
-	if (!param(cmd, buffer, params,
-		   p_req("config", param_opt_dynamic_config, &ot),
-		   p_opt("val", param_string, &val),
-		   NULL))
+	if (!param_check(cmd, buffer, params,
+			 p_req("config", param_opt_dynamic_config, &ot),
+			 p_opt("val", param_string, &val),
+			 NULL))
 		return command_param_failed();
+
+	log_debug(cmd->ld->log, "setconfig!");
 
 	/* We don't handle DYNAMIC MULTI, at least yet! */
 	assert(!(ot->type & OPT_MULTI));
+
+	/* We use arg = NULL to tell callback it's only for testing */
+	if (command_check_only(cmd))
+		arg = NULL;
+	else
+		arg = ot->u.arg;
 
 	if (ot->type & OPT_NOARG) {
 		if (val)
@@ -601,7 +607,7 @@ static struct command_result *json_setconfig(struct command *cmd,
 		if (is_plugin_opt(ot))
 			return plugin_set_dynamic_opt(cmd, ot, NULL,
 						      setconfig_success);
-		err = ot->cb(ot->u.arg);
+		err = ot->cb(arg);
 	} else {
 		assert(ot->type & OPT_HASARG);
 		if (!val)
@@ -611,7 +617,7 @@ static struct command_result *json_setconfig(struct command *cmd,
 		if (is_plugin_opt(ot))
 			return plugin_set_dynamic_opt(cmd, ot, val,
 						      setconfig_success);
-		err = ot->cb_arg(val, ot->u.arg);
+		err = ot->cb_arg(val, arg);
 	}
 
 	if (err) {
@@ -619,13 +625,14 @@ static struct command_result *json_setconfig(struct command *cmd,
 				    "Error setting %s: %s", ot->names + 2, err);
 	}
 
+	if (command_check_only(cmd))
+		return command_check_done(cmd);
+
 	return setconfig_success(cmd, ot, val);
 }
 
 static const struct json_command setconfig_command = {
 	"setconfig",
-	"utility",
 	json_setconfig,
-	"Set a dynamically-adjustable config."
 };
 AUTODATA(json_command, &setconfig_command);

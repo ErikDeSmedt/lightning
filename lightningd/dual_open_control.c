@@ -104,7 +104,8 @@ static void channel_err_broken(struct channel *channel,
 		channel_disconnect(channel, LOG_BROKEN, false, errmsg);
 }
 
-void json_add_unsaved_channel(struct json_stream *response,
+void json_add_unsaved_channel(struct command *cmd,
+			      struct json_stream *response,
 			      const struct channel *channel,
 			      const struct peer *peer)
 {
@@ -130,7 +131,7 @@ void json_add_unsaved_channel(struct json_stream *response,
 	json_add_string(response, "owner", channel->owner->name);
 	json_add_string(response, "opener", channel->opener == LOCAL ?
 					    "local" : "remote");
-	json_add_bool(response, "lost_state", channel->future_per_commitment_point ? true : false);
+	json_add_bool(response, "lost_state", channel->has_future_per_commitment_point);
 	json_array_start(response, "status");
 	for (size_t i = 0; i < ARRAY_SIZE(channel->billboard.permanent); i++) {
 		if (!channel->billboard.permanent[i])
@@ -157,13 +158,16 @@ void json_add_unsaved_channel(struct json_stream *response,
 
 	if (feature_negotiated(channel->peer->ld->our_features,
 			       channel->peer->their_features,
-			       OPT_ANCHOR_OUTPUTS))
+			       OPT_ANCHOR_OUTPUTS_DEPRECATED))
 		json_add_string(response, NULL, "option_anchor_outputs");
 
 	if (feature_negotiated(channel->peer->ld->our_features,
 			       channel->peer->their_features,
-			       OPT_ANCHORS_ZERO_FEE_HTLC_TX))
-		json_add_string(response, NULL, "option_anchors_zero_fee_htlc_tx");
+			       OPT_ANCHORS_ZERO_FEE_HTLC_TX)) {
+		if (command_deprecated_out_ok(cmd, "features", "v24.08", "v25.08"))
+			json_add_string(response, NULL, "option_anchors_zero_fee_htlc_tx");
+		json_add_string(response, NULL, "option_anchors");
+	}
 
 	json_array_end(response);
 	json_object_end(response);
@@ -1045,6 +1049,11 @@ static enum watch_result opening_depth_cb(struct lightningd *ld,
 		wallet_channel_save(ld->wallet, inflight->channel);
 	}
 
+	/* Tell connectd it can forward onion messages via this scid (ok if redundant!) */
+	if (inflight->channel->channel_flags & CHANNEL_FLAGS_ANNOUNCE_CHANNEL)
+		tell_connectd_scid(ld, *inflight->channel->scid,
+				   &inflight->channel->peer->id);
+
 	if (depth >= inflight->channel->minimum_depth)
 		update_channel_from_inflight(ld, inflight->channel, inflight);
 
@@ -1180,7 +1189,7 @@ static struct amount_sat calculate_reserve(struct channel_config *their_config,
 {
 	struct amount_sat reserve, dust_limit;
 
-	/* BOLT-f53ca2301232db780843e894f55d95d512f297f9 #2
+	/* BOLT #2
 	 *
 	 * The channel reserve is fixed at 1% of the total channel balance
 	 * rounded down (sum of `funding_satoshis` from `open_channel2`
@@ -1527,7 +1536,7 @@ static void handle_peer_wants_to_close(struct subd *dualopend,
 					    OPT_SHUTDOWN_ANYSEGWIT);
 	bool anchors = feature_negotiated(ld->our_features,
 					  channel->peer->their_features,
-					  OPT_ANCHOR_OUTPUTS)
+					  OPT_ANCHOR_OUTPUTS_DEPRECATED)
 		|| feature_negotiated(ld->our_features,
 				      channel->peer->their_features,
 				      OPT_ANCHORS_ZERO_FEE_HTLC_TX);
@@ -1720,7 +1729,7 @@ static void sendfunding_done(struct bitcoind *bitcoind UNUSED,
 		 * that the broadcast would fail. Verify that's not
 		 * the case here. */
 		cs->err_msg = tal_strdup(cs, msg);
-		bitcoind_getutxout(ld->topology->bitcoind,
+		bitcoind_getutxout(cs, ld->topology->bitcoind,
 				   &channel->funding,
 				   check_utxo_block,
 				   cs);
@@ -1833,7 +1842,7 @@ static void handle_peer_tx_sigs_sent(struct subd *dualopend,
 					      &channel->funding.txid,
 					      channel->remote_channel_ready);
 
-		/* BOLT-f53ca2301232db780843e894f55d95d512f297f9 #2
+		/* BOLT #2
 		 * The receiving node:  ...
 		 * - MUST fail the channel if:
 		 *   - the `witness_stack` weight lowers the
@@ -2175,7 +2184,7 @@ static void handle_peer_tx_sigs_msg(struct subd *dualopend,
 					      &channel->funding.txid,
 					      channel->remote_channel_ready);
 
-		/* BOLT-f53ca2301232db780843e894f55d95d512f297f9 #2
+		/* BOLT #2
 		 * The receiving node:  ...
 		 * - MUST fail the channel if:
 		 *   - the `witness_stack` weight lowers the
@@ -2290,11 +2299,11 @@ static void handle_validate_rbf(struct subd *dualopend,
 	inputs_present = tal_arr(tmpctx, bool, candidate_psbt->num_inputs);
 	memset(inputs_present, true, tal_bytelen(inputs_present));
 
-	/* BOLT-f53ca2301232db780843e894f55d95d512f297f9 #2:
+	/* BOLT #2:
 	 * The receiving node: ...
 	 *    - MUST fail the negotiation if: ...
-	 *    - the transaction does not share a common input with
-	 *    all previous funding transactions
+	 *    - the transaction does not share at least one input with
+	 *    each previous funding transaction
 	 */
 	list_for_each(&channel->inflights, inflight, list) {
 		/* Remove every non-matching input from set */
@@ -2338,9 +2347,9 @@ static void handle_validate_rbf(struct subd *dualopend,
 	assert(inflight);
 	last_fee = psbt_compute_fee(inflight->funding_psbt);
 
-	/* BOLT-f53ca2301232db780843e894f55d95d512f297f9 #2:
+	/* BOLT #2:
 	 * The receiving node: ...
-	 * - if is an RBF attempt:
+	 * - if this is an RBF attempt:
 	 *   - MUST fail the negotiation if:
 	 *   - the transaction's total fees is less than the last
 	 *   successfully negotiated transaction's fees
@@ -2444,73 +2453,136 @@ static char *restart_dualopend(const tal_t *ctx, const struct lightningd *ld,
 	return NULL;
 }
 
+struct openchannel_bump_info {
+	struct command *cmd;
+	struct channel_id *cid;
+	struct amount_sat *amount;
+	struct wally_psbt *psbt;
+	u32 *feerate_per_kw_funding;
+};
+
+static struct command_result *openchannel_bump(struct openchannel_bump_info *info)
+{
+	struct open_attempt *oa;
+	struct channel_inflight *inflight;
+	struct channel *channel;
+	struct command *cmd = info->cmd;
+
+	/* We re-check channel in case it changed! */
+	channel = channel_by_cid(cmd->ld, info->cid);
+	if (!channel)
+		return command_fail(cmd, FUNDING_UNKNOWN_CHANNEL,
+				    "Unknown channel %s",
+				    fmt_channel_id(tmpctx, info->cid));
+
+	inflight = channel_current_inflight(channel);
+	if (!inflight) {
+		return command_fail(cmd, FUNDING_STATE_INVALID,
+				    "No inflight for this channel exists.");
+	}
+
+	if (!inflight->remote_tx_sigs) {
+		return command_fail(cmd, FUNDING_STATE_INVALID,
+				    "Funding sigs for this channel not "
+				    "secured, see `openchannel_signed`");
+	}
+
+	/* It's possible that the last open failed/was aborted.
+	 * So now we restart the attempt! */
+	if (!channel->owner) {
+		char *err = restart_dualopend(cmd, cmd->ld, channel, false);
+		if (err)
+			return command_fail(cmd, FUNDING_PEER_NOT_CONNECTED,
+					    "%s", err);
+	}
+
+	channel->open_attempt = oa = new_channel_open_attempt(channel);
+	oa->funding = *info->amount;
+	oa->cmd = info->cmd;
+	oa->our_upfront_shutdown_script
+		= channel->shutdown_scriptpubkey[LOCAL];
+
+	subd_send_msg(channel->owner,
+		      take(towire_dualopend_rbf_init(NULL, *info->amount,
+						     *info->feerate_per_kw_funding,
+						     info->psbt)));
+	return command_still_pending(cmd);
+}
+
+/* sync_waiter must return void, so we use a simple wrapper */
+static void openchannel_bump_after_sync(struct chain_topology *topo,
+					struct openchannel_bump_info *info)
+{
+	openchannel_bump(info);
+}
+
 static struct command_result *
 json_openchannel_bump(struct command *cmd,
 		      const char *buffer,
 		      const jsmntok_t *obj UNNEEDED,
 		      const jsmntok_t *params)
 {
-	struct channel_id *cid;
+	struct openchannel_bump_info *info = tal(cmd, struct openchannel_bump_info);
 	struct channel *channel;
-	struct amount_sat *amount, psbt_val;
-	struct wally_psbt *psbt;
-	u32 last_feerate_perkw, next_feerate_min, *feerate_per_kw_funding;
-	struct open_attempt *oa;
+	struct amount_sat psbt_val;
+	u32 last_feerate_perkw, next_feerate_min;
 	struct channel_inflight *inflight;
 
+	info->cmd = cmd;
 	if (!param_check(cmd, buffer, params,
-			 p_req("channel_id", param_channel_id, &cid),
-			 p_req("amount", param_sat, &amount),
-			 p_req("initialpsbt", param_psbt, &psbt),
+			 p_req("channel_id", param_channel_id, &info->cid),
+			 p_req("amount", param_sat, &info->amount),
+			 p_req("initialpsbt", param_psbt, &info->psbt),
 			 p_opt("funding_feerate", param_feerate,
-			       &feerate_per_kw_funding),
+			       &info->feerate_per_kw_funding),
 			 NULL))
 		return command_param_failed();
 
 	psbt_val = AMOUNT_SAT(0);
-	for (size_t i = 0; i < psbt->num_inputs; i++) {
-		struct amount_sat in_amt = psbt_input_get_amount(psbt, i);
+	for (size_t i = 0; i < info->psbt->num_inputs; i++) {
+		struct amount_sat in_amt = psbt_input_get_amount(info->psbt, i);
 		if (!amount_sat_add(&psbt_val, psbt_val, in_amt))
 			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 					    "Overflow in adding PSBT input"
 					    " values. %s",
-					    fmt_wally_psbt(tmpctx, psbt));
+					    fmt_wally_psbt(tmpctx, info->psbt));
 	}
 
 	/* If they don't pass in at least enough in the PSBT to cover
 	 * their amount, nope */
-	if (!amount_sat_greater(psbt_val, *amount))
+	if (!amount_sat_greater(psbt_val, *info->amount))
 		return command_fail(cmd, FUND_CANNOT_AFFORD,
 				    "Provided PSBT cannot afford funding of "
 				    "amount %s. %s",
-				    fmt_amount_sat(tmpctx, *amount),
-				    fmt_wally_psbt(tmpctx, psbt));
-
-	if (!topology_synced(cmd->ld->topology)) {
-		return command_fail(cmd, FUNDING_STILL_SYNCING_BITCOIN,
-				    "Still syncing with bitcoin network");
-	}
+				    fmt_amount_sat(tmpctx, *info->amount),
+				    fmt_wally_psbt(tmpctx, info->psbt));
 
 	/* Are we in a state where we can attempt an RBF? */
-	channel = channel_by_cid(cmd->ld, cid);
+	channel = channel_by_cid(cmd->ld, info->cid);
 	if (!channel)
 		return command_fail(cmd, FUNDING_UNKNOWN_CHANNEL,
 				    "Unknown channel %s",
-				    fmt_channel_id(tmpctx, cid));
+				    fmt_channel_id(tmpctx, info->cid));
 
+	/* BOLT #2:
+	 * The sender:
+	 *   - MUST set `feerate` greater than or equal to 25/24 times the
+	 *     `feerate` of the previously constructed transaction, rounded
+	 *     down.
+	 */
 	last_feerate_perkw = channel_last_funding_feerate(channel);
-	next_feerate_min = last_feerate_perkw * 65 / 64;
+	next_feerate_min = last_feerate_perkw * 25 / 24;
 	assert(next_feerate_min > last_feerate_perkw);
-	if (!feerate_per_kw_funding) {
-		feerate_per_kw_funding = tal(cmd, u32);
-		*feerate_per_kw_funding = next_feerate_min;
-	} else if (*feerate_per_kw_funding < next_feerate_min)
+	if (!info->feerate_per_kw_funding) {
+		info->feerate_per_kw_funding = tal(info, u32);
+		*info->feerate_per_kw_funding = next_feerate_min;
+	} else if (*info->feerate_per_kw_funding < next_feerate_min)
 		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-				    "Next feerate must be at least 1/64th"
+				    "Next feerate must be at least 1/24th"
 				    " greater than the last. Min req %u,"
 				    " you proposed %u",
 				    next_feerate_min,
-				    *feerate_per_kw_funding);
+				    *info->feerate_per_kw_funding);
 
 	/* BOLT #2:
 	 *  - if both nodes advertised `option_support_large_channel`:
@@ -2521,20 +2593,11 @@ json_openchannel_bump(struct command *cmd,
 	if (!feature_negotiated(cmd->ld->our_features,
 				channel->peer->their_features,
 				OPT_LARGE_CHANNELS)
-	    && amount_sat_greater(*amount, chainparams->max_funding))
+	    && amount_sat_greater(*info->amount, chainparams->max_funding))
 		return command_fail(cmd, FUND_MAX_EXCEEDED,
 				    "Amount exceeded %s",
 				    fmt_amount_sat(tmpctx,
 						   chainparams->max_funding));
-
-	/* It's possible that the last open failed/was aborted.
-	 * So now we restart the attempt! */
-	if (!channel->owner) {
-		char *err = restart_dualopend(cmd, cmd->ld, channel, false);
-		if (err)
-			return command_fail(cmd, FUNDING_PEER_NOT_CONNECTED,
-					    "%s", err);
-	}
 
 	if (channel->open_attempt)
 		return command_fail(cmd, FUNDING_STATE_INVALID,
@@ -2564,19 +2627,8 @@ json_openchannel_bump(struct command *cmd,
 				    "secured, see `openchannel_signed`");
 	}
 
-	if (command_check_only(cmd))
-		return command_check_done(cmd);
-
-
-	/* Ok, we're kosher to start */
-	channel->open_attempt = oa = new_channel_open_attempt(channel);
-	oa->funding = *amount;
-	oa->cmd = cmd;
-	oa->our_upfront_shutdown_script
-		= channel->shutdown_scriptpubkey[LOCAL];
-
 	/* Add serials to any input that's missing them */
-	psbt_add_serials(psbt, TX_INITIATOR);
+	psbt_add_serials(info->psbt, TX_INITIATOR);
 
 	/* We require the PSBT to meet certain criteria such as
 	 * extra, proprietary fields (`serial_id`s) or
@@ -2585,16 +2637,28 @@ json_openchannel_bump(struct command *cmd,
 	 * Since this is externally provided, we confirm that
 	 * they've done the right thing / haven't lost any required info.
 	 */
-	if (!psbt_has_required_fields(psbt))
+	if (!psbt_has_required_fields(info->psbt))
 		return command_fail(cmd, FUNDING_PSBT_INVALID,
 				    "PSBT is missing required fields %s",
-				    fmt_wally_psbt(tmpctx, psbt));
+				    fmt_wally_psbt(tmpctx, info->psbt));
 
-	subd_send_msg(channel->owner,
-		      take(towire_dualopend_rbf_init(NULL, *amount,
-						     *feerate_per_kw_funding,
-						     psbt)));
-	return command_still_pending(cmd);
+	if (command_check_only(cmd))
+		return command_check_done(cmd);
+
+	/* Ok, we're kosher to start.  Delay if not synced yet. */
+	if (!topology_synced(cmd->ld->topology)) {
+		json_notify_fmt(cmd, LOG_UNUSUAL,
+				"Waiting to sync with bitcoind network (block %u of %u)",
+				get_block_height(cmd->ld->topology),
+				get_network_blockheight(cmd->ld->topology));
+
+		topology_add_sync_waiter(cmd, cmd->ld->topology,
+					 openchannel_bump_after_sync,
+					 info);
+		return command_still_pending(cmd);
+	}
+
+	return openchannel_bump(info);
 }
 
 static struct command_result *
@@ -2773,7 +2837,7 @@ static void validate_input_unspent(struct bitcoind *bitcoind,
 		pv->next_index = i + 1;
 
 		/* Confirm input is in a block */
-		bitcoind_getutxout(pv->channel->owner->ld->topology->bitcoind,
+		bitcoind_getutxout(pv, pv->channel->owner->ld->topology->bitcoind,
 				   &outpoint,
 				   validate_input_unspent,
 				   pv);
@@ -2957,131 +3021,23 @@ static struct command_result *init_set_feerate(struct command *cmd,
 	return NULL;
 }
 
-static struct command_result *json_openchannel_init(struct command *cmd,
-						    const char *buffer,
-						    const jsmntok_t *obj UNNEEDED,
-						    const jsmntok_t *params)
+static struct command_result *openchannel_init(struct command *cmd,
+					       struct peer *peer,
+					       struct amount_sat amount,
+					       struct amount_sat request_amt,
+					       const struct wally_psbt *psbt,
+					       u32 feerate_per_kw_funding,
+					       u32 feerate_per_kw,
+					       const u8 *our_upfront_shutdown_script,
+					       bool announce_channel,
+					       const struct lease_rates *rates,
+					       const struct channel_type *ctype)
 {
-	struct node_id *id;
-	struct peer *peer;
-	struct channel *channel;
-	bool *announce_channel;
-	u32 *feerate_per_kw_funding;
-	u32 *feerate_per_kw;
-	struct amount_sat *amount, psbt_val, *request_amt;
-	struct wally_psbt *psbt;
-	const u8 *our_upfront_shutdown_script;
 	u32 *our_upfront_shutdown_script_wallet_index;
+	u32 found_wallet_index;
+	struct channel *channel;
 	struct open_attempt *oa;
-	struct lease_rates *rates;
-	struct command_result *res;
-	struct channel_type *ctype;
 	int fds[2];
-
-	if (!param_check(cmd, buffer, params,
-			 p_req("id", param_node_id, &id),
-			 p_req("amount", param_sat, &amount),
-			 p_req("initialpsbt", param_psbt, &psbt),
-			 p_opt("commitment_feerate", param_feerate, &feerate_per_kw),
-			 p_opt("funding_feerate", param_feerate, &feerate_per_kw_funding),
-			 p_opt_def("announce", param_bool, &announce_channel, true),
-			 p_opt("close_to", param_bitcoin_address, &our_upfront_shutdown_script),
-			 p_opt_def("request_amt", param_sat, &request_amt, AMOUNT_SAT(0)),
-			 p_opt("compact_lease", param_lease_hex, &rates),
-			 p_opt("channel_type", param_channel_type, &ctype),
-			 NULL))
-		return command_param_failed();
-
-	/* We only deal in v2 */
-	if (!psbt_set_version(psbt, 2)) {
-		return command_fail(cmd, LIGHTNINGD, "Could not set PSBT version.");
-	}
-
-	/* Gotta expect some rates ! */
-	if (!amount_sat_zero(*request_amt) && !rates)
-		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-				    "Must pass in 'compact_lease' if requesting"
-				    " funds from peer");
-	psbt_val = AMOUNT_SAT(0);
-	for (size_t i = 0; i < psbt->num_inputs; i++) {
-		struct amount_sat in_amt = psbt_input_get_amount(psbt, i);
-		if (!amount_sat_add(&psbt_val, psbt_val, in_amt))
-			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-					    "Overflow in adding PSBT input"
-					    " values. %s",
-					    fmt_wally_psbt(tmpctx, psbt));
-	}
-
-	/* If they don't pass in at least enough in the PSBT to cover
-	 * their amount, nope */
-	if (!amount_sat_greater(psbt_val, *amount))
-		return command_fail(cmd, FUND_CANNOT_AFFORD,
-				    "Provided PSBT cannot afford funding of "
-				    "amount %s. %s",
-				    fmt_amount_sat(tmpctx, *amount),
-				    fmt_wally_psbt(tmpctx, psbt));
-
-	res = init_set_feerate(cmd, &feerate_per_kw, &feerate_per_kw_funding);
-	if (res)
-		return res;
-
-	if (!topology_synced(cmd->ld->topology)) {
-		return command_fail(cmd, FUNDING_STILL_SYNCING_BITCOIN,
-				    "Still syncing with bitcoin network");
-	}
-
-	peer = peer_by_id(cmd->ld, id);
-	if (!peer) {
-		return command_fail(cmd, FUNDING_UNKNOWN_PEER, "Unknown peer");
-	}
-
-	if (!feature_negotiated(cmd->ld->our_features,
-			        peer->their_features,
-				OPT_DUAL_FUND)) {
-		return command_fail(cmd, FUNDING_V2_NOT_SUPPORTED,
-				    "v2 openchannel not supported "
-				    "by peer");
-	}
-
-	if (ctype &&
-	    !cmd->ld->dev_any_channel_type &&
-	    !channel_type_accept(tmpctx,
-				 ctype->features,
-				 cmd->ld->our_features)) {
-		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-				    "channel_type not supported");
-	}
-
-	/* BOLT #2:
-	 *  - if both nodes advertised `option_support_large_channel`:
-	 *    - MAY set `funding_satoshis` greater than or equal to 2^24 satoshi.
-	 *  - otherwise:
-	 *    - MUST set `funding_satoshis` to less than 2^24 satoshi.
-	 */
-	if (!feature_negotiated(cmd->ld->our_features,
-				peer->their_features, OPT_LARGE_CHANNELS)
-	    && amount_sat_greater(*amount, chainparams->max_funding))
-		return command_fail(cmd, FUND_MAX_EXCEEDED,
-				    "Amount exceeded %s",
-				    fmt_amount_sat(tmpctx, chainparams->max_funding));
-
-	/* Add serials to any input that's missing them */
-	psbt_add_serials(psbt, TX_INITIATOR);
-
-	/* We require the PSBT to meet certain criteria such as
-	 * extra, proprietary fields (`serial_id`s) or
-	 * to have a `redeemscripts` iff the inputs are P2SH.
-	 *
-	 * Since this is externally provided, we confirm that
-	 * they've done the right thing / haven't lost any required info.
-	 */
-	if (!psbt_has_required_fields(psbt))
-		return command_fail(cmd, FUNDING_PSBT_INVALID,
-				    "PSBT is missing required fields %s",
-				    fmt_wally_psbt(tmpctx, psbt));
-
-	if (command_check_only(cmd))
-		return command_check_done(cmd);
 
 	if (socketpair(AF_LOCAL, SOCK_STREAM, 0, fds) != 0) {
 		return command_fail(cmd, FUND_MAX_EXCEEDED,
@@ -3101,14 +3057,14 @@ static struct command_result *json_openchannel_init(struct command *cmd,
 	channel->opener = LOCAL;
 	channel->open_attempt = oa = new_channel_open_attempt(channel);
 	channel->channel_flags = OUR_CHANNEL_FLAGS;
-	oa->funding = *amount;
+	oa->funding = amount;
 	oa->cmd = cmd;
 
-	if (!*announce_channel) {
+	if (!announce_channel) {
 		channel->channel_flags &= ~CHANNEL_FLAGS_ANNOUNCE_CHANNEL;
 		log_info(peer->ld->log,
 			 "Will open private channel with node %s",
-			 fmt_node_id(tmpctx, id));
+			 fmt_node_id(tmpctx, &peer->id));
 	}
 
 	/* Needs to be stolen away from cmd */
@@ -3118,25 +3074,23 @@ static struct command_result *json_openchannel_init(struct command *cmd,
 
 	/* Determine the wallet index for our_upfront_shutdown_script,
 	 * NULL if not found. */
-	u32 found_wallet_index;
 	if (wallet_can_spend(cmd->ld->wallet,
 			     oa->our_upfront_shutdown_script,
 			     &found_wallet_index)) {
-		our_upfront_shutdown_script_wallet_index = tal(tmpctx, u32);
-		*our_upfront_shutdown_script_wallet_index = found_wallet_index;
+		our_upfront_shutdown_script_wallet_index = &found_wallet_index;
 	} else
 		our_upfront_shutdown_script_wallet_index = NULL;
 
 	oa->open_msg = towire_dualopend_opener_init(oa,
-					   psbt, *amount,
+					   psbt, amount,
 					   oa->our_upfront_shutdown_script,
 					   our_upfront_shutdown_script_wallet_index,
-					   *feerate_per_kw,
+					   feerate_per_kw,
 					   unilateral_feerate(cmd->ld->topology, true),
-					   *feerate_per_kw_funding,
+					   feerate_per_kw_funding,
 					   channel->channel_flags,
-					   amount_sat_zero(*request_amt) ?
-						NULL : request_amt,
+					   amount_sat_zero(request_amt) ?
+						NULL : &request_amt,
 					   get_block_height(cmd->ld->topology),
 					   false,
 					   ctype,
@@ -3160,6 +3114,182 @@ static struct command_result *json_openchannel_init(struct command *cmd,
 							     &channel->cid)));
 	subd_send_fd(peer->ld->connectd, fds[1]);
 	return command_still_pending(cmd);
+}
+
+struct openchannel_init_info {
+	struct command *cmd;
+	struct node_id *id;
+	struct amount_sat *amount, *request_amt;
+	struct wally_psbt *psbt;
+	u32 *feerate_per_kw_funding, *feerate_per_kw;
+	const u8 *our_upfront_shutdown_script;
+	bool *announce_channel;
+	struct lease_rates *rates;
+	struct channel_type *ctype;
+};
+
+static void openchannel_init_after_sync(struct chain_topology *topo,
+					struct openchannel_init_info *info)
+{
+	struct peer *peer;
+
+	/* Look up peer again in case it's gone! */
+	peer = peer_by_id(info->cmd->ld, info->id);
+	if (!peer) {
+		was_pending(command_fail(info->cmd, FUNDING_UNKNOWN_PEER, "Unknown peer"));
+		return;
+	}
+
+	if (!feature_negotiated(info->cmd->ld->our_features,
+			        peer->their_features,
+				OPT_DUAL_FUND)) {
+		was_pending(command_fail(info->cmd, FUNDING_V2_NOT_SUPPORTED,
+					 "v2 openchannel not supported "
+					 "by peer"));
+		return;
+	}
+
+	openchannel_init(info->cmd, peer,
+			 *info->amount,
+			 *info->request_amt,
+			 info->psbt,
+			 *info->feerate_per_kw_funding, *info->feerate_per_kw,
+			 info->our_upfront_shutdown_script,
+			 *info->announce_channel,
+			 info->rates, info->ctype);
+}
+
+static struct command_result *json_openchannel_init(struct command *cmd,
+						    const char *buffer,
+						    const jsmntok_t *obj UNNEEDED,
+						    const jsmntok_t *params)
+{
+	struct openchannel_init_info *info = tal(cmd, struct openchannel_init_info);
+	struct peer *peer;
+	struct amount_sat psbt_val;
+	struct command_result *res;
+
+	info->cmd = cmd;
+	if (!param_check(cmd, buffer, params,
+			 p_req("id", param_node_id, &info->id),
+			 p_req("amount", param_sat, &info->amount),
+			 p_req("initialpsbt", param_psbt, &info->psbt),
+			 p_opt("commitment_feerate", param_feerate, &info->feerate_per_kw),
+			 p_opt("funding_feerate", param_feerate, &info->feerate_per_kw_funding),
+			 p_opt_def("announce", param_bool, &info->announce_channel, true),
+			 p_opt("close_to", param_bitcoin_address, &info->our_upfront_shutdown_script),
+			 p_opt_def("request_amt", param_sat, &info->request_amt, AMOUNT_SAT(0)),
+			 p_opt("compact_lease", param_lease_hex, &info->rates),
+			 p_opt("channel_type", param_channel_type, &info->ctype),
+			 NULL))
+		return command_param_failed();
+
+	/* We only deal in v2 */
+	if (!psbt_set_version(info->psbt, 2)) {
+		return command_fail(cmd, LIGHTNINGD, "Could not set PSBT version.");
+	}
+
+	/* Gotta expect some rates ! */
+	if (!amount_sat_zero(*info->request_amt) && !info->rates)
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "Must pass in 'compact_lease' if requesting"
+				    " funds from peer");
+	psbt_val = AMOUNT_SAT(0);
+	for (size_t i = 0; i < info->psbt->num_inputs; i++) {
+		struct amount_sat in_amt = psbt_input_get_amount(info->psbt, i);
+		if (!amount_sat_add(&psbt_val, psbt_val, in_amt))
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "Overflow in adding PSBT input"
+					    " values. %s",
+					    fmt_wally_psbt(tmpctx, info->psbt));
+	}
+
+	/* If they don't pass in at least enough in the PSBT to cover
+	 * their amount, nope */
+	if (!amount_sat_greater(psbt_val, *info->amount))
+		return command_fail(cmd, FUND_CANNOT_AFFORD,
+				    "Provided PSBT cannot afford funding of "
+				    "amount %s. %s",
+				    fmt_amount_sat(tmpctx, *info->amount),
+				    fmt_wally_psbt(tmpctx, info->psbt));
+
+	res = init_set_feerate(cmd, &info->feerate_per_kw, &info->feerate_per_kw_funding);
+	if (res)
+		return res;
+
+	peer = peer_by_id(cmd->ld, info->id);
+	if (!peer) {
+		return command_fail(cmd, FUNDING_UNKNOWN_PEER, "Unknown peer");
+	}
+
+	if (!feature_negotiated(cmd->ld->our_features,
+			        peer->their_features,
+				OPT_DUAL_FUND)) {
+		return command_fail(cmd, FUNDING_V2_NOT_SUPPORTED,
+				    "v2 openchannel not supported "
+				    "by peer");
+	}
+
+	if (info->ctype &&
+	    !cmd->ld->dev_any_channel_type &&
+	    !channel_type_accept(tmpctx,
+				 info->ctype->features,
+				 cmd->ld->our_features)) {
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "channel_type not supported");
+	}
+
+	/* BOLT #2:
+	 *  - if both nodes advertised `option_support_large_channel`:
+	 *    - MAY set `funding_satoshis` greater than or equal to 2^24 satoshi.
+	 *  - otherwise:
+	 *    - MUST set `funding_satoshis` to less than 2^24 satoshi.
+	 */
+	if (!feature_negotiated(cmd->ld->our_features,
+				peer->their_features, OPT_LARGE_CHANNELS)
+	    && amount_sat_greater(*info->amount, chainparams->max_funding))
+		return command_fail(cmd, FUND_MAX_EXCEEDED,
+				    "Amount exceeded %s",
+				    fmt_amount_sat(tmpctx, chainparams->max_funding));
+
+	/* Add serials to any input that's missing them */
+	psbt_add_serials(info->psbt, TX_INITIATOR);
+
+	/* We require the PSBT to meet certain criteria such as
+	 * extra, proprietary fields (`serial_id`s) or
+	 * to have a `redeemscripts` iff the inputs are P2SH.
+	 *
+	 * Since this is externally provided, we confirm that
+	 * they've done the right thing / haven't lost any required info.
+	 */
+	if (!psbt_has_required_fields(info->psbt))
+		return command_fail(cmd, FUNDING_PSBT_INVALID,
+				    "PSBT is missing required fields %s",
+				    fmt_wally_psbt(tmpctx, info->psbt));
+
+	if (command_check_only(cmd))
+		return command_check_done(cmd);
+
+	if (!topology_synced(cmd->ld->topology)) {
+		json_notify_fmt(cmd, LOG_UNUSUAL,
+				"Waiting to sync with bitcoind network (block %u of %u)",
+				get_block_height(cmd->ld->topology),
+				get_network_blockheight(cmd->ld->topology));
+
+		topology_add_sync_waiter(cmd, cmd->ld->topology,
+					 openchannel_init_after_sync,
+					 info);
+		return command_still_pending(cmd);
+	}
+
+	return openchannel_init(cmd, peer,
+				*info->amount,
+				*info->request_amt,
+				info->psbt,
+				*info->feerate_per_kw_funding, *info->feerate_per_kw,
+				info->our_upfront_shutdown_script,
+				*info->announce_channel,
+				info->rates, info->ctype);
 }
 
 static void psbt_request_valid(struct psbt_validator *pv)
@@ -3250,7 +3380,7 @@ channel_fail_fallen_behind(struct subd* dualopend, const u8 *msg)
 		return;
 	}
 
-        channel_fallen_behind(channel, msg);
+        channel_fallen_behind(channel);
 }
 
 static void handle_psbt_changed(struct subd *dualopend,
@@ -3762,10 +3892,7 @@ static struct command_result *json_queryrates(struct command *cmd,
 
 static const struct json_command queryrates_command = {
 	"dev-queryrates",
-	"channels",
 	json_queryrates,
-	"Ask a peer what their contribution and liquidity rates are"
-	" for the given {amount} and {requested_amt}",
 	.dev_only = true,
 };
 
@@ -3773,40 +3900,27 @@ AUTODATA(json_command, &queryrates_command);
 
 static const struct json_command openchannel_init_command = {
 	"openchannel_init",
-	"channels",
 	json_openchannel_init,
-	"Init an open channel to {id} with {initialpsbt} for {amount} satoshis. "
-	"Returns updated {psbt} with (partial) contributions from peer"
 };
 
 static const struct json_command openchannel_update_command = {
 	"openchannel_update",
-	"channels",
 	json_openchannel_update,
-	"Update {channel_id} with {psbt}. "
-	"Returns updated {psbt} with (partial) contributions from peer. "
-	"If {commitments_secured} is true, next call should be to openchannel_signed"
 };
 
 static const struct json_command openchannel_signed_command = {
 	"openchannel_signed",
-	"channels",
 	json_openchannel_signed,
-	"Send our {signed_psbt}'s tx sigs for {channel_id}."
 };
 
 static const struct json_command openchannel_bump_command = {
 	"openchannel_bump",
-	"channels",
 	json_openchannel_bump,
-	"Attempt to bump the fee on {channel_id}'s funding transaction."
 };
 
 static const struct json_command openchannel_abort_command = {
 	"openchannel_abort",
-	"channels",
 	json_openchannel_abort,
-	"Abort {channel_id}'s open. Usable while `commitment_signed=false`."
 };
 
 AUTODATA(json_command, &openchannel_init_command);
@@ -3950,6 +4064,12 @@ bool peer_start_dualopend(struct peer *peer,
 				  | HSM_PERM_SIGN_REMOTE_TX
 				  | HSM_PERM_SIGN_WILL_FUND_OFFER
 				  | HSM_PERM_LOCK_OUTPOINT);
+	if (hsmfd < 0) {
+		channel_internal_error(channel,
+				       "Getting hsm fd for dualopend: %s",
+				       strerror(errno));
+		return false;
+	}
 
 	channel->owner = new_channel_subd(channel,
 					  peer->ld,
@@ -4025,6 +4145,15 @@ bool peer_restart_dualopend(struct peer *peer,
 				  | HSM_PERM_SIGN_REMOTE_TX
 				  | HSM_PERM_SIGN_WILL_FUND_OFFER
 				  | HSM_PERM_LOCK_OUTPOINT);
+
+	if (hsmfd < 0) {
+		log_broken(channel->log, "Could not get hsmfd: %s",
+			   strerror(errno));
+		/* Disconnect it. */
+		force_peer_disconnect(peer->ld, peer,
+				      "Failed to get hsm fd for dualopend");
+		return false;
+	}
 
 	channel_set_owner(channel,
 			  new_channel_subd(channel, peer->ld,

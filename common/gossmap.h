@@ -8,6 +8,7 @@
 #include <common/fp16.h>
 
 struct node_id;
+struct sciddir_or_pubkey;
 
 struct gossmap_node {
 	/* Offset in memory map for node_announce, or 0. */
@@ -160,7 +161,7 @@ static inline bool gossmap_chan_set(const struct gossmap_chan *chan, int dir)
 	return chan->cupdate_off[dir] != 0;
 }
 
-/* Return capacity if it's known (fails only on race condition, or a local mod) */
+/* Return capacity if it's known (fails on a local mod) */
 bool gossmap_chan_get_capacity(const struct gossmap *map,
 			       const struct gossmap_chan *c,
 			       struct amount_sat *amount);
@@ -207,6 +208,10 @@ u8 *gossmap_chan_get_update(const tal_t *ctx,
 			    const struct gossmap_chan *chan,
 			    int dir);
 
+/* Return true if we can map this sciddir_or_pubkey to a pubkey. */
+bool gossmap_scidd_pubkey(struct gossmap *gossmap,
+			  struct sciddir_or_pubkey *sciddpk);
+
 /* Returns details from channel_update (must be gossmap_chan_set, and
  * does not work for local_updatechan)! */
 void gossmap_chan_get_update_details(const struct gossmap *map,
@@ -237,6 +242,19 @@ bool gossmap_chan_has_capacity(const struct gossmap_chan *chan,
 			       int direction,
 			       struct amount_msat amount);
 
+/* Convenience routines to get htlc min/max as amount_msat */
+static inline struct amount_msat
+gossmap_chan_htlc_max(const struct gossmap_chan *chan, const int dir)
+{
+	return amount_msat(fp16_to_u64(chan->half[dir].htlc_max));
+}
+
+static inline struct amount_msat
+gossmap_chan_htlc_min(const struct gossmap_chan *chan, const int dir)
+{
+	return amount_msat(fp16_to_u64(chan->half[dir].htlc_min));
+}
+
 /* Remove a channel from the map (warning! realloc can move gossmap_chan
  * and gossmap_node ptrs!) */
 void gossmap_remove_chan(struct gossmap *map, struct gossmap_chan *chan);
@@ -257,4 +275,29 @@ size_t gossmap_num_chans(const struct gossmap *map);
 struct gossmap_chan *gossmap_first_chan(const struct gossmap *map);
 struct gossmap_chan *gossmap_next_chan(const struct gossmap *map,
 				       struct gossmap_chan *prev);
+
+/* For iterating the gossmap: returns iterator at start. */
+struct gossmap_iter *gossmap_iter_new(const tal_t *ctx,
+				      const struct gossmap *map);
+/* Copy an existing iterator (same offset) */
+struct gossmap_iter *gossmap_iter_dup(const tal_t *ctx,
+				      const struct gossmap_iter *iter);
+
+/* Get next message, and optional timestamp */
+const void *gossmap_stream_next(const tal_t *ctx,
+				const struct gossmap *map,
+				struct gossmap_iter *iter,
+				u32 *timestamp);
+/* For fast-forwarding to the given timestamp */
+void gossmap_iter_fast_forward(const struct gossmap *map,
+			       struct gossmap_iter *iter,
+			       u64 timestamp);
+/* Moves iterator to the end. */
+void gossmap_iter_end(const struct gossmap *map, struct gossmap_iter *iter);
+
+/* For debugging: returns length read, and total known length of file */
+size_t gossmap_lengths(const struct gossmap *map, size_t *total);
+
+/* Debugging: connectd wants to enumerate fds */
+int gossmap_fd(const struct gossmap *map);
 #endif /* LIGHTNING_COMMON_GOSSMAP_H */

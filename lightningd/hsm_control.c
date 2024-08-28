@@ -1,12 +1,12 @@
 #include "config.h"
 #include <ccan/err/err.h>
 #include <ccan/fdpass/fdpass.h>
+#include <common/bolt12_id.h>
 #include <common/ecdh.h>
 #include <common/errcode.h>
 #include <common/hsm_capable.h>
 #include <common/hsm_encryption.h>
 #include <common/hsm_version.h>
-#include <common/invoice_path_id.h>
 #include <common/json_command.h>
 #include <common/json_param.h>
 #include <common/jsonrpc_errors.h>
@@ -26,7 +26,6 @@ static int hsm_get_fd(struct lightningd *ld,
 		      u64 dbid,
 		      u64 permissions)
 {
-	int hsm_fd;
 	const u8 *msg;
 
 	msg = towire_hsmd_client_hsmfd(NULL, id, dbid, permissions);
@@ -34,10 +33,7 @@ static int hsm_get_fd(struct lightningd *ld,
 	if (!fromwire_hsmd_client_hsmfd_reply(msg))
 		fatal("Bad reply from HSM: %s", tal_hex(tmpctx, msg));
 
-	hsm_fd = fdpass_recv(ld->hsm_fd);
-	if (hsm_fd < 0)
-		fatal("Could not read fd from HSM: %s", strerror(errno));
-	return hsm_fd;
+	return fdpass_recv(ld->hsm_fd);
 }
 
 int hsm_get_client_fd(struct lightningd *ld,
@@ -52,7 +48,11 @@ int hsm_get_client_fd(struct lightningd *ld,
 
 int hsm_get_global_fd(struct lightningd *ld, u64 permissions)
 {
-	return hsm_get_fd(ld, &ld->id, 0, permissions);
+	int fd = hsm_get_fd(ld, &ld->our_nodeid, 0, permissions);
+
+	if (fd < 0)
+		fatal("Could not read fd from HSM: %s", strerror(errno));
+	return fd;
 }
 
 static unsigned int hsm_msg(struct subd *hsmd,
@@ -87,6 +87,7 @@ struct ext_key *hsm_init(struct lightningd *ld)
 	int fds[2];
 	struct ext_key *bip32_base;
 	u32 hsm_version;
+	struct pubkey unused;
 
 	/* We actually send requests synchronously: only status is async. */
 	if (socketpair(AF_LOCAL, SOCK_STREAM, 0, fds) != 0)
@@ -109,6 +110,21 @@ struct ext_key *hsm_init(struct lightningd *ld)
 	}
 
 	ld->hsm_fd = fds[0];
+
+	if (ld->developer) {
+		struct tlv_hsmd_dev_preinit_tlvs *tlv;
+
+		tlv = tlv_hsmd_dev_preinit_tlvs_new(tmpctx);
+		tlv->fail_preapprove = tal_dup(tlv, bool,
+					       &ld->dev_hsmd_fail_preapprove);
+		tlv->no_preapprove_check = tal_dup(tlv, bool,
+						   &ld->dev_hsmd_no_preapprove_check);
+
+		msg = towire_hsmd_dev_preinit(tmpctx, tlv);
+		if (!wire_sync_write(ld->hsm_fd, msg))
+		    err(EXITCODE_HSM_GENERIC_ERROR, "Writing preinit msg to hsm");
+	}
+
 	if (!wire_sync_write(ld->hsm_fd, towire_hsmd_init(tmpctx,
 							  &chainparams->bip32_key_version,
 							  chainparams,
@@ -126,14 +142,18 @@ struct ext_key *hsm_init(struct lightningd *ld)
 	if (fromwire_hsmd_init_reply_v4(ld, msg,
 					&hsm_version,
 					&ld->hsm_capabilities,
-					&ld->id, bip32_base,
-					&ld->bolt12_base)) {
+					&ld->our_nodeid, bip32_base,
+					&unused)) {
 		/* nothing to do. */
 	} else {
 		if (ld->config.keypass)
 			errx(EXITCODE_HSM_BAD_PASSWORD, "Wrong password for encrypted hsm_secret.");
 		errx(EXITCODE_HSM_GENERIC_ERROR, "HSM did not give init reply");
 	}
+
+	if (!pubkey_from_node_id(&ld->our_pubkey, &ld->our_nodeid))
+		errx(EXITCODE_HSM_GENERIC_ERROR, "HSM gave invalid node id %s",
+		     fmt_node_id(tmpctx, &ld->our_nodeid));
 
 	if (hsm_version < HSM_MIN_VERSION)
 		errx(EXITCODE_HSM_GENERIC_ERROR,
@@ -164,13 +184,24 @@ struct ext_key *hsm_init(struct lightningd *ld)
 
 	/* This is equivalent to makesecret("bolt12-invoice-base") */
 	msg = towire_hsmd_derive_secret(NULL, tal_dup_arr(tmpctx, u8,
-							  (const u8 *)INVOICE_PATH_BASE_STRING,
-							  strlen(INVOICE_PATH_BASE_STRING), 0));
+							  (const u8 *)BOLT12_ID_BASE_STRING,
+							  strlen(BOLT12_ID_BASE_STRING), 0));
 	if (!wire_sync_write(ld->hsm_fd, take(msg)))
 		err(EXITCODE_HSM_GENERIC_ERROR, "Writing derive_secret msg to hsm");
 
 	msg = wire_sync_read(tmpctx, ld->hsm_fd);
 	if (!fromwire_hsmd_derive_secret_reply(msg, &ld->invoicesecret_base))
+		err(EXITCODE_HSM_GENERIC_ERROR, "Bad derive_secret_reply");
+
+	/* This is equivalent to makesecret("node-alias-base") */
+	msg = towire_hsmd_derive_secret(NULL, tal_dup_arr(tmpctx, u8,
+							  (const u8 *)NODE_ALIAS_BASE_STRING,
+							  strlen(NODE_ALIAS_BASE_STRING), 0));
+	if (!wire_sync_write(ld->hsm_fd, take(msg)))
+		err(EXITCODE_HSM_GENERIC_ERROR, "Writing derive_secret msg to hsm");
+
+	msg = wire_sync_read(tmpctx, ld->hsm_fd);
+	if (!fromwire_hsmd_derive_secret_reply(msg, &ld->nodealias_base))
 		err(EXITCODE_HSM_GENERIC_ERROR, "Bad derive_secret_reply");
 
 	return bip32_base;
@@ -268,8 +299,6 @@ static struct command_result *json_makesecret(struct command *cmd,
 
 static const struct json_command makesecret_command = {
 	"makesecret",
-	"utility",
 	&json_makesecret,
-	"Get a pseudorandom secret key, using some {hex} data."
 };
 AUTODATA(json_command, &makesecret_command);

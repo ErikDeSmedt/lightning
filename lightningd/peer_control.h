@@ -109,7 +109,16 @@ void peer_set_dbid(struct peer *peer, u64 dbid);
 /* At startup, re-send any transactions we want bitcoind to have */
 void resend_closing_transactions(struct lightningd *ld);
 
-void drop_to_chain(struct lightningd *ld, struct channel *channel, bool cooperative);
+/**
+ * Initiate the close of a channel.
+ *
+ * @param rebroadcast: Whether we should be broadcasting our
+ *   commitment transaction in order to close the channel, or not.
+ */
+void drop_to_chain(struct lightningd *ld,
+		   struct channel *channel,
+		   bool cooperative,
+		   bool rebroadcast);
 
 void update_channel_from_inflight(struct lightningd *ld,
 				  struct channel *channel,
@@ -127,8 +136,13 @@ struct amount_msat channel_amount_spendable(const struct channel *channel);
 struct amount_msat channel_amount_receivable(const struct channel *channel);
 
 /* Pull peers, channels and HTLCs from db, and wire them up.
- * Returns any HTLCs we have to resubmit via htlcs_resubmit. */
-struct htlc_in_map *load_channels_from_wallet(struct lightningd *ld);
+ * Returns any HTLCs we have to resubmit via htlcs_resubmit.
+ *
+ * As a side-effect, count total channels loaded into *num_channels.
+ */
+struct htlc_in_map *load_channels_from_wallet(struct lightningd *ld,
+					      size_t *num_channels);
+
 
 struct leak_detect;
 void peer_dev_memleak(struct lightningd *ld, struct leak_detect *leaks);

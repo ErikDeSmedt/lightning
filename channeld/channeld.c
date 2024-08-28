@@ -45,8 +45,6 @@
 #include <common/wire_error.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <gossipd/gossip_store_wiregen.h>
-#include <gossipd/gossipd_peerd_wiregen.h>
 #include <hsmd/hsmd_wiregen.h>
 #include <stdio.h>
 #include <wally_bip32.h>
@@ -618,10 +616,7 @@ static void handle_peer_add_htlc(struct peer *peer, const u8 *msg)
 
 	if (!fromwire_update_add_htlc(msg, msg, &channel_id, &id, &amount,
 				      &payment_hash, &cltv_expiry,
-				      onion_routing_packet, &tlvs)
-	    /* This is an *even* field: don't send if we didn't understand */
-	    || (tlvs->blinding_point && !feature_offered(peer->our_features->bits[INIT_FEATURE],
-							 OPT_ROUTE_BLINDING))) {
+				      onion_routing_packet, &tlvs)) {
 		peer_failed_warn(peer->pps, &peer->channel_id,
 				 "Bad peer_add_htlc %s", tal_hex(msg, msg));
 	}
@@ -1419,11 +1414,13 @@ static void start_commit_timer(struct peer *peer)
 					  send_commit_if_not_stfu, peer);
 }
 
-/* If old_secret is NULL, we don't care, otherwise it is filled in. */
-static void get_per_commitment_point(u64 index, struct pubkey *point,
-				     struct secret *old_secret)
+/* Fetch the requested point. The secret is no longer returned, use
+ * revoke_commitment instead.  It is legal to call this on any
+ * commitment (including distant future).
+ */
+static void get_per_commitment_point(u64 index, struct pubkey *point)
 {
-	struct secret *s;
+	struct secret *unused;
 	const u8 *msg;
 
 	msg = hsm_req(tmpctx,
@@ -1431,61 +1428,47 @@ static void get_per_commitment_point(u64 index, struct pubkey *point,
 
 	if (!fromwire_hsmd_get_per_commitment_point_reply(tmpctx, msg,
 							 point,
-							 &s))
+							 &unused))
 		status_failed(STATUS_FAIL_HSM_IO,
 			      "Bad per_commitment_point reply %s",
 			      tal_hex(tmpctx, msg));
+}
 
-	if (old_secret) {
-		if (!s)
-			status_failed(STATUS_FAIL_HSM_IO,
-				      "No secret in per_commitment_point_reply %"
-				      PRIu64,
-				      index);
-		*old_secret = *s;
-	}
+/* Revoke the specified commitment, the old secret is returned and
+ * next commitment point are returned.  This call is idempotent, it is
+ * fine to re-revoke a previously revoked commitment.  It is an error
+ * to revoke a commitment beyond the next revocable commitment.
+ */
+static void revoke_commitment(u64 index, struct secret *old_secret, struct pubkey *point)
+{
+	const u8 *msg;
+
+	msg = hsm_req(tmpctx,
+		      take(towire_hsmd_revoke_commitment_tx(tmpctx, index)));
+
+	if (!fromwire_hsmd_revoke_commitment_tx_reply(msg, old_secret, point))
+		status_failed(STATUS_FAIL_HSM_IO,
+			      "Reading revoke_commitment_tx reply: %s",
+			      tal_hex(tmpctx, msg));
 }
 
 /* revoke_index == current index - 1 (usually; not for retransmission) */
 static u8 *make_revocation_msg(const struct peer *peer, u64 revoke_index,
 			       struct pubkey *point)
 {
- 	const u8 *msg;
 	struct secret old_commit_secret;
 
 	/* Now that the master has persisted the new commitment advance the HSMD
-	 * and fetch the revocation secret for the old one. */
-	if (!hsm_is_capable(peer->hsm_capabilities, WIRE_HSMD_REVOKE_COMMITMENT_TX)) {
-		/* Prior to HSM_VERSION 5 we call get_per_commitment_point to
-		 * get the old_secret and next point.
-		 */
-		get_per_commitment_point(revoke_index+2, point, &old_commit_secret);
-	} else {
-		/* After HSM_VERSION 5 we explicitly revoke the commitment in case
-		 * the original revoke didn't complete.  The hsmd_revoke_commitment_tx
-		 * call is idempotent ...
-		 */
-		msg = towire_hsmd_revoke_commitment_tx(tmpctx, revoke_index);
-		msg = hsm_req(tmpctx, take(msg));
-		if (!fromwire_hsmd_revoke_commitment_tx_reply(msg, &old_commit_secret, point))
-			status_failed(STATUS_FAIL_HSM_IO,
-				      "Reading revoke_commitment_tx reply: %s",
-				      tal_hex(tmpctx, msg));
-	}
+	 * and fetch the revocation secret for the old one.
+	 *
+	 * After HSM_VERSION 5 we explicitly revoke the commitment in case
+	 * the original revoke didn't complete.  The hsmd_revoke_commitment_tx
+	 * call is idempotent ...
+	 */
+	revoke_commitment(revoke_index, &old_commit_secret, point);
 
 	return towire_revoke_and_ack(peer, &peer->channel_id, &old_commit_secret,
 				     point);
-}
-
-static u8 *make_revocation_msg_from_secret(const struct peer *peer,
-					   u64 revoke_index,
-					   struct pubkey *point,
-					   const struct secret *old_commit_secret,
-					   const struct pubkey *next_point)
-{
-	*point = *next_point;
-	return towire_revoke_and_ack(peer, &peer->channel_id,
-				     old_commit_secret, next_point);
 }
 
 /* Convert changed htlcs into parts which lightningd expects. */
@@ -1554,8 +1537,6 @@ static void send_revocation(struct peer *peer,
 	struct added_htlc *added;
 	const u8 *msg;
 	const u8 *msg_for_master;
-	struct secret old_secret2;
-	struct pubkey next_point2;
 
 	/* Marshall it now before channel_sending_revoke_and_ack changes htlcs */
 	/* FIXME: Make infrastructure handle state post-revoke_and_ack! */
@@ -1598,24 +1579,8 @@ static void send_revocation(struct peer *peer,
 
 	/* Now that the master has persisted the new commitment advance the HSMD
 	 * and fetch the revocation secret for the old one. */
-	if (!hsm_is_capable(peer->hsm_capabilities, WIRE_HSMD_REVOKE_COMMITMENT_TX)) {
-		/* Prior to HSM_VERSION 5 we use the old_secret
-		 * received earlier from validate_commitment_tx. */
-		old_secret2 = *old_secret;
-		next_point2 = *next_point;
-	} else {
-		msg = towire_hsmd_revoke_commitment_tx(tmpctx, peer->next_index[LOCAL] - 2);
-		msg = hsm_req(tmpctx, take(msg));
-		if (!fromwire_hsmd_revoke_commitment_tx_reply(msg, &old_secret2, &next_point2))
-			status_failed(STATUS_FAIL_HSM_IO,
-				      "Reading revoke_commitment_tx reply: %s",
-				      tal_hex(tmpctx, msg));
-	}
-
-	/* Revoke previous commit, get new point. */
-	msg = make_revocation_msg_from_secret(peer, peer->next_index[LOCAL]-2,
-					      &peer->next_local_per_commit,
-					      &old_secret2, &next_point2);
+	msg = make_revocation_msg(peer, peer->next_index[LOCAL]-2,
+				  &peer->next_local_per_commit);
 
 	/* Now we can finally send revoke_and_ack to peer */
 	peer_write(peer->pps, take(msg));
@@ -2040,7 +2005,7 @@ static struct commitsig_info *handle_peer_commit_sig(struct peer *peer,
 					 "error");
 	}
 
-	/* Validate the counterparty's signatures, returns prior per_commitment_secret. */
+	/* As of HSM_VERSION 5 returned old_secret is always NULL (revoke returns it instead) */
 	htlcs = collect_htlcs(NULL, htlc_map);
 	msg2 = towire_hsmd_validate_commitment_tx(NULL,
 						  txs[0],
@@ -2102,10 +2067,8 @@ static struct commitsig_info *handle_peer_commit_sig(struct peer *peer,
 		tal_steal(commitsigs, result);
 	}
 
-	// If the HSM doesn't support WIRE_HSMD_REVOKE_COMMITMENT_TX we'd better
-	// have the old_secret at this point.
-	if (!hsm_is_capable(peer->hsm_capabilities, WIRE_HSMD_REVOKE_COMMITMENT_TX))
-		assert(old_secret);
+	/* After HSM_VERSION 5 old_secret is always NULL */
+	assert(!old_secret);
 
 	send_revocation(peer, &commit_sig, htlc_sigs, changed_htlcs, txs[0],
 			old_secret, &next_point, commitsigs);
@@ -2586,7 +2549,7 @@ static void handle_unexpected_reestablish(struct peer *peer, const u8 *msg)
 
 static bool is_initiators_serial(const struct wally_map *unknowns)
 {
-	/* BOLT-f15b6b0feeffc2acd1a8466537810bbb3f824f9f #2:
+	/* BOLT #2:
 	 * The sending node: ...
 	 *   - if is the *initiator*:
 	 *     - MUST send even `serial_id`s
@@ -2752,7 +2715,7 @@ static struct commitsig *interactive_send_commitments(struct peer *peer,
 		/* Funding counts as 0th commit so we do inflight_index + 1 */
 		if (fromwire_peektype(msg) == WIRE_COMMITMENT_SIGNED) {
 			get_per_commitment_point(next_index_local - 1,
-						 &my_current_per_commitment_point, NULL);
+						 &my_current_per_commitment_point);
 
 			result = handle_peer_commit_sig(peer, msg,
 							inflight_index + 1,
@@ -2824,18 +2787,24 @@ static size_t calc_weight(enum tx_role role, const struct wally_psbt *psbt)
 {
 	size_t weight = 0;
 
-	/* BOLT-0d8b701614b09c6ee4172b04da2203e73deec7e2 #2:
-	 * The initiator:
-	 *   ...
-	 * - MUST pay for the common fields.
+	/* BOLT #2:
+	 * The *initiator* is responsible for paying the fees for the following fields,
+	 * to be referred to as the `common fields`.
+	 *
+	 *   - version
+	 *   - segwit marker + flag
+	 *   - input count
+	 *   - output count
+	 *   - locktime
 	 */
 	if (role == TX_INITIATOR)
 		weight += bitcoin_tx_core_weight(psbt->num_inputs,
 						 psbt->num_outputs);
 
-	/* BOLT-0d8b701614b09c6ee4172b04da2203e73deec7e2 #2:
-	 * Each node:
-	 * - MUST pay for their own added inputs and outputs.
+	/* BOLT #2:
+	 * The rest of the transaction bytes' fees are the responsibility of
+	 * the peer who contributed that input or output via `tx_add_input` or
+	 * `tx_add_output`, at the agreed upon `feerate`.
 	 */
 	for (size_t i = 0; i < psbt->num_inputs; i++)
 		if (is_initiators_serial(&psbt->inputs[i].unknowns)) {
@@ -4020,7 +3989,7 @@ static void splice_initiator_user_update(struct peer *peer, const u8 *inmsg)
 }
 
 /* This occurs when the user has signed the final version of the PSBT. At this
- * point we do a commitment transaciton round with our peer via
+ * point we do a commitment transaction round with our peer via
  * `interactive_send_commitments`.
  *
  * Then we finalize the PSBT some more and sign away our funding output,
@@ -4520,21 +4489,17 @@ static void resend_commitment(struct peer *peer, struct changed_htlc *last)
 /* BOLT #2:
  *
  * A receiving node:
- *  - if `option_static_remotekey` applies to the commitment transaction:
+ *    - MUST ignore `my_current_per_commitment_point`, but MAY require it to be
+ *      a valid point.
  *    - if `next_revocation_number` is greater than expected above, AND
  *    `your_last_per_commitment_secret` is correct for that
  *    `next_revocation_number` minus 1:
- *...
- *  - otherwise, if it supports `option_data_loss_protect`:
- *    - if `next_revocation_number` is greater than expected above,
- *      AND `your_last_per_commitment_secret` is correct for that
- *     `next_revocation_number` minus 1:
+ *      - MUST NOT broadcast its commitment transaction.
+ *      - SHOULD send an `error` to request the peer to fail the channel.
  */
 static void check_future_dataloss_fields(struct peer *peer,
 			u64 next_revocation_number,
-			const struct secret *last_local_per_commit_secret,
-			/* This is NULL if option_static_remotekey */
-			const struct pubkey *remote_current_per_commitment_point)
+			const struct secret *last_local_per_commit_secret)
 {
 	const u8 *msg;
 	bool correct;
@@ -4567,13 +4532,9 @@ static void check_future_dataloss_fields(struct peer *peer,
 	/* BOLT #2:
 	 * - MUST NOT broadcast its commitment transaction.
 	 * - SHOULD send an `error` to request the peer to fail the channel.
-	 * - SHOULD store `my_current_per_commitment_point` to
-	 *   retrieve funds should the sending node broadcast its
-	 *   commitment transaction on-chain.
 	 */
 	wire_sync_write(MASTER_FD,
-			take(towire_channeld_fail_fallen_behind(NULL,
-				       remote_current_per_commitment_point)));
+			take(towire_channeld_fail_fallen_behind(NULL)));
 
 	sleep(1);
 	/* We have to send them an error to trigger dropping to chain. */
@@ -4584,15 +4545,9 @@ static void check_future_dataloss_fields(struct peer *peer,
 /* BOLT #2:
  *
  * A receiving node:
- *  - if `option_static_remotekey` applies to the commitment transaction:
  * ...
  *  - if `your_last_per_commitment_secret` does not match the expected values:
  *     - SHOULD send an `error` and fail the channel.
- *  - otherwise, if it supports `option_data_loss_protect`:
- *...
- *    - otherwise (`your_last_per_commitment_secret` or
- *     `my_current_per_commitment_point` do not match the expected values):
- *      - SHOULD send an `error` and fail the channel.
  */
 static void check_current_dataloss_fields(struct peer *peer,
 			u64 next_revocation_number,
@@ -4627,10 +4582,7 @@ static void check_current_dataloss_fields(struct peer *peer,
 		memset(&old_commit_secret, 0, sizeof(old_commit_secret));
 	else {
 		struct pubkey unused;
-		/* This gets previous revocation number, since asking for
-		 * commitment point N gives secret for N-2 */
-		get_per_commitment_point(next_revocation_number+1,
-					 &unused, &old_commit_secret);
+		revoke_commitment(next_revocation_number - 1, &old_commit_secret, &unused);
 	}
 
 	if (!secret_eq_consttime(&old_commit_secret,
@@ -4763,7 +4715,7 @@ static void peer_reconnect(struct peer *peer,
 	/* Our current per-commitment point is the commitment point in the last
 	 * received signed commitment */
 	get_per_commitment_point(peer->next_index[LOCAL] - 1,
-				 &my_current_per_commitment_point, NULL);
+				 &my_current_per_commitment_point);
 
 	send_tlvs = NULL;
 
@@ -4844,14 +4796,7 @@ static void peer_reconnect(struct peer *peer,
 	 *     of the next `commitment_signed` it expects to receive.
 	 *   - MUST set `next_revocation_number` to the commitment number
 	 *     of the next `revoke_and_ack` message it expects to receive.
-	 *   - if `option_static_remotekey` applies to the commitment transaction:
-	 *     - MUST set `my_current_per_commitment_point` to a valid point.
-	 *   - otherwise:
-	 *     - MUST set `my_current_per_commitment_point` to its commitment
-	 *       point for the last signed commitment it received from its
-	 *       channel peer (i.e. the commitment_point corresponding to the
-	 *       commitment transaction the sender would use to unilaterally
-	 *       close).
+	 *   - MUST set `my_current_per_commitment_point` to a valid point.
 	 *   - if `next_revocation_number` equals 0:
 	 *     - MUST set `your_last_per_commitment_secret` to all zeroes
 	 *   - otherwise:
@@ -4867,6 +4812,14 @@ static void peer_reconnect(struct peer *peer,
 			 /* Can send any (valid) point here */
 			 &peer->remote_per_commit, send_tlvs);
 	} else {
+		/* Older BOLT spec said for non-static-remotekey:
+		 *
+		 * - MUST set `my_current_per_commitment_point` to its
+		 *   commitment point for the last signed commitment it
+		 *   received from its channel peer (i.e. the commitment_point
+		 *   corresponding to the commitment transaction the sender
+		 *   would use to unilaterally close).
+		 */
 		msg = towire_channel_reestablish
 			(NULL, &peer->channel_id,
 			 peer->next_index[LOCAL],
@@ -5086,11 +5039,7 @@ static void peer_reconnect(struct peer *peer,
 		 * Does not return. */
 		check_future_dataloss_fields(peer,
 					     next_revocation_number,
-					     &last_local_per_commitment_secret,
-					     channel_has(peer->channel,
-							 OPT_STATIC_REMOTEKEY)
-					     ? NULL :
-					     &remote_current_per_commitment_point);
+					     &last_local_per_commitment_secret);
  	} else
  		retransmit_revoke_and_ack = false;
 
@@ -5363,7 +5312,7 @@ static void handle_funding_depth(struct peer *peer, const u8 *msg)
 			/* Need to retrieve the first point again, even if we
 			 * moved on, as channel_ready explicitly includes the
 			 * first one. */
-			get_per_commitment_point(1, &point, NULL);
+			get_per_commitment_point(1, &point);
 
 			msg = towire_channel_ready(NULL, &peer->channel_id,
 						    &point, tlvs);
@@ -5910,7 +5859,7 @@ static void init_channel(struct peer *peer)
 		     " option_anchor_outputs = %u"
 		     " option_anchors_zero_fee_htlc_tx = %u",
 		     channel_type_has(channel_type, OPT_STATIC_REMOTEKEY),
-		     channel_type_has(channel_type, OPT_ANCHOR_OUTPUTS),
+		     channel_type_has(channel_type, OPT_ANCHOR_OUTPUTS_DEPRECATED),
 		     channel_type_has(channel_type, OPT_ANCHORS_ZERO_FEE_HTLC_TX));
 
 	/* Keeping an array of pointers is better since it allows us to avoid
@@ -5947,7 +5896,7 @@ static void init_channel(struct peer *peer)
 	assert(peer->next_index[REMOTE] > 0);
 
 	get_per_commitment_point(peer->next_index[LOCAL],
-				 &peer->next_local_per_commit, NULL);
+				 &peer->next_local_per_commit);
 
 	peer->channel = new_full_channel(peer, &peer->channel_id,
 					 &funding,

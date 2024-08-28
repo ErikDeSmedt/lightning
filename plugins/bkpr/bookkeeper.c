@@ -359,6 +359,8 @@ static struct command_result *json_list_account_events(struct command *cmd,
 {
 	struct json_stream *res;
 	struct account *acct;
+	struct sha256 *payment_id;
+	struct bitcoin_txid *tx_id;
 	const char *acct_name;
 	struct channel_event **channel_events;
 	struct chain_event **chain_events;
@@ -366,8 +368,15 @@ static struct command_result *json_list_account_events(struct command *cmd,
 
 	if (!param(cmd, buf, params,
 		   p_opt("account", param_string, &acct_name),
+		   p_opt("payment_id", param_sha256, &payment_id),
 		   NULL))
 		return command_param_failed();
+
+	if (acct_name && payment_id != NULL) {
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "Can only specify one of "
+				    "{account} or {payment_id}");
+	}
 
 	if (acct_name) {
 		db_begin_transaction(db);
@@ -386,6 +395,16 @@ static struct command_result *json_list_account_events(struct command *cmd,
 		channel_events = account_get_channel_events(cmd, db, acct);
 		chain_events = account_get_chain_events(cmd, db, acct);
 		onchain_fees = account_get_chain_fees(cmd, db, acct);
+	} else if (payment_id != NULL) {
+		channel_events = get_channel_events_by_id(cmd, db, payment_id);
+
+		tx_id = tal(cmd, struct bitcoin_txid);
+		tx_id->shad.sha = *payment_id;
+		/* Transaction ids are stored as big-endian in the database */
+		reverse_bytes(tx_id->shad.sha.u.u8, sizeof(tx_id->shad.sha.u.u8));
+
+		chain_events = find_chain_events_bytxid(cmd, db, tx_id);
+		onchain_fees = get_chain_fees_by_txid(cmd, db, tx_id);
 	} else {
 		channel_events = list_channel_events(cmd, db);
 		chain_events = list_chain_events(cmd, db);
@@ -671,6 +690,7 @@ static bool new_missed_channel_account(struct command *cmd,
 		chain_ev->payment_id = NULL;
 		chain_ev->ignored = false;
 		chain_ev->stealable = false;
+		chain_ev->splice_close = false;
 		chain_ev->desc = NULL;
 
 		/* Update the account info too */
@@ -1178,8 +1198,8 @@ static char *fetch_out_desc_invstr(const tal_t *ctx, const char *buf,
 }
 
 static struct command_result *
-listinvoice_done(struct command *cmd, const char *buf,
-		 const jsmntok_t *result, struct sha256 *payment_hash)
+listinvoices_done(struct command *cmd, const char *buf,
+		  const jsmntok_t *result, struct sha256 *payment_hash)
 {
 	size_t i;
 	const jsmntok_t *inv_arr_tok, *inv_tok;
@@ -1270,7 +1290,7 @@ static struct command_result *lookup_invoice_desc(struct command *cmd,
 	if (!amount_msat_zero(credit))
 		req = jsonrpc_request_start(cmd->plugin, cmd,
 					    "listinvoices",
-					    listinvoice_done,
+					    listinvoices_done,
 					    log_error,
 					    payment_hash);
 	else
@@ -1458,9 +1478,11 @@ parse_and_log_chain_move(struct command *cmd,
 
 	e->ignored = false;
 	e->stealable = false;
+	e->splice_close = false;
 	for (size_t i = 0; i < tal_count(tags); i++) {
 		e->ignored |= tags[i] == IGNORED;
 		e->stealable |= tags[i] == STEALABLE;
+		e->splice_close |= tags[i] == SPLICE;
 	}
 
 	db_begin_transaction(db);
@@ -1516,7 +1538,8 @@ parse_and_log_chain_move(struct command *cmd,
 		/* Go see if there's any deposits to an external
 		 * that are now confirmed */
 		/* FIXME: might need updating when we can splice? */
-		maybe_closeout_external_deposits(db, e);
+		maybe_closeout_external_deposits(db, e->spending_txid,
+						 e->blockheight);
 		db_commit_transaction(db);
 	}
 
@@ -1671,6 +1694,176 @@ static char *parse_tags(const tal_t *ctx,
 	return NULL;
 }
 
+static struct command_result *json_utxo_deposit(struct command *cmd, const char *buf, const jsmntok_t *params)
+{
+	const char *move_tag ="utxo_deposit";
+	struct chain_event *ev = tal(cmd, struct chain_event);
+	struct account *acct;
+	const char *err;
+
+	err = json_scan(tmpctx, buf, params,
+			"{payload:{utxo_deposit:{"
+			"account:%"
+			",transfer_from:%"
+			",outpoint:%"
+			",amount_msat:%"
+			",coin_type:%"
+			",timestamp:%"
+			",blockheight:%"
+			"}}}",
+			JSON_SCAN_TAL(tmpctx, json_strdup, &ev->acct_name),
+			JSON_SCAN_TAL(tmpctx, json_strdup, &ev->origin_acct),
+			JSON_SCAN(json_to_outpoint, &ev->outpoint),
+			JSON_SCAN(json_to_msat, &ev->credit),
+			JSON_SCAN_TAL(tmpctx, json_strdup, &ev->currency),
+			JSON_SCAN(json_to_u64, &ev->timestamp),
+			JSON_SCAN(json_to_u32, &ev->blockheight));
+
+	if (err)
+		plugin_err(cmd->plugin,
+			   "`%s` payload did not scan %s: %.*s",
+			   move_tag, err, json_tok_full_len(params),
+			   json_tok_full(buf, params));
+
+	/* Log the thing */
+	db_begin_transaction(db);
+	acct = find_account(tmpctx, db, ev->acct_name);
+
+	if (!acct) {
+		acct = new_account(tmpctx, ev->acct_name, NULL);
+		account_add(db, acct);
+	}
+
+	ev->tag = "deposit";
+	ev->ignored = false;
+	ev->stealable = false;
+	ev->rebalance = false;
+	ev->splice_close = false;
+	ev->debit = AMOUNT_MSAT(0);
+	ev->output_value = ev->credit;
+	ev->spending_txid = NULL;
+	ev->payment_id = NULL;
+	ev->desc = NULL;
+	ev->splice_close = false;
+
+	plugin_log(cmd->plugin, LOG_DBG, "%s (%s|%s) %s -%s %"PRIu64" %d %s",
+		   move_tag, ev->tag, ev->acct_name,
+		   fmt_amount_msat(tmpctx, ev->credit),
+		   fmt_amount_msat(tmpctx, ev->debit),
+		   ev->timestamp, ev->blockheight,
+		   fmt_bitcoin_outpoint(tmpctx, &ev->outpoint));
+
+	if (!log_chain_event(db, acct, ev)) {
+		db_commit_transaction(db);
+		/* This is not a new event, do nothing */
+		return notification_handled(cmd);
+	}
+
+	/* Can we calculate any onchain fees now? */
+	err = maybe_update_onchain_fees(cmd, db, &ev->outpoint.txid);
+	db_commit_transaction(db);
+	if (err)
+		plugin_err(cmd->plugin,
+			   "Unable to update onchain fees %s",
+			   err);
+
+	/* FIXME: do account close checks, when allow onchain close to externals? */
+	return notification_handled(cmd);;
+}
+
+static struct command_result *json_utxo_spend(struct command *cmd, const char *buf, const jsmntok_t *params)
+{
+	const char *move_tag ="utxo_spend";
+	struct account *acct;
+	struct chain_event *ev = tal(cmd, struct chain_event);
+	const char *err, *acct_name;
+
+	ev->spending_txid = tal(ev, struct bitcoin_txid);
+	err = json_scan(tmpctx, buf, params,
+			"{payload:{utxo_spend:{"
+			"account:%"
+			",outpoint:%"
+			",spending_txid:%"
+			",amount_msat:%"
+			",coin_type:%"
+			",timestamp:%"
+			",blockheight:%"
+			"}}}",
+			JSON_SCAN_TAL(tmpctx, json_strdup, &acct_name),
+			JSON_SCAN(json_to_outpoint, &ev->outpoint),
+			JSON_SCAN(json_to_txid, ev->spending_txid),
+			JSON_SCAN(json_to_msat, &ev->debit),
+			JSON_SCAN_TAL(tmpctx, json_strdup, &ev->currency),
+			JSON_SCAN(json_to_u64, &ev->timestamp),
+			JSON_SCAN(json_to_u32, &ev->blockheight));
+
+	if (err)
+		plugin_err(cmd->plugin,
+			   "`%s` payload did not scan %s: %.*s",
+			   move_tag, err, json_tok_full_len(params),
+			   json_tok_full(buf, params));
+
+	/* Log the thing */
+	db_begin_transaction(db);
+	acct = find_account(tmpctx, db, acct_name);
+
+	if (!acct) {
+		acct = new_account(tmpctx, acct_name, NULL);
+		account_add(db, acct);
+	}
+
+	ev->origin_acct = NULL;
+	ev->tag = "withdrawal";
+	ev->ignored = false;
+	ev->stealable = false;
+	ev->rebalance = false;
+	ev->splice_close = false;
+	ev->credit = AMOUNT_MSAT(0);
+	ev->output_value = ev->debit;
+	ev->payment_id = NULL;
+	ev->desc = NULL;
+
+	plugin_log(cmd->plugin, LOG_DBG, "%s (%s|%s) %s -%s %"PRIu64" %d %s %s",
+		   move_tag, ev->tag, acct_name,
+		   fmt_amount_msat(tmpctx, ev->credit),
+		   fmt_amount_msat(tmpctx, ev->debit),
+		   ev->timestamp, ev->blockheight,
+		   fmt_bitcoin_outpoint(tmpctx, &ev->outpoint),
+		   fmt_bitcoin_txid(tmpctx, ev->spending_txid));
+
+	if (!log_chain_event(db, acct, ev)) {
+		db_commit_transaction(db);
+		/* This is not a new event, do nothing */
+		return notification_handled(cmd);
+	}
+
+	err = maybe_update_onchain_fees(cmd, db, ev->spending_txid);
+	if (err) {
+		db_commit_transaction(db);
+		plugin_err(cmd->plugin,
+			   "Unable to update onchain fees %s",
+			   err);
+	}
+
+	err = maybe_update_onchain_fees(cmd, db, &ev->outpoint.txid);
+	if (err) {
+		db_commit_transaction(db);
+		plugin_err(cmd->plugin,
+			   "Unable to update onchain fees %s",
+			   err);
+	}
+
+	/* Go see if there's any deposits to an external
+	 * that are now confirmed */
+	/* FIXME: might need updating when we can splice? */
+	maybe_closeout_external_deposits(db, ev->spending_txid,
+					 ev->blockheight);
+	db_commit_transaction(db);
+
+	/* FIXME: do account close checks, when allow onchain close to externals? */
+	return notification_handled(cmd);;
+}
+
 static struct command_result *json_coin_moved(struct command *cmd,
 					      const char *buf,
 					      const jsmntok_t *params)
@@ -1746,54 +1939,40 @@ const struct plugin_notification notifs[] = {
 	{
 		"balance_snapshot",
 		json_balance_snapshot,
-	}
+	},
+	{
+		"utxo_deposit",
+		json_utxo_deposit,
+	},
+	{
+		"utxo_spend",
+		json_utxo_spend,
+	},
 };
 
 static const struct plugin_command commands[] = {
 	{
 		"bkpr-listbalances",
-		"bookkeeping",
-		"List current account balances",
-		"List of current accounts and their balances",
 		json_list_balances
 	},
 	{
 		"bkpr-listaccountevents",
-		"bookkeeping",
-		"List all events for an {account}",
-		"List all events for an {account} (or all accounts, if"
-		" no account specified) in {format}. Sorted by timestamp",
 		json_list_account_events
 	},
 	{
 		"bkpr-inspect",
-		"utilities",
-		"See the current on-chain graph of an {account}",
-		"Prints out the on-chain footprint of a given {account}.",
 		json_inspect
 	},
 	{
 		"bkpr-listincome",
-		"bookkeeping",
-		"List all income impacting events",
-		"List all events for this node that impacted income",
 		json_list_income
 	},
 	{
 		"bkpr-dumpincomecsv",
-		"bookkeeping",
-		"Print out all the income events to a csv file in "
-		" {csv_format",
-		"Dump income statment data to {csv_file} in {csv_format}."
-		" Optionally, {consolidate_fee}s into single entries"
-		" (default: true)",
 		json_dump_income
 	},
 	{
 		"bkpr-channelsapy",
-		"bookkeeping",
-		"Stats on channel fund usage",
-		"Print out stats on chanenl fund usage",
 		json_channel_apy
 	},
 };
@@ -1831,7 +2010,7 @@ int main(int argc, char *argv[])
 	datadir = NULL;
 	db_dsn = NULL;
 
-	plugin_main(argv, init, PLUGIN_STATIC, true, NULL,
+	plugin_main(argv, init, NULL, PLUGIN_STATIC, true, NULL,
 		    commands, ARRAY_SIZE(commands),
 		    notifs, ARRAY_SIZE(notifs),
 		    NULL, 0,
@@ -1839,11 +2018,11 @@ int main(int argc, char *argv[])
 		    plugin_option("bookkeeper-dir",
 				  "string",
 				  "Location for bookkeeper records.",
-				  charp_option, &datadir),
+				  charp_option, NULL, &datadir),
 		    plugin_option("bookkeeper-db",
 				  "string",
 				  "Location of the bookkeeper database",
-				  charp_option, &db_dsn),
+				  charp_option, NULL, &db_dsn),
 		    NULL);
 
 	return 0;

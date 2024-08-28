@@ -50,30 +50,6 @@
     "",
     "- 1401: The forward specified does not exist."
   ],
-  "example_json_request": [
-    {
-      "id": "example:delforward#1",
-      "method": "delforward",
-      "params": {
-        "in_channel": "103x1x0",
-        "in_htlc_id": 2,
-        "status": "local_failed"
-      }
-    },
-    {
-      "id": "example:delforward#2",
-      "method": "delforward",
-      "params": [
-        "103x1x0",
-        1,
-        "failed"
-      ]
-    }
-  ],
-  "example_json_response": [
-    {},
-    {}
-  ],
   "author": [
     "Rusty Russell <<rusty@rustcorp.com.au>> is mainly responsible."
   ],
@@ -82,5 +58,31 @@
   ],
   "resources": [
     "Main web site: <https://github.com/ElementsProject/lightning>"
+  ],
+  "examples": [
+    {
+      "request": {
+        "id": "example:delforward#1",
+        "method": "delforward",
+        "params": {
+          "in_channel": "109x1x1",
+          "in_htlc_id": 4,
+          "status": "local_failed"
+        }
+      },
+      "response": {}
+    },
+    {
+      "request": {
+        "id": "example:delforward#2",
+        "method": "delforward",
+        "params": [
+          "109x1x1",
+          19,
+          "failed"
+        ]
+      },
+      "response": {}
+    }
   ]
 }

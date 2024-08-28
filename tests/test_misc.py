@@ -11,12 +11,13 @@ from pyln.testing.utils import (
 from utils import (
     account_balance, scriptpubkey_addr, check_coin_moves, first_scid
 )
-from ephemeral_port_reserve import reserve
 
+import copy
 import json
 import os
 import pytest
 import re
+import resource
 import shutil
 import signal
 import socket
@@ -107,7 +108,7 @@ def test_bitcoin_failure(node_factory, bitcoind):
 
     # Ignore BROKEN log message about blocksonly mode.
     l2 = node_factory.get_node(start=False, expect_fail=True,
-                               allow_broken_log=True)
+                               broken_log="plugin-bcli: The 'blocksonly' mode of bitcoind, or any option deactivating transaction relay is not supported.")
     l2.daemon.start(wait_for_initialized=False, stderr_redir=True)
     # Will exit with failure code.
     assert l2.daemon.wait() == 1
@@ -136,6 +137,101 @@ def test_bitcoin_ibd(node_factory, bitcoind):
 
     l1.daemon.wait_for_log('Bitcoin backend now synced')
     assert 'warning_bitcoind_sync' not in l1.rpc.getinfo()
+
+
+def test_bitcoin_pruned(node_factory, bitcoind):
+    """Test that we try to fetch blocks from a peer if we can not find
+    them on our local bitcoind.
+    """
+    fetched_peerblock = False
+
+    def mock_getblock(r):
+        # Simulate a pruned node that reutrns an error when asked for a block.
+        nonlocal fetched_peerblock
+        if fetched_peerblock:
+            fetched_peerblock = False
+            conf_file = os.path.join(bitcoind.bitcoin_dir, "bitcoin.conf")
+            brpc = RawProxy(btc_conf_file=conf_file)
+            return {
+                "result": brpc._call(r["method"], *r["params"]),
+                "error": None,
+                "id": r["id"],
+            }
+        return {
+            "id": r["id"],
+            "result": None,
+            "error": {"code": -1, "message": "Block not available (pruned data)"},
+        }
+
+    def mock_getpeerinfo(r, error=False):
+        if error:
+            return {"id": r["id"], "error": {"code": -1, "message": "unknown"}}
+        return {
+            "id": r["id"],
+            "result": [
+                {
+                    "id": 1,
+                },
+                {
+                    "id": 2,
+                },
+                {
+                    "id": 3,
+                },
+            ],
+        }
+
+    def mock_getblockfrompeer(error=False, release_after=0):
+        getblock_counter = 0
+
+        def mock_getblockfrompeer_inner(r):
+            nonlocal getblock_counter
+            getblock_counter += 1
+
+            if error and getblock_counter < release_after:
+                return {
+                    "id": r["id"],
+                    "error": {"code": -1, "message": "peer unknown"},
+                }
+            if getblock_counter >= release_after:
+                nonlocal fetched_peerblock
+                fetched_peerblock = True
+            return {
+                "id": r["id"],
+                "result": {},
+            }
+        return mock_getblockfrompeer_inner
+
+    l1 = node_factory.get_node(start=False)
+
+    l1.daemon.rpcproxy.mock_rpc("getblock", mock_getblock)
+    l1.daemon.rpcproxy.mock_rpc("getpeerinfo", mock_getpeerinfo)
+    l1.daemon.rpcproxy.mock_rpc("getblockfrompeer", mock_getblockfrompeer())
+    l1.start(wait_for_bitcoind_sync=False)
+
+    # check that we fetched a block from a peer (1st peer (from the back) in this case).
+    pruned_block = bitcoind.rpc.getblockhash(bitcoind.rpc.getblockcount())
+    l1.daemon.wait_for_log(f"failed to fetch block {pruned_block} from the bitcoin backend")
+    l1.daemon.wait_for_log(rf"try to fetch block {pruned_block} from peer 3")
+    l1.daemon.wait_for_log(rf"Adding block (\d+): {pruned_block}")
+
+    # check that we can also fetch from a peer > 1st (from the back).
+    l1.daemon.rpcproxy.mock_rpc("getblockfrompeer", mock_getblockfrompeer(error=True, release_after=2))
+    bitcoind.generate_block(1)
+
+    pruned_block = bitcoind.rpc.getblockhash(bitcoind.rpc.getblockcount())
+    l1.daemon.wait_for_log(f"failed to fetch block {pruned_block} from the bitcoin backend")
+    l1.daemon.wait_for_log(rf"failed to fetch block {pruned_block} from peer 3")
+    l1.daemon.wait_for_log(rf"try to fetch block {pruned_block} from peer (\d+)")
+    l1.daemon.wait_for_log(rf"Adding block (\d+): {pruned_block}")
+
+    # check that we retry if we could not fetch any block
+    l1.daemon.rpcproxy.mock_rpc("getblockfrompeer", mock_getblockfrompeer(error=True, release_after=10))
+    bitcoind.generate_block(1)
+
+    pruned_block = bitcoind.rpc.getblockhash(bitcoind.rpc.getblockcount())
+    l1.daemon.wait_for_log(f"asked all known peers about block {pruned_block}, retry")
+    l1.daemon.wait_for_log(rf"Adding block (\d+): {pruned_block}")
 
 
 @pytest.mark.openchannel('v1')
@@ -188,23 +284,23 @@ def test_lightningd_still_loading(node_factory, bitcoind, executor):
     # Make sure it's connected to l2 (otherwise we get TEMPORARY_CHANNEL_FAILURE)
     wait_for(lambda: only_one(l1.rpc.listpeers(l2.info['id'])['peers'])['connected'])
 
-    # Payments will fail.  FIXME: More informative msg?
-    with pytest.raises(RpcError, match=r'TEMPORARY_NODE_FAILURE'):
-        l1.pay(l2, 1000)
-
-    # Can't fund a new channel.
-    l1.rpc.connect(l3.info['id'], 'localhost', l3.port)
-    with pytest.raises(RpcError, match=r'304'):
-        if l1.config('experimental-dual-fund'):
-            psbt = l1.rpc.fundpsbt('10000sat', '253perkw', 250)['psbt']
-            l1.rpc.openchannel_init(l3.info['id'], '10000sat', psbt)
-        else:
-            l1.rpc.fundchannel_start(l3.info['id'], '10000sat')
+    # Payments will succced.
+    l1.pay(l2, 1000)
+    assert l1.daemon.is_in_log(r"Sending HTLC while still syncing with bitcoin network \(104 vs 105\)")
 
     # Attempting to fund an extremely large transaction should fail
     # with a 'unsynced' error
     with pytest.raises(RpcError, match=r'304'):
         l1.rpc.txprepare([{l1.rpc.newaddr()['bech32']: '200000000sat'}])
+
+    # Funding a new channel blocks...
+    l1.rpc.connect(l3.info['id'], 'localhost', l3.port)
+    if l1.config('experimental-dual-fund'):
+        psbt = l1.rpc.fundpsbt('30000sat', '253perkw', 250)['psbt']
+        fut_open = executor.submit(l1.rpc.openchannel_init, l3.info['id'], '30000sat', psbt)
+    else:
+        fut_open = executor.submit(l1.rpc.fundchannel_start, l3.info['id'], '30000sat')
+    l1.daemon.wait_for_log("NOTIFY .* unusual Waiting to sync with bitcoind network")
 
     # This will work, but will be delayed until synced.
     fut = executor.submit(l2.pay, l1, 1000)
@@ -212,8 +308,11 @@ def test_lightningd_still_loading(node_factory, bitcoind, executor):
 
     # Release the mock.
     mock_release.set()
+    # Incoming pay now completes
     fut.result()
 
+    # Channel open now completes
+    fut_open.result()
     assert 'warning_lightningd_sync' not in l1.rpc.getinfo()
 
     # Now we get insufficient funds error
@@ -875,7 +974,7 @@ def test_cli(node_factory):
                                    .format(l1.daemon.lightning_dir),
                                    'help']).decode('utf-8')
     # Test some known output.
-    assert 'help [command]\n    List available commands, or give verbose help on one {command}' in out
+    assert 'addgossip message\n\naddpsbtoutput' in out
 
     # Check JSON id is as expected
     l1.daemon.wait_for_log(r'jsonrpc#[0-9]*: "cli:help#[0-9]*"\[IN\]')
@@ -889,7 +988,6 @@ def test_cli(node_factory):
                                    'help']).decode('utf-8')
     j, _ = json.JSONDecoder().raw_decode(out)
     assert j['help'][0]['command'] is not None
-    assert j['help'][0]['description'] is not None
 
     # Test keyword input (autodetect)
     out = subprocess.check_output(['cli/lightning-cli',
@@ -899,7 +997,7 @@ def test_cli(node_factory):
                                    '-J',
                                    'help', 'command=help']).decode('utf-8')
     j, _ = json.JSONDecoder().raw_decode(out)
-    assert 'help [command]' in j['help'][0]['verbose']
+    assert 'help [command]' in j['help'][0]['command']
 
     # Test keyword input (forced)
     out = subprocess.check_output(['cli/lightning-cli',
@@ -909,7 +1007,7 @@ def test_cli(node_factory):
                                    '-J', '-k',
                                    'help', 'command=help']).decode('utf-8')
     j, _ = json.JSONDecoder().raw_decode(out)
-    assert 'help [command]' in j['help'][0]['verbose']
+    assert 'help [command]' in j['help'][0]['command']
 
     # Test ordered input (autodetect)
     out = subprocess.check_output(['cli/lightning-cli',
@@ -919,7 +1017,7 @@ def test_cli(node_factory):
                                    '-J',
                                    'help', 'help']).decode('utf-8')
     j, _ = json.JSONDecoder().raw_decode(out)
-    assert 'help [command]' in j['help'][0]['verbose']
+    assert 'help [command]' in j['help'][0]['command']
 
     # Test ordered input (forced)
     out = subprocess.check_output(['cli/lightning-cli',
@@ -929,7 +1027,7 @@ def test_cli(node_factory):
                                    '-J', '-o',
                                    'help', 'help']).decode('utf-8')
     j, _ = json.JSONDecoder().raw_decode(out)
-    assert 'help [command]' in j['help'][0]['verbose']
+    assert 'help [command]' in j['help'][0]['command']
 
     # Test filtering
     out = subprocess.check_output(['cli/lightning-cli',
@@ -1051,7 +1149,7 @@ def test_cli(node_factory):
 
 def test_cli_commando(node_factory):
     l1, l2 = node_factory.line_graph(2, fundchannel=False,
-                                     opts={'log-level': 'io'})
+                                     opts={'log-level': 'io', 'allow-deprecated-apis': True})
     rune = l2.rpc.commando_rune()['rune']
 
     # Invalid peer id.
@@ -1080,7 +1178,7 @@ def test_cli_commando(node_factory):
                                    .format(l1.daemon.lightning_dir),
                                    'help']).decode('utf-8')
     # Test some known output.
-    assert 'help [command]\n    List available commands, or give verbose help on one {command}' in out
+    assert 'addgossip message\n\naddpsbtoutput' in out
 
     # Check JSON id is as expected
     l1.daemon.wait_for_log(r'jsonrpc#[0-9]*: "cli:help#[0-9]*"\[IN\]')
@@ -1097,7 +1195,7 @@ def test_cli_commando(node_factory):
                                    '-J', '-k',
                                    'help', 'command=help']).decode('utf-8')
     j, _ = json.JSONDecoder().raw_decode(out)
-    assert 'help [command]' in j['help'][0]['verbose']
+    assert 'help [command]' in j['help'][0]['command']
 
     # Test ordered input (forced)
     out = subprocess.check_output(['cli/lightning-cli',
@@ -1108,7 +1206,7 @@ def test_cli_commando(node_factory):
                                    '-J', '-o',
                                    'help', 'help']).decode('utf-8')
     j, _ = json.JSONDecoder().raw_decode(out)
-    assert 'help [command]' in j['help'][0]['verbose']
+    assert 'help [command]' in j['help'][0]['command']
 
     # Test filtering
     out = subprocess.check_output(['cli/lightning-cli',
@@ -1187,7 +1285,7 @@ def test_daemon_option(node_factory):
                                    '--lightning-dir={}'
                                    .format(l1.daemon.lightning_dir),
                                    'help']).decode('utf-8')
-    assert 'help [command]\n    List available commands, or give verbose help on one {command}' in out
+    assert 'addgossip message\n\naddpsbtoutput' in out
 
     subprocess.run(['cli/lightning-cli',
                     '--network={}'.format(TEST_NETWORK),
@@ -1259,7 +1357,6 @@ def test_funding_reorg_private(node_factory, bitcoind):
     opts = {'funding-confirms': 2, 'rescan': 10, 'may_reconnect': True,
             'allow_bad_gossip': True,
             # gossipd send lightning update for original channel.
-            'allow_broken_log': True,
             'allow_warning': True,
             'dev-fast-reconnect': None,
             # if it's not zeroconf, we'll terminate on reorg.
@@ -1350,7 +1447,7 @@ def test_funding_reorg_remote_lags(node_factory, bitcoind):
 @pytest.mark.openchannel('v1')
 @pytest.mark.openchannel('v2')
 def test_funding_reorg_get_upset(node_factory, bitcoind):
-    l1, l2 = node_factory.line_graph(2, opts=[{}, {'allow_broken_log': True}])
+    l1, l2 = node_factory.line_graph(2, opts=[{}, {'broken_log': 'Funding transaction has been reorged out in state CHANNELD_NORMAL'}])
     bitcoind.simple_reorg(103, 1)
 
     # l1 is ok, as funder.
@@ -1364,7 +1461,7 @@ def test_funding_reorg_get_upset(node_factory, bitcoind):
 def test_decode(node_factory, bitcoind):
     """Test the decode option to decode the contents of emergency recovery.
     """
-    l1 = node_factory.get_node(allow_broken_log=True)
+    l1 = node_factory.get_node()
     cmd_line = ["tools/hsmtool", "getemergencyrecover", os.path.join(l1.daemon.lightning_dir, TEST_NETWORK, "emergency.recover")]
     out = subprocess.check_output(cmd_line).decode('utf-8')
     bech32_out = out.strip('\n')
@@ -1491,7 +1588,7 @@ def test_rescan(node_factory, bitcoind):
 
 def test_bitcoind_goes_backwards(node_factory, bitcoind):
     """Check that we refuse to acknowledge bitcoind giving a shorter chain without explicit rescan"""
-    l1 = node_factory.get_node(may_fail=True, allow_broken_log=True)
+    l1 = node_factory.get_node(may_fail=True)
 
     bitcoind.generate_block(10)
     sync_blockheight(bitcoind, [l1])
@@ -1582,7 +1679,7 @@ def test_reserve_enforcement(node_factory, executor):
 
 def test_ipv4_and_ipv6(node_factory):
     """Test we can bind to both IPv4 and IPv6 addresses (if supported)"""
-    port = reserve()
+    port = node_factory.get_unused_port()
     l1 = node_factory.get_node(options={'addr': ':{}'.format(port)})
     bind = l1.rpc.getinfo()['binding']
 
@@ -1824,7 +1921,8 @@ def test_logging(node_factory):
 @unittest.skipIf(VALGRIND,
                  "Valgrind sometimes fails assert on injected SEGV")
 def test_crashlog(node_factory):
-    l1 = node_factory.get_node(may_fail=True, allow_broken_log=True)
+    l1 = node_factory.get_node(may_fail=True,
+                               broken_log=' lightningd: ')
 
     def has_crash_log(n):
         files = os.listdir(os.path.join(n.daemon.lightning_dir, TEST_NETWORK))
@@ -2016,6 +2114,7 @@ def test_newaddr(node_factory, chainparams):
     both = l1.rpc.newaddr('all')
     assert 'p2sh-segwit' not in both
     assert both['bech32'].startswith(chainparams['bip173_prefix'])
+    assert both['p2tr'].startswith(chainparams['bip173_prefix'])
 
 
 def test_bitcoind_fail_first(node_factory, bitcoind):
@@ -2029,7 +2128,7 @@ def test_bitcoind_fail_first(node_factory, bitcoind):
     # first.
     timeout = 5 if 5 < TIMEOUT // 3 else TIMEOUT // 3
     l1 = node_factory.get_node(start=False,
-                               allow_broken_log=True,
+                               broken_log=r'plugin-bcli: .*-stdinrpcpass getblockhash 100 exited 1 \(after [0-9]* other errors\)',
                                may_fail=True,
                                options={'bitcoin-retry-timeout': timeout})
 
@@ -2207,7 +2306,8 @@ def test_dev_force_bip32_seed(node_factory):
 
 
 def test_dev_demux(node_factory):
-    l1 = node_factory.get_node(may_fail=True, allow_broken_log=True)
+    l1 = node_factory.get_node(may_fail=True,
+                               broken_log=' lightningd: ')
 
     # Check should work.
     l1.rpc.check(command_to_check='dev', subcommand='crash')
@@ -2263,16 +2363,17 @@ def test_list_features_only(node_factory):
                                         '--list-features-only']).decode('utf-8').splitlines()
     expected = ['option_data_loss_protect/even',
                 'option_upfront_shutdown_script/odd',
-                'option_gossip_queries/even',
+                'option_gossip_queries/odd',
                 'option_var_onion_optin/even',
                 'option_gossip_queries_ex/odd',
                 'option_static_remotekey/even',
                 'option_payment_secret/even',
                 'option_basic_mpp/odd',
                 'option_support_large_channel/odd',
-                'option_anchors_zero_fee_htlc_tx/odd',
+                'option_anchors/odd',
                 'option_route_blinding/odd',
                 'option_shutdown_anysegwit/odd',
+                'option_onion_messages/odd',
                 'option_channel_type/odd',
                 'option_scid_alias/odd',
                 'option_zeroconf/odd']
@@ -2574,7 +2675,7 @@ def test_unix_socket_path_length(node_factory, bitcoind, directory, executor, db
     db = db_provider.get_db(lightning_dir, "test_unix_socket_path_length", 1)
     db.provider = db_provider
 
-    l1 = LightningNode(1, lightning_dir, bitcoind, executor, VALGRIND, db=db, port=reserve())
+    l1 = LightningNode(1, lightning_dir, bitcoind, executor, VALGRIND, db=db, port=node_factory.get_unused_port())
 
     # `LightningNode.start()` internally calls `LightningRpc.getinfo()` which
     # exercises the socket logic, and raises an issue if it fails.
@@ -2773,11 +2874,12 @@ def test_emergencyrecover(node_factory, bitcoind):
     """
     Test emergencyrecover
     """
-    l1, l2 = node_factory.get_nodes(2, opts=[{'allow_broken_log': True, 'may_reconnect': True},
+    l1, l2 = node_factory.get_nodes(2, opts=[{'may_reconnect': True,
+                                              'broken_log': 'ERROR: Unknown commitment #.*, recovering our funds'},
                                              {'may_reconnect': True}])
 
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
-    c12, _ = l1.fundchannel(l2, 10**5)
+    c12, _ = l1.fundchannel(l2)
     stubs = l1.rpc.emergencyrecover()["stubs"]
     assert l1.daemon.is_in_log('channel {} already exists!'.format(_['channel_id']))
 
@@ -2802,10 +2904,14 @@ def test_emergencyrecover(node_factory, bitcoind):
     sync_blockheight(bitcoind, [l1, l2])
 
     l1.daemon.wait_for_log(r'All outputs resolved.*')
+    # Make sure l1 can spend its recovered funds.
     wait_for(lambda: l1.rpc.listfunds()["channels"][0]["state"] == "ONCHAIN")
-    # Check if funds are recovered.
-    assert l1.rpc.listfunds()["channels"][0]["state"] == "ONCHAIN"
-    assert l2.rpc.listfunds()["channels"][0]["state"] == "ONCHAIN"
+    wait_for(lambda: l2.rpc.listfunds()["channels"][0]["state"] == "ONCHAIN")
+
+    withdraw = l1.rpc.withdraw(l2.rpc.newaddr('bech32')['bech32'], 'all')
+    # Should have two inputs
+    assert len(bitcoind.rpc.decoderawtransaction(withdraw['tx'])['vin']) == 2
+    bitcoind.generate_block(1, wait_for_mempool=withdraw['txid'])
 
 
 @unittest.skipIf(os.getenv('TEST_DB_PROVIDER', 'sqlite3') != 'sqlite3', "sqlite3-specific DB rollback")
@@ -2824,7 +2930,7 @@ def test_recover_plugin(node_factory, bitcoind):
     l2 = node_factory.get_node(
         may_reconnect=True,
         feerates=(7500, 7500, 7500, 7500),
-        allow_broken_log=True,
+        broken_log='.*',
         allow_bad_gossip=True,
         options={
             'log-level': 'info',
@@ -2880,7 +2986,7 @@ def test_restorefrompeer(node_factory, bitcoind):
     """
     Test restorefrompeer
     """
-    l1, l2 = node_factory.get_nodes(2, [{'allow_broken_log': True,
+    l1, l2 = node_factory.get_nodes(2, [{'broken_log': 'ERROR: Unknown commitment #.*, recovering our funds!',
                                          'experimental-peer-storage': None,
                                          'may_reconnect': True,
                                          'allow_bad_gossip': True},
@@ -3202,7 +3308,7 @@ def test_version_reexec(node_factory, bitcoind):
 
     l1, l2 = node_factory.get_nodes(2, opts=[{'subdaemon': 'openingd:' + badopeningd,
                                               'start': False,
-                                              'allow_broken_log': True},
+                                              'broken_log': "openingd.*version 'badversion' not '.*': restarting"},
                                              {}])
     # We use a file to tell our openingd wrapper where the real one is
     with open(os.path.join(l1.daemon.lightning_dir, TEST_NETWORK, "openingd-real"), 'w') as f:
@@ -3763,6 +3869,43 @@ def test_fast_shutdown(node_factory):
         break
 
 
+def test_config_whitespace(node_factory):
+    """ Test the configuration parsing with extra
+        whitespace in the configuration file. """
+    l1 = node_factory.get_node()
+
+    configfile = os.path.join(l1.daemon.opts.get("lightning-dir"), TEST_NETWORK, 'config')
+
+    # Stop the node to modify the configuration file safely
+    l1.stop()
+
+    # Ensure the log-prefix option is not set in the command line arguments
+    if 'log-prefix' in l1.daemon.opts:
+        del l1.daemon.opts['log-prefix']
+
+    # Write configuration parameters with extra whitespace
+    with open(configfile, "a") as f:
+        f.write("\n\n# Test whitespace\n")
+        f.write("funder-policy-mod=100             \n")
+        f.write("funder-min-their-funding=10000\n")
+        f.write("allow-deprecated-apis=false       \n")
+        f.write("alias=MyLightningNode   \n")
+        f.write("log-prefix=MyNode   \n")
+
+    l1.start()
+
+    configs = l1.rpc.listconfigs()
+
+    # Verify that the trimmed configuration values are correctly set
+    assert configs['configs']['funder-policy-mod']['value_str'] == '100', "funder-policy-mod should be '100'"
+    assert configs['configs']['funder-min-their-funding']['value_str'] == '10000', "funder-min-their-funding should be '10000'"
+    assert configs['configs']['allow-deprecated-apis']['value_bool'] is False, "allow-deprecated-apis should be False"
+
+    # We want to keep the whitespaces at the parameter 'alias' & 'log-prefix'
+    assert configs['configs']['alias']['value_str'] == 'MyLightningNode   ', "alias should be 'MyLightningNode   '"
+    assert configs['configs']['log-prefix']['value_str'] == 'MyNode   ', "log-prefix should be 'MyNode   '"
+
+
 def test_setconfig(node_factory, bitcoind):
     l1, l2 = node_factory.line_graph(2, fundchannel=False)
     configfile = os.path.join(l2.daemon.opts.get("lightning-dir"), TEST_NETWORK, 'config')
@@ -3781,6 +3924,22 @@ def test_setconfig(node_factory, bitcoind):
 
     with pytest.raises(RpcError, match='is not a number'):
         l2.rpc.setconfig(config='min-capacity-sat', val="abcd")
+
+    # Check will fail the same way.
+    with pytest.raises(RpcError, match='requires a value'):
+        l2.rpc.check('setconfig', config='min-capacity-sat')
+
+    with pytest.raises(RpcError, match='is not a number'):
+        l2.rpc.check('setconfig', config='min-capacity-sat', val="abcd")
+
+    # Check will pass, but NOT change value.
+    assert l2.rpc.check(command_to_check='setconfig', config='min-capacity-sat', val=500000) == {'command_to_check': 'setconfig'}
+
+    assert (l2.rpc.listconfigs('min-capacity-sat')['configs']
+            == {'min-capacity-sat':
+                {'source': 'default',
+                 'value_int': 10000,
+                 'dynamic': True}})
 
     ret = l2.rpc.setconfig(config='min-capacity-sat', val=500000)
     assert ret == {'config':
@@ -3963,7 +4122,7 @@ def test_set_feerate_offset(node_factory, bitcoind):
 
     l1.pay(l2, 200000000)
     # First payment causes fee update, which should reflect the feerate offset.
-    if 'anchors_zero_fee_htlc_tx/even' in only_one(l1.rpc.listpeerchannels()['channels'])['channel_type']['names']:
+    if 'anchors/even' in only_one(l1.rpc.listpeerchannels()['channels'])['channel_type']['names']:
         feerate = 3850
         min_feerate = 253
     else:
@@ -3979,3 +4138,154 @@ def test_set_feerate_offset(node_factory, bitcoind):
 
     l1.daemon.wait_for_log(' to CLOSINGD_COMPLETE')
     l2.daemon.wait_for_log(' to CLOSINGD_COMPLETE')
+
+
+def test_low_fd_limit(node_factory, bitcoind):
+    limits = resource.getrlimit(resource.RLIMIT_NOFILE)
+
+    # We assume this, otherwise l2 cannot increase limits!
+    if limits[0] == limits[1]:
+        limits = (limits[1] // 2, limits[1])
+        resource.setrlimit(resource.RLIMIT_NOFILE, limits)
+
+    # l1 asks for too much, l2 asks for more than it has, but enough.
+    l1, l2 = node_factory.line_graph(2, opts=[{'dev-fd-limit-multiplier': limits[1] + 1,
+                                               'allow_warning': True},
+                                              {'dev-fd-limit-multiplier': limits[1],
+                                               'allow_warning': True}])
+
+    # fd check is done at start, so restart.
+    l1.restart()
+
+    # Github CI seems to give children a lower fd hard limit that we have (32768 vs 65536?)
+    # so we don't check the actual numbers here.
+
+    # It should warn that FD limit is "low".
+    assert l1.daemon.is_in_log('UNUSUAL.*WARNING: we have 1 channels but file descriptors limited')
+
+    l2.restart()
+
+    assert l2.daemon.is_in_log(r'Increasing file descriptor limit')
+
+
+@pytest.mark.parametrize("preapprove", [False, True])
+def test_preapprove(node_factory, bitcoind, preapprove):
+    # l1 uses old routine which doesn't support check.
+    opts = [{'dev-hsmd-no-preapprove-check': None}, {}]
+    if preapprove is False:
+        opts[0]['dev-hsmd-fail-preapprove'] = None
+        opts[1]['dev-hsmd-fail-preapprove'] = None
+
+    l1, l2 = node_factory.line_graph(2, opts=opts)
+
+    inv = l1.rpc.invoice(123000, 'label', 'description', 3700)['bolt11']
+    if preapprove:
+        l2.rpc.check('preapproveinvoice', bolt11=inv)
+    else:
+        with pytest.raises(RpcError, match='invoice was declined'):
+            l2.rpc.check('preapproveinvoice', bolt11=inv)
+
+    l2.daemon.wait_for_log("preapprove_invoice: check_only=1")
+
+    # But l1 can't check properly, will always pass.
+    inv = l2.rpc.invoice(123000, 'label', 'description', 3700)['bolt11']
+    l1.rpc.check('preapproveinvoice', bolt11=inv)
+
+    assert not l1.daemon.is_in_log("preapprove_invoice: check_only=1")
+
+    # But if we try to actually preapprove we fail if told.
+    if preapprove:
+        l1.rpc.preapproveinvoice(inv)
+    else:
+        with pytest.raises(RpcError, match='invoice was declined'):
+            l1.rpc.preapproveinvoice(bolt11=inv)
+    l1.daemon.wait_for_log("preapprove_invoice: check_only=0")
+
+    # Same for keysend
+    if preapprove:
+        l2.rpc.check('preapprovekeysend',
+                     destination=l1.info['id'],
+                     payment_hash='00' * 32,
+                     amount_msat=1000)
+    else:
+        with pytest.raises(RpcError, match='keysend was declined'):
+            l2.rpc.check('preapprovekeysend',
+                         destination=l1.info['id'],
+                         payment_hash='00' * 32,
+                         amount_msat=1000)
+
+    l2.daemon.wait_for_log("preapprove_keysend: check_only=1")
+
+    # But l1 can't check properly, will always pass.
+    l1.rpc.check('preapprovekeysend',
+                 destination=l2.info['id'],
+                 payment_hash='00' * 32,
+                 amount_msat=1000)
+
+    assert not l1.daemon.is_in_log("preapprove_keysend: check_only=1")
+
+    # But if we try to actually preapprove we fail if told.
+    if preapprove:
+        l1.rpc.preapprovekeysend(l2.info['id'], '00' * 32, 1000)
+    else:
+        with pytest.raises(RpcError, match='keysend was declined'):
+            l1.rpc.preapprovekeysend(l2.info['id'], '00' * 32, 1000)
+    l1.daemon.wait_for_log("preapprove_keysend: check_only=0")
+
+
+def test_preapprove_use(node_factory, bitcoind):
+    """Test preapprove calls implicitly made by pay and keysend"""
+    l1, l2 = node_factory.line_graph(2, opts=[{}, {'dev-hsmd-fail-preapprove': None}])
+
+    # Create some balance, make sure it's entirely settled.
+    l1.pay(l2, 200000000)
+    wait_for(lambda: only_one(l2.rpc.listpeerchannels()['channels'])['htlcs'] == [])
+
+    # This will fail at the preapprove step.
+    inv = l1.rpc.invoice(123000, 'label', 'description', 3700)['bolt11']
+    with pytest.raises(RpcError, match='invoice was declined'):
+        l2.rpc.pay(inv)
+
+    # This will fail the same way
+    with pytest.raises(RpcError, match='invoice was declined'):
+        l2.rpc.check('pay', bolt11=inv)
+
+    # Now keysend.
+    with pytest.raises(RpcError, match='keysend was declined'):
+        l2.rpc.keysend(l1.info['id'], 1000)
+    with pytest.raises(RpcError, match='keysend was declined'):
+        l2.rpc.check('keysend', destination=l1.info['id'], amount_msat=1000)
+
+
+def test_badparam_discretion(node_factory):
+    """When in non-developer mode, don't return the contents of invalid parameters, but refer to logs"""
+    l1 = node_factory.get_node()
+
+    with pytest.raises(RpcError, match='rune: should be base64 string: invalid token') as err:
+        l1.rpc.checkrune(rune='THIS IS NOT ACTUALLY A RUNE')
+
+    assert err.value.error['message'] == "rune: should be base64 string: invalid token '\"THIS IS NOT ACTUALLY A RUNE\"'"
+
+    # We don't bother logging since we returned all the details
+    assert not l1.daemon.is_in_log('Invalid parameter')
+
+    # Now try non-developer mode (needs some other option removal, too)
+    l1.stop()
+    assert l1.daemon.early_opts == ['--developer']
+    l1.daemon.early_opts = []
+    opts = copy.copy(l1.daemon.opts)
+    for k in opts.keys():
+        if k.startswith('dev'):
+            del l1.daemon.opts[k]
+    l1.start()
+
+    with pytest.raises(RpcError, match=r'rune: should be base64 string: invalid token \(see logs for details\)'):
+        l1.rpc.checkrune(rune='THIS IS NOT ACTUALLY A RUNE')
+
+    l1.daemon.wait_for_log(r"checkrune: Invalid parameter rune \(should be base64 string\): token '\"THIS IS NOT ACTUALLY A RUNE\"'")
+
+    # But: check command *SHOULD* give as much info as we can.
+    with pytest.raises(RpcError, match='rune: should be base64 string: invalid token') as err:
+        l1.rpc.check('checkrune', rune='THIS IS NOT ACTUALLY A RUNE')
+
+    assert err.value.error['message'] == "rune: should be base64 string: invalid token '\"THIS IS NOT ACTUALLY A RUNE\"'"

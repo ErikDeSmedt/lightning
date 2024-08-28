@@ -9,8 +9,7 @@
 void derive_channel_id(struct channel_id *channel_id,
 		       const struct bitcoin_outpoint *outpoint)
 {
-	BUILD_ASSERT(sizeof(*channel_id) == sizeof(outpoint->txid));
-	memcpy(channel_id, &outpoint->txid, sizeof(*channel_id));
+	CROSS_TYPE_ASSIGNMENT(channel_id, &outpoint->txid);
 	channel_id->id[sizeof(*channel_id)-2] ^= outpoint->n >> 8;
 	channel_id->id[sizeof(*channel_id)-1] ^= outpoint->n;
 }
@@ -19,15 +18,14 @@ void derive_channel_id_v2(struct channel_id *channel_id,
 			  const struct pubkey *basepoint_1,
 			  const struct pubkey *basepoint_2)
 {
-	/* BOLT-f53ca2301232db780843e894f55d95d512f297f9 #2:
+	/* BOLT #2:
 	 * `channel_id`, v2
 	 *  For channels established using the v2 protocol, the
 	 *  `channel_id` is the
-	 *      SHA256(lesser-revocation-basepoint ||
-	 *             greater-revocation-basepoint),
+	 *      `SHA256(lesser-revocation-basepoint ||
+	 *              greater-revocation-basepoint)`,
 	 *  where the lesser and greater is based off the order of
-	 *  the basepoint. The basepoints are compact
-	 *  DER-encoded public keys.
+	 *  the basepoint.
 	 */
 	u8 der_keys[PUBKEY_CMPR_LEN * 2];
 	struct sha256 sha;
@@ -44,8 +42,7 @@ void derive_channel_id_v2(struct channel_id *channel_id,
 	pubkey_to_der(der_keys + offset_1, basepoint_1);
 	pubkey_to_der(der_keys + offset_2, basepoint_2);
 	sha256(&sha, der_keys, sizeof(der_keys));
-	BUILD_ASSERT(sizeof(*channel_id) == sizeof(sha));
-	memcpy(channel_id, &sha, sizeof(*channel_id));
+	CROSS_TYPE_ASSIGNMENT(channel_id, &sha);
 }
 
 void derive_tmp_channel_id(struct channel_id *channel_id,
@@ -53,17 +50,16 @@ void derive_tmp_channel_id(struct channel_id *channel_id,
 {
 	struct sha256 sha;
 
-	/* BOLT-f53ca2301232db780843e894f55d95d512f297f9 #2:
-	 * If the peer's revocation basepoint is unknown
-	 * (e.g. `open_channel2`), a temporary `channel_id` should be
-	 * found by using a zeroed out basepoint for the unknown peer.
+	/* BOLT #2:
+	 * When sending `open_channel2`, the peer's revocation basepoint is unknown.
+	 * A `temporary_channel_id` must be computed by using a zeroed out basepoint
+	 * for the non-initiator.
 	 */
 	u8 der_keys[PUBKEY_CMPR_LEN * 2];
 	memset(der_keys, 0, PUBKEY_CMPR_LEN);
 	pubkey_to_der(der_keys + PUBKEY_CMPR_LEN, opener_basepoint);
 	sha256(&sha, der_keys, sizeof(der_keys));
-	BUILD_ASSERT(sizeof(*channel_id) == sizeof(sha));
-	memcpy(channel_id, &sha, sizeof(*channel_id));
+	CROSS_TYPE_ASSIGNMENT(channel_id, &sha);
 }
 
 /* BOLT #2:

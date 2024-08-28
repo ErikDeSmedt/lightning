@@ -55,12 +55,16 @@ struct command_result *command_param_failed(void)
 	return &param_failed;
 }
 
-/* For our purposes, the same as command_param_failed: we examine
- * cmd->mode to see if it's really done. */
+/* We immediately respond with success if we reach here. */
 struct command_result *command_check_done(struct command *cmd)
 {
+	struct json_stream *response;
+
 	assert(cmd->mode == CMD_CHECK);
-	return &param_failed;
+
+	response = json_stream_success(cmd);
+	json_add_string(response, "command_to_check", cmd->json_cmd->name);
+	return command_success(cmd, response);
 }
 
 struct command_result *command_its_complicated(const char *relationship_details
@@ -168,7 +172,7 @@ static void destroy_jcon(struct json_connection *jcon)
 	tal_free(jcon->log);
 }
 
-struct logger *command_log(struct command *cmd)
+struct logger *command_logger(struct command *cmd)
 {
 	if (cmd->jcon)
 		return cmd->jcon->log;
@@ -182,15 +186,7 @@ static struct command_result *json_help(struct command *cmd,
 
 static const struct json_command help_command = {
 	"help",
-	"utility",
 	json_help,
-	"List available commands, or give verbose help on one {command}.",
-	.verbose = "help [command]\n"
-	"Without [command]:\n"
-	"  Outputs an array of objects with 'command' and 'description'\n"
-	"With [command]:\n"
-	"  Give a single object containing 'verbose', which completely describes\n"
-	"  the command inputs and outputs."
 };
 AUTODATA(json_command, &help_command);
 
@@ -250,9 +246,7 @@ static struct command_result *json_stop(struct command *cmd,
 
 static const struct json_command stop_command = {
 	"stop",
-	"utility",
 	json_stop,
-	"Shut down the lightningd process"
 };
 AUTODATA(json_command, &stop_command);
 
@@ -357,9 +351,7 @@ static struct command_result *json_recover(struct command *cmd,
 
 static const struct json_command recover_command = {
 	"recover",
-	"utility",
 	json_recover,
-	"Restart an unused lightning node with --recover"
 };
 AUTODATA(json_command, &recover_command);
 
@@ -434,15 +426,7 @@ static struct command_result *json_dev(struct command *cmd UNUSED,
 
 static const struct json_command dev_command = {
 	"dev",
-	"developer",
 	json_dev,
-	"Developer command test multiplexer",
-	.verbose = "dev rhash {secret}\n"
-	"	Show SHA256 of {secret}\n"
-	"dev crash\n"
-	"	Crash lightningd by calling fatal()\n"
-	"dev slowcmd {msec}\n"
-	"	Torture test for slow commands, optional {msec}\n",
 	.dev_only = true,
 };
 AUTODATA(json_command, &dev_command);
@@ -477,25 +461,8 @@ static void json_add_help_command(struct command *cmd,
 			strmap_get(&cmd->ld->jsonrpc->usagemap,
 				   json_command->name));
 	json_object_start(response, NULL);
-
 	json_add_string(response, "command", usage);
-	json_add_string(response, "category", json_command->category);
-	json_add_string(response, "description", json_command->description);
-
-	if (!json_command->verbose) {
-		json_add_string(response, "verbose",
-				"HELP! Please contribute"
-				" a description for this"
-				" json_command!");
-	} else {
-		struct json_escape *esc;
-
-		esc = json_escape(NULL, json_command->verbose);
-		json_add_escaped_string(response, "verbose", take(esc));
-	}
-
 	json_object_end(response);
-
 }
 
 static const struct json_command *find_command(struct json_command **commands,
@@ -600,12 +567,6 @@ struct command_result *command_raw_complete(struct command *cmd,
 	if (cmd->jcon)
 		tal_steal(cmd->jcon, result);
 
-	/* Don't free it here if we're doing `check` */
-	if (command_check_only(cmd)) {
-		cmd->mode = CMD_CHECK_FAILED;
-		return command_param_failed();
-	}
-
 	tal_free(cmd);
 	return &complete;
 }
@@ -675,7 +636,7 @@ bool command_deprecated_in_ok(struct command *cmd,
 				 const char *depr_end)
 {
 	return lightningd_deprecated_in_ok(cmd->ld,
-					   command_log(cmd),
+					   command_logger(cmd),
 					   command_deprecated_ok_flag(cmd),
 					   cmd->json_cmd->name, param,
 					   depr_start, depr_end,
@@ -731,20 +692,27 @@ void json_notify_fmt(struct command *cmd,
 {
 	va_list ap;
 	struct json_stream *js;
+	const char *msg;
 
+	va_start(ap, fmt);
+	msg = tal_vfmt(tmpctx, fmt, ap);
+	va_end(ap);
+
+	/* Help for tests */
+	log_debug(cmd->ld->log, "NOTIFY %s %s %s",
+		  cmd->id, log_level_name(level), msg);
 	if (!cmd->send_notifications)
 		return;
 
 	js = json_stream_raw_for_cmd(cmd);
 
-	va_start(ap, fmt);
 	json_object_start(js, NULL);
 	json_add_string(js, "jsonrpc", "2.0");
 	json_add_string(js, "method", "message");
 	json_object_start(js, "params");
 	json_add_id(js, cmd->id);
 	json_add_string(js, "level", log_level_name(level));
-	json_add_string(js, "message", tal_vfmt(tmpctx, fmt, ap));
+	json_add_string(js, "message", msg);
 	json_object_end(js);
 	json_object_end(js);
 
@@ -1478,6 +1446,20 @@ bool command_dev_apis(const struct command *cmd)
 	return cmd->ld->developer;
 }
 
+void command_log(struct command *cmd, enum log_level level,
+		 const char *fmt, ...)
+{
+	const char *msg;
+	va_list ap;
+
+	va_start(ap, fmt);
+	msg = tal_vfmt(cmd, fmt, ap);
+	log_(cmd->ld->log, level, NULL, level >= LOG_UNUSUAL,
+	     "JSON COMMAND %s: %s",
+	     cmd->json_cmd->name, msg);
+	va_end(ap);
+}
+
 void command_set_usage(struct command *cmd, const char *usage TAKES)
 {
 	usage = tal_strdup(cmd->ld, usage);
@@ -1661,13 +1643,13 @@ void jsonrpc_request_end(struct jsonrpc_request *r)
 
 static struct command_result *json_check(struct command *cmd,
 					 const char *buffer,
-					 const jsmntok_t *obj UNNEEDED,
+					 const jsmntok_t *obj,
 					 const jsmntok_t *params)
 {
 	jsmntok_t *mod_params;
 	const jsmntok_t *name_tok;
-	struct json_stream *response;
 	struct command_result *res;
+	struct lightningd *ld = cmd->ld;
 
 	if (cmd->mode == CMD_USAGE) {
 		mod_params = NULL;
@@ -1675,45 +1657,37 @@ static struct command_result *json_check(struct command *cmd,
 		mod_params = json_tok_copy(cmd, params);
 	}
 
+	/* Replaces cmd->json_cmd: */
 	if (!param(cmd, buffer, mod_params,
 		   p_req("command_to_check", param_command, &name_tok),
 		   p_opt_any(),
 		   NULL))
 		return command_param_failed();
 
-	/* Point name_tok to the name, not the value */
-	if (params->type == JSMN_OBJECT)
-		name_tok--;
-
-	json_tok_remove(&mod_params, mod_params, name_tok, 1);
-
 	cmd->mode = CMD_CHECK;
 	/* Make *sure* it doesn't try to manip db! */
-	db_set_readonly(cmd->ld->wallet->db, true);
-	res = cmd->json_cmd->dispatch(cmd, buffer, mod_params, mod_params);
-	db_set_readonly(cmd->ld->wallet->db, false);
+	db_set_readonly(ld->wallet->db, true);
 
-	/* CMD_CHECK always makes it "fail" parameter parsing. */
-	assert(res == &param_failed);
-	if (cmd->mode == CMD_CHECK_FAILED) {
-		tal_free(cmd);
-		return res;
+	/* Raw check hook is needed for plugins */
+	if (cmd->json_cmd->check) {
+		res = cmd->json_cmd->check(cmd, buffer, obj, params);
+	} else {
+		/* Point name_tok to the name, not the value */
+		if (params->type == JSMN_OBJECT)
+			name_tok--;
+
+		json_tok_remove(&mod_params, mod_params, name_tok, 1);
+
+		res = cmd->json_cmd->dispatch(cmd, buffer, mod_params, mod_params);
 	}
+	db_set_readonly(ld->wallet->db, false);
 
-	response = json_stream_success(cmd);
-	json_add_string(response, "command_to_check", cmd->json_cmd->name);
-	res = command_success(cmd, response);
-	/* CMD_CHECK means we don't get freed! */
-	tal_free(cmd);
 	return res;
 }
 
 static const struct json_command check_command = {
 	"check",
-	"utility",
 	json_check,
-	"Don't run {command_to_check}, just verify parameters.",
-	.verbose = "check command_to_check [parameters...]\n"
 };
 AUTODATA(json_command, &check_command);
 
@@ -1737,9 +1711,7 @@ static struct command_result *json_notifications(struct command *cmd,
 
 static const struct json_command notifications_command = {
 	"notifications",
-	"utility",
 	json_notifications,
-	"{enable} notifications",
 };
 AUTODATA(json_command, &notifications_command);
 
@@ -1763,9 +1735,7 @@ static struct command_result *json_batching(struct command *cmd,
 
 static const struct json_command batching_command = {
 	"batching",
-	"utility",
 	json_batching,
-	"Database transaction batching {enable}",
 };
 AUTODATA(json_command, &batching_command);
 
@@ -1789,8 +1759,6 @@ static struct command_result *json_deprecations(struct command *cmd,
 
 static const struct json_command deprecations_command = {
 	"deprecations",
-	"utility",
 	json_deprecations,
-	"Set/unset deprecated APIs on this JSON connection (for developer testing)",
 };
 AUTODATA(json_command, &deprecations_command);

@@ -1,4 +1,3 @@
-from ephemeral_port_reserve import reserve
 from fixtures import *  # noqa: F401,F403
 from pathlib import Path
 from pyln import grpc as clnpb
@@ -49,10 +48,7 @@ def test_plugin_start(node_factory):
     assert l1.rpc.help("testmethod") == {
         'help': [
             {
-                'command': 'testmethod ',
-                'category': 'plugin',
-                'description': 'This is a test',
-                'verbose': 'This is a test'
+                'command': 'testmethod '
             }
         ],
         'format-hint': 'simple'
@@ -66,28 +62,53 @@ def test_plugin_start(node_factory):
     l1.daemon.wait_for_log(r'Got a connect hook call')
     l1.daemon.wait_for_log(r'Got a connect notification')
 
+    l1.rpc.setconfig("test-dynamic-option", True)
+    assert l1.rpc.listconfigs("test-dynamic-option")["configs"]["test-dynamic-option"]["value_bool"]
+    wait_for(lambda: l1.daemon.is_in_log(r'cln-plugin-startup: Got dynamic option change: test-dynamic-option \\"true\\"'))
+    l1.rpc.setconfig("test-dynamic-option", False)
+    assert not l1.rpc.listconfigs("test-dynamic-option")["configs"]["test-dynamic-option"]["value_bool"]
+    wait_for(lambda: l1.daemon.is_in_log(r'cln-plugin-startup: Got dynamic option change: test-dynamic-option \\"false\\"'))
+
 
 def test_plugin_options_handle_defaults(node_factory):
     """Start a minimal plugin and ensure it is well-behaved
     """
     bin_path = Path.cwd() / "target" / RUST_PROFILE / "examples" / "cln-plugin-startup"
-    l1 = node_factory.get_node(options={"plugin": str(bin_path), 'opt-option': 31337, "test-option": 31338})
+    l1 = node_factory.get_node(
+        options={
+            "plugin": str(bin_path),
+            "opt-option": 31337,
+            "test-option": 31338,
+            "multi-str-option": ["String1", "String2"],
+            "multi-str-option-default": ["NotDefault1", "NotDefault2"],
+            "multi-i64-option": [1, 2, 3, 4],
+            "multi-i64-option-default": [5, 6],
+        }
+    )
     opts = l1.rpc.testoptions()
     assert opts["opt-option"] == 31337
     assert opts["test-option"] == 31338
+    assert opts["multi-str-option"] == ["String1", "String2"]
+    assert opts["multi-str-option-default"] == ["NotDefault1", "NotDefault2"]
+    assert opts["multi-i64-option"] == [1, 2, 3, 4]
+    assert opts["multi-i64-option-default"] == [5, 6]
 
     # Do not set any value, should be None now
     l1 = node_factory.get_node(options={"plugin": str(bin_path)})
     opts = l1.rpc.testoptions()
     assert opts["opt-option"] is None, "opt-option has no default"
     assert opts["test-option"] == 42, "test-option has a default of 42"
+    assert opts["multi-str-option"] is None
+    assert opts["multi-str-option-default"] == ["Default1"]
+    assert opts["multi-i64-option"] is None
+    assert opts["multi-i64-option-default"] == [-42]
 
 
 def test_grpc_connect(node_factory):
     """Attempts to connect to the grpc interface and call getinfo"""
     # These only exist if we have rust!
 
-    grpc_port = reserve()
+    grpc_port = node_factory.get_unused_port()
     l1 = node_factory.get_node(options={"grpc-port": str(grpc_port)})
 
     p = Path(l1.daemon.lightning_dir) / TEST_NETWORK
@@ -143,7 +164,7 @@ def test_grpc_generate_certificate(node_factory):
      - If we have certs, we they should just get loaded
      - If we delete one cert or its key it should get regenerated.
     """
-    grpc_port = reserve()
+    grpc_port = node_factory.get_unused_port()
     l1 = node_factory.get_node(options={
         "grpc-port": str(grpc_port),
     }, start=False)
@@ -203,7 +224,7 @@ def test_grpc_wrong_auth(node_factory):
     """
     # These only exist if we have rust!
 
-    grpc_port = reserve()
+    grpc_port = node_factory.get_unused_port()
     l1, l2 = node_factory.get_nodes(2, opts={
         "start": False,
         "grpc-port": str(grpc_port),
@@ -290,7 +311,7 @@ def test_grpc_keysend_routehint(bitcoind, node_factory):
     recipient.
 
     """
-    grpc_port = reserve()
+    grpc_port = node_factory.get_unused_port()
     l1, l2, l3 = node_factory.line_graph(
         3,
         opts=[
@@ -308,7 +329,7 @@ def test_grpc_keysend_routehint(bitcoind, node_factory):
         clnpb.Routehint(hops=[
             clnpb.RouteHop(
                 id=bytes.fromhex(l2.info['id']),
-                short_channel_id=chan['channels'][0]['short_channel_id'],
+                scid=chan['channels'][0]['short_channel_id'],
                 # Fees are defaults from CLN
                 feebase=clnpb.Amount(msat=1),
                 feeprop=10,
@@ -334,7 +355,7 @@ def test_grpc_keysend_routehint(bitcoind, node_factory):
 def test_grpc_listpeerchannels(bitcoind, node_factory):
     """ Check that conversions of this rather complex type work.
     """
-    grpc_port = reserve()
+    grpc_port = node_factory.get_unused_port()
     l1, l2 = node_factory.line_graph(
         2,
         opts=[
@@ -364,7 +385,7 @@ def test_grpc_listpeerchannels(bitcoind, node_factory):
 
 
 def test_grpc_decode(node_factory):
-    grpc_port = reserve()
+    grpc_port = node_factory.get_unused_port()
     l1 = node_factory.get_node(options={'grpc-port': str(grpc_port)})
     inv = l1.grpc.Invoice(clnpb.InvoiceRequest(
         amount_msat=clnpb.AmountOrAny(any=True),
@@ -382,3 +403,70 @@ def test_grpc_decode(node_factory):
         string=inv.bolt11
     ))
     print(res)
+
+
+def test_rust_plugin_subscribe_wildcard(node_factory):
+    """ Creates a plugin that loads the subscribe_wildcard plugin
+    """
+    bin_path = Path.cwd() / "target" / RUST_PROFILE / "examples" / "cln-subscribe-wildcard"
+    l1 = node_factory.get_node(options={"plugin": bin_path})
+    l2 = node_factory.get_node()
+
+    l2.connect(l1)
+
+    l1.daemon.wait_for_log("Received notification connect")
+
+
+def test_grpc_block_added_notifications(node_factory, bitcoind):
+    grpc_port = node_factory.get_unused_port()
+
+    l1 = node_factory.get_node(options={"grpc-port": str(grpc_port)})
+
+    # Test the block_added notification
+    # Start listening to block added events over grpc
+    block_added_stream = l1.grpc.SubscribeBlockAdded(clnpb.StreamBlockAddedRequest())
+    bitcoind.generate_block(10)
+    for block_added_event in block_added_stream:
+        assert block_added_event.hash is not None
+        assert block_added_event.height is not None
+
+        # If we don't break out of the loop we'll
+        # be waiting for ever
+        break
+
+
+def test_grpc_connect_notification(node_factory):
+    grpc_port = node_factory.get_unused_port()
+
+    l1 = node_factory.get_node(options={"grpc-port": str(grpc_port)})
+    l2 = node_factory.get_node()
+
+    # Test the connect notification
+    connect_stream = l1.grpc.SubscribeConnect(clnpb.StreamConnectRequest())
+    l2.connect(l1)
+
+    for connect_event in connect_stream:
+        assert connect_event.id.hex() == l2.info["id"]
+        break
+
+
+def test_grpc_custommsg_notification(node_factory):
+    grpc_port = node_factory.get_unused_port()
+
+    l1 = node_factory.get_node(options={"grpc-port": str(grpc_port)})
+    l2 = node_factory.get_node()
+
+    # Test the connect notification
+    custommsg_stream = l1.grpc.SubscribeCustomMsg(clnpb.StreamCustomMsgRequest())
+    l2.connect(l1)
+
+    # Send the custom-msg to node l1
+    # The payload doesn't matter.
+    # It just needs to be valid hex which encodes to an odd BOLT-8 msg id
+    l2.rpc.sendcustommsg(l1.info["id"], "3131313174657374")
+
+    for custommsg in custommsg_stream:
+        assert custommsg.peer_id.hex() == l2.info["id"]
+        assert custommsg.payload.hex() == "3131313174657374"
+        assert custommsg.payload == b"1111test"
+        break

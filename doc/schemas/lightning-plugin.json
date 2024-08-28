@@ -172,120 +172,217 @@
   "errors": [
     "On error, the reason why the action could not be taken upon the plugin is returned."
   ],
-  "example_json_request": [
-    {
-      "id": "example:plugin#1",
-      "method": "plugin",
-      "params": [
-        "list"
-      ]
-    },
-    {
-      "id": "example:plugin#2",
-      "method": "plugin",
-      "params": {
-        "subcommand": "stop",
-        "plugin": "fail_htlcs.py"
-      }
-    }
-  ],
-  "example_json_response": [
-    {
-      "command": "list",
-      "plugins": [
-        {
-          "name": "~/lightning/plugins/autoclean",
-          "active": true,
-          "dynamic": false
-        },
-        {
-          "name": "~/lightning/plugins/chanbackup",
-          "active": true,
-          "dynamic": false
-        },
-        {
-          "name": "~/lightning/plugins/bcli",
-          "active": true,
-          "dynamic": false
-        },
-        {
-          "name": "~/lightning/plugins/commando",
-          "active": true,
-          "dynamic": false
-        },
-        {
-          "name": "~/lightning/plugins/funder",
-          "active": true,
-          "dynamic": true
-        },
-        {
-          "name": "~/lightning/plugins/topology",
-          "active": true,
-          "dynamic": false
-        },
-        {
-          "name": "~/lightning/plugins/keysend",
-          "active": true,
-          "dynamic": false
-        },
-        {
-          "name": "~/lightning/plugins/offers",
-          "active": true,
-          "dynamic": true
-        },
-        {
-          "name": "~/lightning/plugins/pay",
-          "active": true,
-          "dynamic": true
-        },
-        {
-          "name": "~/lightning/plugins/txprepare",
-          "active": true,
-          "dynamic": true
-        },
-        {
-          "name": "~/lightning/plugins/cln-renepay",
-          "active": true,
-          "dynamic": true
-        },
-        {
-          "name": "~/lightning/plugins/spenderp",
-          "active": true,
-          "dynamic": false
-        },
-        {
-          "name": "~/lightning/plugins/sql",
-          "active": true,
-          "dynamic": true
-        },
-        {
-          "name": "~/lightning/plugins/bookkeeper",
-          "active": true,
-          "dynamic": false
-        },
-        {
-          "name": "~/lightning/target/debug/examples/cln-plugin-startup",
-          "active": true,
-          "dynamic": false
-        }
-      ]
-    },
-    {
-      "command": "stop",
-      "result": "Successfully stopped fail_htlcs.py."
-    }
-  ],
   "author": [
     "Antoine Poinsot <<darosior@protonmail.com>> is mainly responsible."
   ],
   "see_also": [
     "lightning-cli(1)",
-    "lightning-listconfigs(1)",
+    "lightning-listconfigs(7)",
     "[writing plugins][writing plugins]"
   ],
   "resources": [
     "Main web site: <https://github.com/ElementsProject/lightning>",
     "",
-    "[writing plugins]: PLUGINS.md"
+    "[writing plugins]: https://docs.corelightning.org/docs/plugin-development"
+  ],
+  "examples": [
+    {
+      "request": {
+        "id": "example:plugin#1",
+        "method": "plugin",
+        "params": {
+          "subcommand": "start",
+          "plugin": "/root/lightning/tests/plugins/allow_even_msgs.py"
+        }
+      },
+      "response": {
+        "command": "start",
+        "plugins": [
+          {
+            "name": "/root/lightning/plugins/autoclean",
+            "active": true,
+            "dynamic": false
+          },
+          {
+            "name": "/root/lightning/plugins/chanbackup",
+            "active": true,
+            "dynamic": false
+          },
+          {
+            "name": "/root/lightning/plugins/bcli",
+            "active": true,
+            "dynamic": false
+          },
+          {
+            "name": "/root/lightning/plugins/commando",
+            "active": true,
+            "dynamic": false
+          },
+          {
+            "name": "/root/lightning/plugins/funder",
+            "active": true,
+            "dynamic": true
+          },
+          {
+            "name": "/root/lightning/plugins/topology",
+            "active": true,
+            "dynamic": false
+          },
+          {
+            "name": "/root/lightning/plugins/keysend",
+            "active": true,
+            "dynamic": false
+          },
+          {
+            "name": "/root/lightning/plugins/offers",
+            "active": true,
+            "dynamic": true
+          },
+          {
+            "name": "/root/lightning/plugins/pay",
+            "active": true,
+            "dynamic": true
+          },
+          {
+            "name": "/root/lightning/plugins/recover",
+            "active": true,
+            "dynamic": false
+          },
+          {
+            "name": "/root/lightning/plugins/txprepare",
+            "active": true,
+            "dynamic": true
+          },
+          {
+            "name": "/root/lightning/plugins/cln-renepay",
+            "active": true,
+            "dynamic": true
+          },
+          {
+            "name": "/root/lightning/plugins/spenderp",
+            "active": true,
+            "dynamic": false
+          },
+          {
+            "name": "/root/lightning/plugins/sql",
+            "active": true,
+            "dynamic": true
+          },
+          {
+            "name": "/root/lightning/plugins/bookkeeper",
+            "active": true,
+            "dynamic": false
+          },
+          {
+            "name": "/root/lightning/tests/plugins/allow_even_msgs.py",
+            "active": true,
+            "dynamic": true
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "id": "example:plugin#2",
+        "method": "plugin",
+        "params": {
+          "subcommand": "stop",
+          "plugin": "/root/lightning/tests/plugins/allow_even_msgs.py"
+        }
+      },
+      "response": {
+        "command": "stop",
+        "result": "Successfully stopped allow_even_msgs.py."
+      }
+    },
+    {
+      "request": {
+        "id": "example:plugin#3",
+        "method": "plugin",
+        "params": [
+          "list"
+        ]
+      },
+      "response": {
+        "command": "list",
+        "plugins": [
+          {
+            "name": "/root/lightning/plugins/autoclean",
+            "active": true,
+            "dynamic": false
+          },
+          {
+            "name": "/root/lightning/plugins/chanbackup",
+            "active": true,
+            "dynamic": false
+          },
+          {
+            "name": "/root/lightning/plugins/bcli",
+            "active": true,
+            "dynamic": false
+          },
+          {
+            "name": "/root/lightning/plugins/commando",
+            "active": true,
+            "dynamic": false
+          },
+          {
+            "name": "/root/lightning/plugins/funder",
+            "active": true,
+            "dynamic": true
+          },
+          {
+            "name": "/root/lightning/plugins/topology",
+            "active": true,
+            "dynamic": false
+          },
+          {
+            "name": "/root/lightning/plugins/keysend",
+            "active": true,
+            "dynamic": false
+          },
+          {
+            "name": "/root/lightning/plugins/offers",
+            "active": true,
+            "dynamic": true
+          },
+          {
+            "name": "/root/lightning/plugins/pay",
+            "active": true,
+            "dynamic": true
+          },
+          {
+            "name": "/root/lightning/plugins/recover",
+            "active": true,
+            "dynamic": false
+          },
+          {
+            "name": "/root/lightning/plugins/txprepare",
+            "active": true,
+            "dynamic": true
+          },
+          {
+            "name": "/root/lightning/plugins/cln-renepay",
+            "active": true,
+            "dynamic": true
+          },
+          {
+            "name": "/root/lightning/plugins/spenderp",
+            "active": true,
+            "dynamic": false
+          },
+          {
+            "name": "/root/lightning/plugins/sql",
+            "active": true,
+            "dynamic": true
+          },
+          {
+            "name": "/root/lightning/plugins/bookkeeper",
+            "active": true,
+            "dynamic": false
+          }
+        ]
+      }
+    }
   ]
 }

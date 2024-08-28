@@ -403,8 +403,7 @@ void bitcoin_tx_input_set_outpoint(struct bitcoin_tx *tx, int innum,
 	assert(innum < tx->wtx->num_inputs);
 
 	in = &tx->wtx->inputs[innum];
-	BUILD_ASSERT(sizeof(struct bitcoin_txid) == sizeof(in->txhash));
-	memcpy(in->txhash, &outpoint->txid, sizeof(struct bitcoin_txid));
+	CROSS_TYPE_ASSIGNMENT(&in->txhash, &outpoint->txid);
 	in->index = outpoint->n;
 }
 
@@ -412,15 +411,13 @@ void bitcoin_tx_input_set_outpoint(struct bitcoin_tx *tx, int innum,
 void wally_tx_input_get_txid(const struct wally_tx_input *in,
 			     struct bitcoin_txid *txid)
 {
-	BUILD_ASSERT(sizeof(struct bitcoin_txid) == sizeof(in->txhash));
-	memcpy(txid, in->txhash, sizeof(struct bitcoin_txid));
+	CROSS_TYPE_ASSIGNMENT(txid, &in->txhash);
 }
 
 void wally_tx_input_get_outpoint(const struct wally_tx_input *in,
 				 struct bitcoin_outpoint *outpoint)
 {
-	BUILD_ASSERT(sizeof(struct bitcoin_txid) == sizeof(in->txhash));
-	memcpy(&outpoint->txid, in->txhash, sizeof(struct bitcoin_txid));
+	wally_tx_input_get_txid(in, &outpoint->txid);
 	outpoint->n = in->index;
 }
 
@@ -693,18 +690,6 @@ fail:
 	return NULL;
 }
 
-/* <sigh>.  Bitcoind represents hashes as little-endian for RPC. */
-static void reverse_bytes(u8 *arr, size_t len)
-{
-	unsigned int i;
-
-	for (i = 0; i < len / 2; i++) {
-		unsigned char tmp = arr[i];
-		arr[i] = arr[len - 1 - i];
-		arr[len - 1 - i] = tmp;
-	}
-}
-
 bool bitcoin_txid_from_hex(const char *hexstr, size_t hexstr_len,
 			   struct bitcoin_txid *txid)
 {
@@ -824,8 +809,7 @@ bool wally_tx_input_spends(const struct wally_tx_input *input,
 	/* Useful, as tx_part can have some NULL inputs */
 	if (!input)
 		return false;
-	BUILD_ASSERT(sizeof(outpoint->txid) == sizeof(input->txhash));
-	if (memcmp(&outpoint->txid, input->txhash, sizeof(outpoint->txid)) != 0)
+	if (!CROSS_TYPE_EQ(&outpoint->txid, &input->txhash))
 		return false;
 	return input->index == outpoint->n;
 }

@@ -68,6 +68,18 @@ static char *opt_set_u64(const char *arg, u64 *u)
 		return tal_fmt(tmpctx, "'%s' is out of range", arg);
 	return NULL;
 }
+
+static char *opt_set_u64_dynamic(const char *arg, u64 *u)
+{
+	u64 ignored;
+
+	/* In case we're called for arg checking only */
+	if (!u)
+		u = &ignored;
+
+	return opt_set_u64(arg, u);
+}
+
 static char *opt_set_u32(const char *arg, u32 *u)
 {
 	char *endp;
@@ -337,7 +349,7 @@ static char *opt_add_addr_withtype(const char *arg,
 					       arg + strlen("dns:"),
 					       arg);
 			}
-			/* BOLT-hostnames #7:
+			/* BOLT #7:
 			 * The origin node:
 			 * ...
 			 *   - MUST NOT announce more than one `type 5` DNS hostname.
@@ -673,6 +685,15 @@ static char *opt_set_hsm_password(struct lightningd *ld)
 	return NULL;
 }
 
+static char *opt_set_max_htlc_cltv(const char *arg, struct lightningd *ld)
+{
+	if (!opt_deprecated_ok(ld, "max-locktime-blocks", NULL,
+			       "v24.05", "v24.11"))
+		return "--max-locktime-blocks has been deprecated (BOLT #4 says 2016)";
+
+	return opt_set_u32(arg, &ld->config.max_htlc_cltv);
+}
+
 static char *opt_force_privkey(const char *optarg, struct lightningd *ld)
 {
 	tal_free(ld->dev_force_privkey);
@@ -919,6 +940,26 @@ static void dev_register_opts(struct lightningd *ld)
 		     opt_set_bool,
 		     &ld->dev_allow_shutdown_destination_change,
 		     "Allow destination override on close, even if risky");
+	clnopt_noarg("--dev-hsmd-no-preapprove-check", OPT_DEV,
+		     opt_set_bool,
+		     &ld->dev_hsmd_no_preapprove_check,
+		     "Tell hsmd not to support preapprove_check msgs");
+	clnopt_noarg("--dev-hsmd-fail-preapprove", OPT_DEV,
+		     opt_set_bool,
+		     &ld->dev_hsmd_fail_preapprove,
+		     "Tell hsmd to always deny preapprove_invoice / preapprove_keysend");
+	clnopt_witharg("--dev-fd-limit-multiplier", OPT_DEV|OPT_SHOWINT,
+		       opt_set_u32, opt_show_u32,
+		       &ld->fd_limit_multiplier,
+		       "Try to set fd limit to this many times by number of channels (default: 2)");
+	clnopt_noarg("--dev-handshake-no-reply", OPT_DEV,
+		     opt_set_bool,
+		     &ld->dev_handshake_no_reply,
+		     "Don't send or read init message after connection");
+	clnopt_noarg("--dev-throttle-gossip", OPT_DEV,
+		     opt_set_bool,
+		     &ld->dev_throttle_gossip,
+		     "Throttle gossip right down, for testing");
 	/* This is handled directly in daemon_developer_mode(), so we ignore it here */
 	clnopt_noarg("--dev-debug-self", OPT_DEV,
 		     opt_ignore,
@@ -930,9 +971,14 @@ static const struct config testnet_config = {
 	/* 6 blocks to catch cheating attempts. */
 	.locktime_blocks = 6,
 
-	/* They can have up to 14 days, maximumu value that lnd will ask for by default. */
-	/* FIXME Convince lnd to use more reasonable defaults... */
-	.locktime_max = 14 * 24 * 6,
+	/* BOLT #4:
+	 * ## `max_htlc_cltv` Selection
+	 *
+	 * This ... value is defined as 2016 blocks, based on historical value
+	 * deployed by Lightning implementations.
+	 */
+	/* FIXME: Typo in spec for CLTV in descripton!  But it breaks our spelling check, so we omit it above */
+	.max_htlc_cltv = 2016,
 
 	/* We're fairly trusting, under normal circumstances. */
 	.anchor_confirms = 1,
@@ -995,9 +1041,14 @@ static const struct config mainnet_config = {
 	/* ~one day to catch cheating attempts. */
 	.locktime_blocks = 6 * 24,
 
-	/* They can have up to 14 days, maximumu value that lnd will ask for by default. */
-	/* FIXME Convince lnd to use more reasonable defaults... */
-	.locktime_max = 14 * 24 * 6,
+	/* BOLT #4:
+	 * ## `max_htlc_cltv` Selection
+	 *
+	 * This ... value is defined as 2016 blocks, based on historical value
+	 * deployed by Lightning implementations.
+	 */
+	/* FIXME: Typo in spec for CLTV in descripton!  But it breaks our spelling check, so we omit it above */
+	.max_htlc_cltv = 2016,
 
 	/* We're fairly trusting, under normal circumstances. */
 	.anchor_confirms = 3,
@@ -1221,9 +1272,9 @@ static char *opt_set_splicing(struct lightningd *ld)
 
 static char *opt_set_onion_messages(struct lightningd *ld)
 {
-	feature_set_or(ld->our_features,
-		       take(feature_set_for_feature(NULL,
-						    OPTIONAL_FEATURE(OPT_ONION_MESSAGES))));
+	if (!opt_deprecated_ok(ld, "experimental-onion-messages", NULL,
+			       "v24.08", "v25.02"))
+		return "--experimental-onion-message is now enabled by default";
 	return NULL;
 }
 
@@ -1256,14 +1307,16 @@ static char *opt_set_quiesce(struct lightningd *ld)
 
 static char *opt_set_anchor_zero_fee_htlc_tx(struct lightningd *ld)
 {
-	/* FIXME: deprecated_apis! */
+	if (!opt_deprecated_ok(ld, "experimental-anchors", NULL,
+			       "v24.02", "v25.02"))
+		return "--experimental-anchors is now enabled by default";
 	return NULL;
 }
 
 static char *opt_set_offers(struct lightningd *ld)
 {
 	ld->config.exp_offers = true;
-	return opt_set_onion_messages(ld);
+	return NULL;
 }
 
 static char *opt_set_db_upgrade(const char *arg, struct lightningd *ld)
@@ -1446,12 +1499,10 @@ static void register_opts(struct lightningd *ld)
 	/* This affects our features, so set early. */
 	opt_register_early_noarg("--experimental-onion-messages",
 				 opt_set_onion_messages, ld,
-				 "EXPERIMENTAL: enable send, receive and relay"
-				 " of onion messages and blinded payments");
+				 opt_hidden);
 	opt_register_early_noarg("--experimental-offers",
 				 opt_set_offers, ld,
-				 "EXPERIMENTAL: enable send and receive of offers"
-				 " (also sets experimental-onion-messages)");
+				 "EXPERIMENTAL: enable send and receive of offers");
 	opt_register_early_noarg("--experimental-shutdown-wrong-funding",
 				 opt_set_shutdown_wrong_funding, ld,
 				 "EXPERIMENTAL: allow shutdown with alternate txids");
@@ -1474,9 +1525,8 @@ static void register_opts(struct lightningd *ld)
 		     opt_lightningd_usage, ld, "Print this message.");
 	opt_register_arg("--rgb", opt_set_rgb, opt_show_rgb, ld,
 			 "RRGGBB hex color for node");
-	opt_register_arg("--alias", opt_set_alias, opt_show_alias, ld,
-			 "Up to 32-byte alias for node");
-
+	clnopt_witharg("--alias", OPT_KEEP_WHITESPACE, opt_set_alias,
+		       opt_show_alias, ld, "Up to 32-byte alias for node");
 	opt_register_arg("--pid-file=<file>", opt_set_talstr, opt_show_charp,
 			 &ld->pidfile,
 			 "Specify pid file");
@@ -1488,9 +1538,8 @@ static void register_opts(struct lightningd *ld)
 	clnopt_witharg("--watchtime-blocks", OPT_SHOWINT, opt_set_u32, opt_show_u32,
 			 &ld->config.locktime_blocks,
 			 "Blocks before peer can unilaterally spend funds");
-	clnopt_witharg("--max-locktime-blocks", OPT_SHOWINT, opt_set_u32, opt_show_u32,
-			 &ld->config.locktime_max,
-			 "Maximum blocks funds may be locked for");
+	opt_register_arg("--max-locktime-blocks", opt_set_max_htlc_cltv, NULL,
+			 ld, opt_hidden);
 	clnopt_witharg("--funding-confirms", OPT_SHOWINT, opt_set_u32, opt_show_u32,
 			 &ld->config.anchor_confirms,
 			 "Confirmations required for funding transaction");
@@ -1533,9 +1582,10 @@ static void register_opts(struct lightningd *ld)
 		       opt_set_msat,
 		       opt_show_msat, &ld->config.max_dust_htlc_exposure_msat,
 		       "Max HTLC amount that can be trimmed");
-	clnopt_witharg("--min-capacity-sat", OPT_SHOWINT|OPT_DYNAMIC, opt_set_u64, opt_show_u64,
-			 &ld->config.min_capacity_sat,
-			 "Minimum capacity in satoshis for accepting channels");
+	clnopt_witharg("--min-capacity-sat", OPT_SHOWINT|OPT_DYNAMIC,
+		       opt_set_u64_dynamic, opt_show_u64,
+		       &ld->config.min_capacity_sat,
+		       "Minimum capacity in satoshis for accepting channels");
 	clnopt_witharg("--addr", OPT_MULTI, opt_add_addr, NULL,
 		       ld,
 		       "Set an IP address (v4 or v6) to listen on and announce to the network for incoming connections");
@@ -1717,14 +1767,14 @@ void setup_color_and_alias(struct lightningd *ld)
 {
 	if (!ld->rgb)
 		/* You can't get much red by default */
-		ld->rgb = tal_dup_arr(ld, u8, ld->id.k, 3, 0);
+		ld->rgb = tal_dup_arr(ld, u8, ld->our_nodeid.k, 3, 0);
 
 	if (!ld->alias) {
 		u64 adjective, noun;
 		char *name;
 
-		memcpy(&adjective, ld->id.k+3, sizeof(adjective));
-		memcpy(&noun, ld->id.k+3+sizeof(adjective), sizeof(noun));
+		memcpy(&adjective, ld->our_nodeid.k+3, sizeof(adjective));
+		memcpy(&noun, ld->our_nodeid.k+3+sizeof(adjective), sizeof(noun));
 		noun %= ARRAY_SIZE(codename_noun);
 		adjective %= ARRAY_SIZE(codename_adjective);
 
@@ -1837,9 +1887,9 @@ void handle_early_opts(struct lightningd *ld, int argc, char *argv[])
 }
 
 /* Free *str, set *str to copy with `cln` prepended */
-static void prefix_cln(const char **str STEALS)
+static void prefix_cln(char **str STEALS)
 {
-	const char *newstr = tal_fmt(tal_parent(*str), "cln%s", *str);
+	char *newstr = tal_fmt(tal_parent(*str), "cln%s", *str);
 	tal_free(*str);
 	*str = newstr;
 }
@@ -1860,7 +1910,7 @@ static void fixup_clnrest_options(struct lightningd *ld)
 		    && !strstarts(cv->configline, "rest-certs="))
 			continue;
 		/* Did some (plugin) claim it? */
-		if (opt_find_long(cv->configline, &cv->optarg))
+		if (opt_find_long(cv->configline, cast_const2(const char **, &cv->optarg)))
 			continue;
 		if (!opt_deprecated_ok(ld,
 				       tal_strndup(tmpctx, cv->configline,

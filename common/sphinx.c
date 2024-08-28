@@ -1,6 +1,7 @@
 #include "config.h"
 #include <assert.h>
 
+#include <ccan/array_size/array_size.h>
 #include <ccan/mem/mem.h>
 #include <common/onion_decode.h>
 #include <common/onionreply.h>
@@ -45,7 +46,7 @@ struct sphinx_path {
 	 * the way. */
 	u8 *associated_data;
 
-	/* The individual hops on this route. */
+	/* The individual hops on this route, and their hmacs */
 	struct sphinx_hop *hops;
 
 	/* If this is a rendez-vous onion, then the following node_id tells us
@@ -120,6 +121,33 @@ bool sphinx_add_hop_has_length(struct sphinx_path *path, const struct pubkey *pu
 	sp.pubkey = *pubkey;
 	tal_arr_expand(&path->hops, sp);
 	return true;
+}
+
+static u8 *make_v0_hop(const tal_t *ctx,
+		       const struct short_channel_id *scid,
+		       struct amount_msat forward, u32 outgoing_cltv)
+{
+	const u8 padding[] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			      0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+	/* Prepend 0 byte for realm */
+	u8 *buf = tal_arrz(ctx, u8, 1);
+	towire_short_channel_id(&buf, *scid);
+	towire_amount_msat(&buf, forward);
+	towire_u32(&buf, outgoing_cltv);
+	towire(&buf, padding, ARRAY_SIZE(padding));
+	assert(tal_bytelen(buf) == 1 + 32);
+	return buf;
+}
+
+void sphinx_add_v0_hop(struct sphinx_path *path, const struct pubkey *pubkey,
+		       const struct short_channel_id *scid,
+		       struct amount_msat forward, u32 outgoing_cltv)
+{
+	struct sphinx_hop sp;
+
+	sp.raw_payload = make_v0_hop(path, scid, forward, outgoing_cltv);
+	sp.pubkey = *pubkey;
+	tal_arr_expand(&path->hops, sp);
 }
 
 void sphinx_add_hop(struct sphinx_path *path, const struct pubkey *pubkey,
@@ -458,11 +486,14 @@ static struct hop_params *generate_hop_params(
 	return params;
 }
 
-static void sphinx_write_frame(u8 *dest, const struct sphinx_hop *hop)
+static void sphinx_write_frame(u8 *dest,
+			       const struct sphinx_hop *hop,
+			       const struct hmac *hmac)
 {
+	BUILD_ASSERT(sizeof(hmac->bytes) == HMAC_SIZE);
 	memcpy(dest, hop->raw_payload, tal_bytelen(hop->raw_payload));
 	memcpy(dest + tal_bytelen(hop->raw_payload),
-	       hop->hmac.bytes, sizeof(hop->hmac.bytes));
+	       hmac->bytes, HMAC_SIZE);
 }
 
 static void sphinx_prefill_stream_xor(u8 *dst, size_t dstlen,
@@ -559,14 +590,13 @@ struct onionpacket *create_onionpacket(
 			       fixed_size);
 
 	for (i = num_hops - 1; i >= 0; i--) {
-		sp->hops[i].hmac = nexthmac;
 		generate_key_set(&params[i].secret, &keys);
 
 		/* Rightshift mix-header by FRAME_SIZE */
 		size_t shiftSize = sphinx_hop_size(&sp->hops[i]);
 		memmove(packet->routinginfo + shiftSize, packet->routinginfo,
 			fixed_size - shiftSize);
-		sphinx_write_frame(packet->routinginfo, &sp->hops[i]);
+		sphinx_write_frame(packet->routinginfo, &sp->hops[i], &nexthmac);
 		xor_cipher_stream(packet->routinginfo, &keys.rho,
 				  fixed_size);
 
@@ -599,8 +629,7 @@ struct route_step *process_onionpacket(
 	const struct onionpacket *msg,
 	const struct secret *shared_secret,
 	const u8 *assocdata,
-	const size_t assocdatalen,
-	bool has_realm
+	const size_t assocdatalen
 	)
 {
 	struct route_step *step = talz(ctx, struct route_step);
@@ -639,12 +668,55 @@ struct route_step *process_onionpacket(
 
 	/* Any of these could fail, falling thru with cursor == NULL */
 	payload_size = fromwire_bigsize(&cursor, &max);
-	/* FIXME: raw_payload *includes* the length, which is redundant and
-	 * means we can't just ust fromwire_tal_arrn. */
-	fromwire_pad(&cursor, &max, payload_size);
-	if (cursor != NULL)
-		step->raw_payload = tal_dup_arr(step, u8, paddedheader,
-						cursor - paddedheader, 0);
+
+	/* Legacy!  0 length payload means fixed 32 byte structure */
+	if (payload_size == 0 && max >= 32) {
+		struct tlv_payload *legacy = tlv_payload_new(tmpctx);
+		const u8 *legacy_cursor = cursor;
+		size_t legacy_max = 32;
+		u8 *onwire_tlv;
+
+		legacy->amt_to_forward = tal(legacy, u64);
+		legacy->outgoing_cltv_value = tal(legacy, u32);
+		legacy->short_channel_id = tal(legacy, struct short_channel_id);
+
+		/* BOLT-obsolete #4:
+		 * ## Legacy `hop_data` payload format
+		 *
+		 * The `hop_data` format is identified by a single `0x00`-byte
+		 * length, for backward compatibility.  Its payload is defined
+		 * as:
+		 *
+		 * 1. type: `hop_data` (for `realm` 0)
+		 * 2. data:
+		 *    * [`short_channel_id`:`short_channel_id`]
+		 *    * [`u64`:`amt_to_forward`]
+		 *    * [`u32`:`outgoing_cltv_value`]
+		 *    * [`12*byte`:`padding`]
+		 */
+		*legacy->short_channel_id = fromwire_short_channel_id(&legacy_cursor, &legacy_max);
+		*legacy->amt_to_forward = fromwire_u64(&legacy_cursor, &legacy_max);
+		*legacy->outgoing_cltv_value = fromwire_u32(&legacy_cursor, &legacy_max);
+
+		/* Re-linearize it as a modern TLV! */
+		onwire_tlv = tal_arr(tmpctx, u8, 0);
+		towire_tlv_payload(&onwire_tlv, legacy);
+
+		/* Length, then tlv */
+		step->raw_payload = tal_arr(step, u8, 0);
+		towire_bigsize(&step->raw_payload, tal_bytelen(onwire_tlv));
+		towire_u8_array(&step->raw_payload, onwire_tlv, tal_bytelen(onwire_tlv));
+
+		payload_size = 32;
+		fromwire_pad(&cursor, &max, payload_size);
+	} else {
+		/* FIXME: raw_payload *includes* the length, which is redundant and
+		 * means we can't just ust fromwire_tal_arrn. */
+		fromwire_pad(&cursor, &max, payload_size);
+		if (cursor != NULL)
+			step->raw_payload = tal_dup_arr(step, u8, paddedheader,
+							cursor - paddedheader, 0);
+	}
 	fromwire_hmac(&cursor, &max, &step->next->hmac);
 
 	/* BOLT #4:

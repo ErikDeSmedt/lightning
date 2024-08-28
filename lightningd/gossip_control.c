@@ -62,8 +62,10 @@ static void got_filteredblock(struct bitcoind *bitcoind,
 	if (fb == NULL)
 		return got_txout(bitcoind, NULL, scid);
 
-	/* Only fill in blocks that we are not going to scan later. */
-	if (bitcoind->ld->topology->max_blockheight > fb->height)
+	/* This routine is mainly for past blocks.  As a corner case,
+	 * we will grab (but not save) future blocks if we're
+	 * syncing */
+	if (fb->height < bitcoind->ld->topology->root->height)
 		wallet_filteredblock_add(bitcoind->ld->wallet, fb);
 
 	u32 outnum = short_channel_id_outnum(scid);
@@ -112,7 +114,7 @@ static void get_txout(struct subd *gossip, const u8 *msg)
 						   NULL, scid, AMOUNT_SAT(0), NULL)));
 	} else {
 		/* Make a pointer of a copy of scid here, for got_filteredblock */
-		bitcoind_getfilteredblock(topo->bitcoind,
+		bitcoind_getfilteredblock(topo->bitcoind, topo->bitcoind,
 					  short_channel_id_blocknum(scid),
 					  got_filteredblock,
 					  tal_dup(gossip, struct short_channel_id, &scid));
@@ -174,7 +176,6 @@ static unsigned gossip_msg(struct subd *gossip, const u8 *msg, const int *fds)
 	case WIRE_GOSSIPD_INIT:
 	case WIRE_GOSSIPD_GET_TXOUT_REPLY:
 	case WIRE_GOSSIPD_OUTPOINTS_SPENT:
-	case WIRE_GOSSIPD_DEV_SET_MAX_SCIDS_ENCODE_SIZE:
 	case WIRE_GOSSIPD_DEV_MEMLEAK:
 	case WIRE_GOSSIPD_DEV_SET_TIME:
 	case WIRE_GOSSIPD_NEW_BLOCKHEIGHT:
@@ -279,7 +280,7 @@ void gossip_init(struct lightningd *ld, int connectd_fd)
 	    NULL,
 	    chainparams,
 	    ld->our_features,
-	    &ld->id,
+	    &ld->our_nodeid,
 	    ld->dev_gossip_time ? &ld->dev_gossip_time: NULL,
 	    ld->dev_fast_gossip,
 	    ld->dev_fast_gossip_prune);
@@ -369,11 +370,7 @@ static struct command_result *json_setleaserates(struct command *cmd,
 
 static const struct json_command setleaserates_command = {
 	"setleaserates",
-	"channels",
 	json_setleaserates,
-	"Called by plugin to set the node's present channel lease rates."
-	" Not to be set without having a plugin which can handle"
-	" `openchannel2` hooks.",
 };
 
 AUTODATA(json_command, &setleaserates_command);
@@ -421,12 +418,11 @@ static struct command_result *json_addgossip(struct command *cmd,
 
 static const struct json_command addgossip_command = {
 	"addgossip",
-	"utility",
 	json_addgossip,
-	"Inject gossip {message} into gossipd"
 };
 AUTODATA(json_command, &addgossip_command);
 
+/* FIXME: move to connect_control.c! */
 static struct command_result *
 json_dev_set_max_scids_encode_size(struct command *cmd,
 				   const char *buffer,
@@ -441,17 +437,15 @@ json_dev_set_max_scids_encode_size(struct command *cmd,
 		   NULL))
 		return command_param_failed();
 
-	msg = towire_gossipd_dev_set_max_scids_encode_size(NULL, *max);
-	subd_send_msg(cmd->ld->gossip, take(msg));
+	msg = towire_connectd_dev_set_max_scids_encode_size(NULL, *max);
+	subd_send_msg(cmd->ld->connectd, take(msg));
 
 	return command_success(cmd, json_stream_success(cmd));
 }
 
 static const struct json_command dev_set_max_scids_encode_size = {
 	"dev-set-max-scids-encode-size",
-	"developer",
 	json_dev_set_max_scids_encode_size,
-	"Set {max} bytes of short_channel_ids per reply_channel_range",
 	.dev_only = true,
 };
 AUTODATA(json_command, &dev_set_max_scids_encode_size);
@@ -477,9 +471,7 @@ static struct command_result *json_dev_gossip_set_time(struct command *cmd,
 
 static const struct json_command dev_gossip_set_time = {
 	"dev-gossip-set-time",
-	"developer",
 	json_dev_gossip_set_time,
-	"Ask gossipd to update the current time.",
 	.dev_only = true,
 };
 AUTODATA(json_command, &dev_gossip_set_time);

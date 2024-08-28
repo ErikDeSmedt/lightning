@@ -29,28 +29,6 @@
       }
     }
   },
-  "example_json_request": [
-    {
-      "id": "example:emergencyrecover#1",
-      "method": "emergencyrecover",
-      "params": "{}"
-    },
-    {
-      "id": "example:emergencyrecover#2",
-      "method": "emergencyrecover",
-      "params": "{}"
-    }
-  ],
-  "example_json_response": [
-    {
-      "stubs": []
-    },
-    {
-      "stubs": [
-        "c00734472f344fdadd0bf787de182e5cf144ccda5d731b0f7c75befd1f1eff52"
-      ]
-    }
-  ],
   "author": [
     "Aditya <<aditya.sharma20111@gmail.com>> is mainly responsible."
   ],
@@ -59,5 +37,31 @@
   ],
   "resources": [
     "Main web site: <https://github.com/ElementsProject/lightning>"
+  ],
+  "examples": [
+    {
+      "request": {
+        "id": "example:emergencyrecover#1",
+        "method": "emergencyrecover",
+        "params": {}
+      },
+      "response": {
+        "stubs": []
+      }
+    },
+    {
+      "request": {
+        "id": "example:emergencyrecover#2",
+        "method": "emergencyrecover",
+        "params": {}
+      },
+      "response": {
+        "stubs": [
+          "e13472d6512413eb1bf03b9a0bb391d0e4152fd337fa6d1014e3de5e131918d9",
+          "f8fc83a432cbfb2fffe222cc06727fdd977b5dd10ebd6707158e799e6f522d9f",
+          "1267da6521b372d7c6407a74066f7a3a5bc3489bbda5eb9f0e990e1e913e2eb9"
+        ]
+      }
+    }
   ]
 }

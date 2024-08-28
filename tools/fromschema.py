@@ -7,8 +7,8 @@ import json
 import re
 
 # To maintain the sequence of the before return value (body) and after return value (footer) sections in the markdown file
-BODY_KEY_SEQUENCE = ['reliability', 'usage', 'restriction_format', 'permitted_sqlite3_functions', 'treatment_of_types', 'tables', 'example_usage', 'example_json_request', 'notes', 'notifications', 'sharing_runes', 'riskfactor_effect_on_routing', 'recommended_riskfactor_values', 'optimality', 'randomization']
-FOOTER_KEY_SEQUENCE = ['example_json_response', 'errors', 'example_json_notifications', 'trivia', 'author', 'see_also', 'resources']
+BODY_KEY_SEQUENCE = ['reliability', 'usage', 'restriction_format', 'permitted_sqlite3_functions', 'treatment_of_types', 'tables', 'notes', 'notifications', 'sharing_runes', 'riskfactor_effect_on_routing', 'recommended_riskfactor_values', 'optimality', 'randomization']
+FOOTER_KEY_SEQUENCE = ['errors', 'trivia', 'author', 'see_also', 'resources', 'example_notifications', 'examples']
 
 
 def output_title(title, underline='-', num_leading_newlines=1, num_trailing_newlines=2):
@@ -291,6 +291,58 @@ def output_members(sub, indent=''):
             output_members(ifclause['then'], indent + '  ')
 
 
+def create_shell_command(rpc, example):
+    """Output shell command for the request example"""
+    output('```shell\n')
+    shell_command = f'lightning-cli {rpc} '
+    if 'params' in example['request']:
+        if isinstance(example['request']['params'], list):
+            if rpc == 'sql' and example['request']['params'] and '=' in example['request']['params'][0]:
+                # For SQL queries in shell, prepend '-o' flag to the query
+                query = example['request']['params'][0]
+                shell_command += f"-o '{query}'" if "'" not in query else f'-o "{query}"'
+            else:
+                shell_command += ' '.join(f'"{item}"' for item in example['request']['params'])
+        elif example['request']['params'].items():
+            shell_command += '-k '
+            for k, v in example['request']['params'].items():
+                # If the value is a string, wrap it in double quotes
+                # otherwise, keep the json as is and wrap the whole value in single quotes
+                # Example 1: wrap route list in single quotes
+                # lightning-cli check -k "command_to_check"="sendpay" "route"='[{"amount_msat": 1011, "id": "022d223620a359a47ff7f7ac447c85c46c923da53389221a0054c11c1e3ca31d59", "delay": 20, "channel": "1x1x1"}, {"amount_msat": 1000, "id": "035d2b1192dfba134e10e540875d366ebc8bc353d5aa766b80c090b39c3a5d885d", "delay": 10, "channel": "2x2x2"}]' "payment_hash"="0000000000000000000000000000000000000000000000000000000000000000"
+                # Example 2: keep subcommand value ("slowcmd") in double quotes
+                # lightning-cli check -k "command_to_check"="dev" "subcommand"="slowcmd" "msec"=1000
+                if isinstance(v, str):
+                    shell_command += f'"{k}"="{v}" '
+                elif isinstance(v, int):
+                    shell_command += f'"{k}"={v} '
+                else:
+                    shell_command += f'"{k}"=\'' + json.dumps(v) + '\' '
+    shell_command = shell_command.strip()
+    output(shell_command + '\n')
+    output('```\n')
+
+
+def create_expandable(title, rpc, examples):
+    """Output example/s with request and response in collapsible header"""
+    output('\n<details>\n')
+    output('<summary>\n')
+    output(f'<span style="font-size: 1.5em; font-weight: bold;">{title}</span><br>\n')
+    output('</summary>\n\n')
+    for i, example in enumerate(examples):
+        output('{}**Example {}**: {}\n'.format('' if i == 0 else '\n', i + 1, '\n'.join(example.get('description', ''))))
+        output('\nRequest:\n')
+        create_shell_command(rpc, example)
+        output('```json\n')
+        output(json.dumps(example['request'], indent=2).strip() + '\n')
+        output('```\n')
+        output('\nResponse:\n')
+        output('```json\n')
+        output(json.dumps(example['response'], indent=2).strip() + '\n')
+        output('```\n')
+    output('</details>')
+
+
 def generate_header(schema):
     """Generate lines for rpc title and synopsis with request parameters"""
     output_title(esc_underscores(''.join(['lightning-', schema['rpc'], ' -- ', schema['title']])), '=', 0, 1)
@@ -426,45 +478,33 @@ def generate_body(schema):
         body_key_found = True
         output_title(key.replace('_', ' ').upper(), '-', 1 if first_matching_key else 2)
         first_matching_key = False
-        if key == 'example_json_request' and len(schema[key]) > 0:
-            output('```json\n')
-            for example in schema.get(key, []):
-                output(json.dumps(example, indent=2).strip() + '\n')
-            output('```')
-        else:
-            outputs(schema[key], '\n')
+        outputs(schema[key], '\n')
     if body_key_found:
         output('\n')
 
 
 def generate_footer(schema):
     """Output sections which should be printed after return value"""
-    first_matching_key = True
     for key in FOOTER_KEY_SEQUENCE:
         if key not in schema:
             continue
-        output_title(key.replace('_', ' ').upper(), '-', 1 if first_matching_key else 2)
-        first_matching_key = False
         if key == 'see_also':
+            output_title(key.replace('_', ' ').upper(), '-', 1)
             # Wrap see_also list with comma separated values
             output(esc_underscores(', '.join(schema[key])))
-        elif key.startswith('example_json_') and len(schema[key]) > 0:
-            # For printing example_json_response and example_json_notifications into code block
-            for i, example in enumerate(schema.get(key, [])):
-                # For printing string elements from example json response; example: `createonion`
-                if isinstance(example, str):
-                    output(example)
-                    if i + 1 < len(schema[key]):
-                        output('\n')
-                else:
-                    if i == 0:
-                        output('```json\n')
-                    output(json.dumps(example, indent=2).strip() + '\n')
-                    if i + 1 == len(schema[key]):
-                        output('```')
+        elif key == 'example_notifications' and len(schema[key]) > 0:
+            output_title(key.replace('_', ' ').upper(), '-', 1)
+            for i, notification in enumerate(schema.get(key, [])):
+                output('{}**Notification {}**: {}\n'.format('' if i == 0 else '\n\n', i + 1, '\n'.join(notification.get('description', ''))))
+                output('```json\n')
+                output(json.dumps(notification, indent=2).strip() + '\n')
+                output('```')
+        elif key == 'examples' and len(schema[key]) > 0:
+            create_expandable('EXAMPLES', schema['rpc'], schema.get('examples', []))
         else:
+            output_title(key.replace('_', ' ').upper(), '-', 1)
             outputs(schema[key], '\n')
-    output('\n')
+        output('\n')
 
 
 def main(schemafile, markdownfile):

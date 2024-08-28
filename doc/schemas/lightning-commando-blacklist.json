@@ -5,7 +5,7 @@
   "added": "v23.05",
   "deprecated": [
     "v23.08",
-    "v24.08"
+    "v25.02"
   ],
   "rpc": "commando-blacklist",
   "title": "Command to prevent a rune from working",
@@ -71,61 +71,6 @@
       }
     }
   },
-  "example_json_request": [
-    {
-      "id": "example:commando-blacklist#1",
-      "method": "commando-blacklist",
-      "params": {
-        "start": 2
-      }
-    },
-    {
-      "id": "example:commando-blacklist#2",
-      "method": "commando-blacklist",
-      "params": {
-        "start": 5,
-        "end": 7
-      }
-    },
-    {
-      "id": "example:commando-blacklist#3",
-      "method": "commando-blacklist",
-      "params": {
-        "start": 3,
-        "end": 4
-      }
-    }
-  ],
-  "example_json_response": [
-    {
-      "blacklist": [
-        {
-          "start": 2,
-          "end": 2
-        }
-      ]
-    },
-    {
-      "blacklist": [
-        {
-          "start": 2,
-          "end": 2
-        },
-        {
-          "start": 5,
-          "end": 7
-        }
-      ]
-    },
-    {
-      "blacklist": [
-        {
-          "start": 2,
-          "end": 7
-        }
-      ]
-    }
-  ],
   "author": [
     "Shahana Farooqui <<sfarooqui@blockstream.com>> is mainly responsible."
   ],
@@ -134,5 +79,42 @@
   ],
   "resources": [
     "Main web site: <https://github.com/ElementsProject/lightning>"
+  ],
+  "examples": [
+    {
+      "request": {
+        "id": "example:commando-blacklist#1",
+        "method": "commando-blacklist",
+        "params": {
+          "start": 1
+        }
+      },
+      "response": {
+        "blacklist": [
+          {
+            "start": 1,
+            "end": 1
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "id": "example:commando-blacklist#2",
+        "method": "commando-blacklist",
+        "params": {
+          "start": 2,
+          "end": 3
+        }
+      },
+      "response": {
+        "blacklist": [
+          {
+            "start": 1,
+            "end": 3
+          }
+        ]
+      }
+    }
   ]
 }

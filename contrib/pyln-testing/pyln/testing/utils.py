@@ -417,6 +417,7 @@ class BitcoinD(TailableProc):
             '-debug=mempoolrej',
             '-debug=rpc',
             '-debug=validation',
+            '-rpcthreads=20',
         ]
         # For up to and including 0.16.1, this needs to be in main section.
         BITCOIND_CONFIG['rpcport'] = rpcport
@@ -760,7 +761,7 @@ class PrettyPrintingLightningRpc(LightningRpc):
 class LightningNode(object):
     def __init__(self, node_id, lightning_dir, bitcoind, executor, valgrind, may_fail=False,
                  may_reconnect=False,
-                 allow_broken_log=False,
+                 broken_log=None,
                  allow_warning=False,
                  allow_bad_gossip=False,
                  db=None, port=None, disconnect=None, random_hsm=None, options=None,
@@ -772,7 +773,7 @@ class LightningNode(object):
         self.executor = executor
         self.may_fail = may_fail
         self.may_reconnect = may_reconnect
-        self.allow_broken_log = allow_broken_log
+        self.broken_log = broken_log
         self.allow_bad_gossip = allow_bad_gossip
         self.allow_warning = allow_warning
         self.db = db
@@ -1071,7 +1072,7 @@ class LightningNode(object):
             return addr in addrs
 
         # We should not have funds on that address yet, we just generated it.
-        assert(not has_funds_on_addr(addr))
+        assert not has_funds_on_addr(addr)
 
         self.bitcoin.rpc.sendtoaddress(addr, (amount + 1000000) / 10**8)
         self.bitcoin.generate_block(1)
@@ -1229,7 +1230,7 @@ class LightningNode(object):
             route = self.rpc.getroute(dst.info["id"], amt, riskfactor=0, fuzzpercent=0)
             self.rpc.sendpay(route["route"], invoice["payment_hash"], payment_secret=invoice.get('payment_secret'))
             result = self.rpc.waitsendpay(invoice["payment_hash"])
-            assert(result.get('status') == 'complete')
+            assert result.get('status') == 'complete'
             self.wait_for_htlcs()
             return
 
@@ -1260,7 +1261,7 @@ class LightningNode(object):
         self.rpc.sendpay([routestep], rhash, payment_secret=psecret, bolt11=inv['bolt11'])
         # wait for sendpay to comply
         result = self.rpc.waitsendpay(rhash)
-        assert(result.get('status') == 'complete')
+        assert result.get('status') == 'complete'
 
         # Make sure they're all settled, in case we quickly mine blocks!
         dst.wait_for_htlcs()
@@ -1337,11 +1338,11 @@ class LightningNode(object):
     # force new feerates by restarting and thus skipping slow smoothed process
     # Note: testnode must be created with: opts={'may_reconnect': True}
     def force_feerates(self, rate):
-        assert(self.may_reconnect)
+        assert self.may_reconnect
         self.set_feerates([rate] * 4, False)
         self.restart()
         self.daemon.wait_for_log('peer_out WIRE_UPDATE_FEE')
-        assert(self.rpc.feerates('perkw')['perkw']['opening'] == rate)
+        assert self.rpc.feerates('perkw')['perkw']['opening'] == rate
 
     def wait_for_onchaind_txs(self, *args):
         """Wait for onchaind to ask lightningd to create one or more txs.  Each arg is a pair of typename, resolvename.  Returns tuples of the rawtx, txid and number of blocks delay for each pair.
@@ -1420,7 +1421,8 @@ class LightningNode(object):
                                timeout=TIMEOUT,
                                stdout=subprocess.PIPE).stdout.strip()
         out = subprocess.run(['devtools/gossipwith',
-                              '--features=40',  # OPT_GOSSIP_QUERIES
+                              '--no-gossip',
+                              '--network={}'.format(TEST_NETWORK),
                               '--timeout-after={}'.format(int(math.sqrt(TIMEOUT) + 1)),
                               '{}@localhost:{}'.format(self.info['id'],
                                                        self.port),
@@ -1559,7 +1561,7 @@ class NodeFactory(object):
         node_opt_keys = [
             'disconnect',
             'may_fail',
-            'allow_broken_log',
+            'broken_log',
             'allow_warning',
             'may_reconnect',
             'random_hsm',
@@ -1725,6 +1727,11 @@ class NodeFactory(object):
 
         self.join_nodes(nodes, fundchannel, fundamount, wait_for_announce, announce_channels)
         return nodes
+
+    def get_unused_port(self):
+        port = reserve_unused_port()
+        self.reserved_ports.append(port)
+        return port
 
     def killall(self, expected_successes):
         """Returns true if every node we expected to succeed actually succeeded"""

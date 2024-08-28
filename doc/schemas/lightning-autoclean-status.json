@@ -414,61 +414,6 @@
       "Note that the ages parameters are set by various `autoclean-...-age` parameters in your configuration: see lightningd-config(5)."
     ]
   },
-  "example_json_request": [
-    {
-      "id": "example:autoclean-status#1",
-      "method": "autoclean-status",
-      "params": {
-        "subsystem": "expiredinvoices"
-      }
-    },
-    {
-      "id": "example:autoclean-status#2",
-      "method": "autoclean-status",
-      "params": {
-        "subsystem": null
-      }
-    }
-  ],
-  "example_json_response": [
-    {
-      "autoclean": {
-        "expiredinvoices": {
-          "enabled": false,
-          "cleaned": 0
-        }
-      }
-    },
-    {
-      "autoclean": {
-        "succeededforwards": {
-          "enabled": false,
-          "cleaned": 0
-        },
-        "failedforwards": {
-          "enabled": false,
-          "cleaned": 0
-        },
-        "succeededpays": {
-          "enabled": false,
-          "cleaned": 0
-        },
-        "failedpays": {
-          "enabled": false,
-          "cleaned": 0
-        },
-        "paidinvoices": {
-          "enabled": false,
-          "cleaned": 0
-        },
-        "expiredinvoices": {
-          "enabled": true,
-          "age": 2,
-          "cleaned": 0
-        }
-      }
-    }
-  ],
   "author": [
     "Rusty Russell <<rusty@rustcorp.com.au>> is mainly responsible."
   ],
@@ -480,5 +425,61 @@
   ],
   "resources": [
     "Main web site: <https://github.com/ElementsProject/lightning>"
+  ],
+  "examples": [
+    {
+      "request": {
+        "id": "example:autoclean-status#1",
+        "method": "autoclean-status",
+        "params": {
+          "subsystem": "expiredinvoices"
+        }
+      },
+      "response": {
+        "autoclean": {
+          "expiredinvoices": {
+            "enabled": true,
+            "age": 300,
+            "cleaned": 0
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "id": "example:autoclean-status#2",
+        "method": "autoclean-status",
+        "params": {}
+      },
+      "response": {
+        "autoclean": {
+          "succeededforwards": {
+            "enabled": false,
+            "cleaned": 0
+          },
+          "failedforwards": {
+            "enabled": false,
+            "cleaned": 0
+          },
+          "succeededpays": {
+            "enabled": false,
+            "cleaned": 7
+          },
+          "failedpays": {
+            "enabled": false,
+            "cleaned": 0
+          },
+          "paidinvoices": {
+            "enabled": false,
+            "cleaned": 0
+          },
+          "expiredinvoices": {
+            "enabled": true,
+            "age": 300,
+            "cleaned": 0
+          }
+        }
+      }
+    }
   ]
 }

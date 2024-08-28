@@ -8,6 +8,9 @@
   "description": [
     "The **listclosedchannels** RPC command returns data on channels which are otherwise forgotten (more than 100 blocks after they're completely resolved onchain)."
   ],
+  "categories": [
+    "readonly"
+  ],
   "request": {
     "required": [],
     "properties": {
@@ -134,13 +137,14 @@
                 "names": {
                   "type": "array",
                   "description": [
-                    "Feature name for each bit set in this channel_type."
+                    "Feature name for each bit set in this channel_type. Note that *anchors_zero_fee_htlc_tx* is a deprecated synonym for *anchors*."
                   ],
                   "items": {
                     "type": "string",
                     "enum": [
                       "static_remotekey/even",
                       "anchor_outputs/even",
+                      "anchors/even",
                       "anchors_zero_fee_htlc_tx/even",
                       "scid_alias/even",
                       "zeroconf/even"
@@ -281,5 +285,17 @@
   ],
   "resources": [
     "Main web site: <https://github.com/ElementsProject/lightning>"
+  ],
+  "examples": [
+    {
+      "request": {
+        "id": "example:listclosedchannels#1",
+        "method": "listclosedchannels",
+        "params": {}
+      },
+      "response": {
+        "closedchannels": []
+      }
+    }
   ]
 }
