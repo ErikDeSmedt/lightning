@@ -1081,3 +1081,134 @@ def test_xpay_blockheight_mismatch(node_factory, bitcoind, executor):
     # Now let it catch up, and it will retry, and succeed.
     l1.daemon.rpcproxy.mock_rpc('getblockhash')
     fut.result(TIMEOUT)
+
+
+def test_xpay_listpays_pending(node_factory, bitcoind, executor):
+    """Test that listpays always returns 'pending' while xpay is in progress.
+
+    Sets up a network where only the most expensive route has liquidity,
+    forcing xpay to try many routes before succeeding. While xpay is
+    running, we spam listpays and verify the status never shows anything
+    other than 'pending' (until xpay completes with 'complete').
+    """
+    NUM_ROUTERS = 20
+
+    # Build per-node options: payer and receiver get defaults,
+    # each router gets an increasing fee-base so xpay tries
+    # the cheapest (no-liquidity) routers first.
+    opts = [{}, {}]  # payer (index 0), receiver (index 1)
+    for i in range(NUM_ROUTERS):
+        opts.append({'fee-base': (i + 1) * 10, 'may_reconnect': True})
+
+    nodes = node_factory.get_nodes(2 + NUM_ROUTERS, opts=opts)
+    payer = nodes[0]
+    receiver = nodes[1]
+    routers = nodes[2:]
+
+    # Connect and fund payer -> router_i channels (payer has liquidity)
+    for r in routers:
+        payer.rpc.connect(r.info['id'], 'localhost', r.port)
+    for r in routers:
+        addr = payer.rpc.newaddr('bech32')['bech32']
+        bitcoind.rpc.sendtoaddress(addr, (FUNDAMOUNT + 1000000) / 10**8)
+    bitcoind.generate_block(1)
+    sync_blockheight(bitcoind, [payer])
+
+    payer_txids = []
+    for r in routers:
+        txid = payer.rpc.fundchannel(r.info['id'], FUNDAMOUNT)['txid']
+        payer_txids.append(txid)
+
+    bitcoind.generate_block(1, wait_for_mempool=payer_txids)
+
+    for r in routers:
+        wait_for(lambda r=r: payer.channel_state(r) == 'CHANNELD_NORMAL')
+
+    # Connect and fund router_i <-> receiver channels.
+    # For routers 0..98: receiver funds the channel, so liquidity is on
+    # receiver's side and router_i cannot forward.
+    # For router 99 (the most expensive): router funds the channel,
+    # so it CAN forward.
+    for r in routers:
+        receiver.rpc.connect(r.info['id'], 'localhost', r.port)
+
+    # Fund receiver for 99 channels
+    for r in routers[:-1]:
+        addr = receiver.rpc.newaddr('bech32')['bech32']
+        bitcoind.rpc.sendtoaddress(addr, (FUNDAMOUNT + 1000000) / 10**8)
+    # Fund last router for its channel to receiver
+    addr = routers[-1].rpc.newaddr('bech32')['bech32']
+    bitcoind.rpc.sendtoaddress(addr, (FUNDAMOUNT + 1000000) / 10**8)
+
+    bitcoind.generate_block(1)
+    sync_blockheight(bitcoind, [receiver, routers[-1]])
+
+    recv_txids = []
+    # Receiver funds channels to routers 0..98 (no liquidity on router side)
+    for r in routers[:-1]:
+        txid = receiver.rpc.fundchannel(r.info['id'], FUNDAMOUNT)['txid']
+        recv_txids.append(txid)
+    # Last router funds channel to receiver (liquidity on router side)
+    txid = routers[-1].rpc.fundchannel(receiver.info['id'], FUNDAMOUNT)['txid']
+    recv_txids.append(txid)
+
+    bitcoind.generate_block(1, wait_for_mempool=recv_txids)
+
+    for r in routers[:-1]:
+        wait_for(lambda r=r: receiver.channel_state(r) == 'CHANNELD_NORMAL')
+    wait_for(lambda: routers[-1].channel_state(receiver) == 'CHANNELD_NORMAL')
+
+    # Wait for all channels to be locally active
+    for r in routers:
+        scid = payer.get_channel_scid(r)
+        payer.wait_local_channel_active(scid)
+        r.wait_local_channel_active(scid)
+
+    for r in routers[:-1]:
+        scid = receiver.get_channel_scid(r)
+        receiver.wait_local_channel_active(scid)
+        r.wait_local_channel_active(scid)
+
+    last_scid = routers[-1].get_channel_scid(receiver)
+    routers[-1].wait_local_channel_active(last_scid)
+    receiver.wait_local_channel_active(last_scid)
+
+    # Announce all channels
+    bitcoind.generate_block(5)
+
+    # Wait for payer to see all channels in gossip
+    # Each router has 2 channels (to payer and to receiver), each bidirectional
+    expected_channels = NUM_ROUTERS * 2 * 2
+    wait_for(lambda: len(payer.rpc.listchannels()['channels']) == expected_channels)
+
+    # Create invoice on receiver
+    inv = receiver.rpc.invoice('100000sat', 'test_pending', 'test_pending')['bolt11']
+
+    # Start xpay in background - it will try all cheap routes first
+    # (which have no liquidity) before finding the expensive one that works
+    fut = executor.submit(payer.rpc.xpay, invstring=inv, retry_for=120)
+
+    # Spam listpays as fast as possible while xpay is working.
+    # Collect all observed statuses to validate the sequence afterwards.
+    observed_statuses = []
+    while not fut.done():
+        pays = payer.rpc.listpays(inv)['pays']
+        if len(pays) > 0:
+            observed_statuses.append(only_one(pays)['status'])
+
+    result = fut.result(TIMEOUT)
+    assert result['successful_parts'] >= 1
+    observed_statuses.append(only_one(payer.rpc.listpays(inv)['pays'])['status'])
+
+    # Dump all observed statuses to a file for debugging
+    status_file = os.path.join(payer.lightning_dir, 'observed_statuses.txt')
+    with open(status_file, 'w') as f:
+        for i, s in enumerate(observed_statuses):
+            f.write(f"{i}: {s}\n")
+
+    # Statuses must be: pending, pending, ..., complete, complete, ...
+    assert 'pending' in observed_statuses
+    assert observed_statuses[-1] == 'complete'
+    first_complete = observed_statuses.index('complete')
+    assert all(s == 'pending' for s in observed_statuses[:first_complete])
+    assert all(s == 'complete' for s in observed_statuses[first_complete:])
